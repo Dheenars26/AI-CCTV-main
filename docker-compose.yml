@@ -1,0 +1,189 @@
+version: '3.8'
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    driver: bridge
+  data:
+    internal: true  # Isolated data network with zero external internet access
+
+volumes:
+  postgres_data:
+  redis_data:
+  evidence_storage:
+  recordings_storage:
+
+services:
+  # 1. Reverse Proxy (TLS 1.3 + Compression + Rate Limiting)
+  nginx:
+    image: nginx:1.26-alpine
+    container_name: cctv_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - edge
+      - backend
+    depends_on:
+      backend-api:
+        condition: service_healthy
+    restart: always
+
+  # 2. Frontend Application (React Dashboard)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cctv_frontend
+    networks:
+      - edge
+    restart: always
+
+  # 3. Backend API Service Gateway
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cctv_backend_api
+    env_file:
+      - ./backend/.env.production
+    volumes:
+      - evidence_storage:/app/evidence
+      - recordings_storage:/app/recordings
+    networks:
+      - backend
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    restart: always
+
+  # 4. Ingestion Worker Service (Camera Workers)
+  ingestion-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: cctv_ingestion_worker
+    command: ["python", "-m", "app.cli.start_ingestion_worker"]
+    env_file:
+      - ./backend/.env.production
+    volumes:
+      - evidence_storage:/app/evidence
+    networks:
+      - backend
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+    restart: always
+
+  # 5. AI Worker Service (GPU Acceleration + PyTorch)
+  ai-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: cctv_ai_worker
+    command: ["python", "-m", "app.cli.start_ai_worker"]
+    env_file:
+      - ./backend/.env.production
+    volumes:
+      - evidence_storage:/app/evidence
+    networks:
+      - backend
+      - data
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  # 6. Retention Cleaner Worker
+  retention-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: cctv_retention_worker
+    command: ["python", "-m", "app.cli.start_retention_worker"]
+    env_file:
+      - ./backend/.env.production
+    volumes:
+      - evidence_storage:/app/evidence
+    networks:
+      - backend
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
+  # 7. PostgreSQL 16 Primary Database (Data Network Only)
+  postgres:
+    image: postgres:16-alpine
+    container_name: cctv_postgres
+    environment:
+      POSTGRES_DB: cctv_monitor
+      POSTGRES_USER: cctv_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cctv_user -d cctv_monitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    restart: always
+
+  # 8. Redis Inter-Process Pub/Sub & Cache Broker (Data Network Only)
+  redis:
+    image: redis:7-alpine
+    container_name: cctv_redis
+    command: redis-server --appendonly yes --requirepass_file /run/secrets/redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+    restart: always

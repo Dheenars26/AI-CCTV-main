@@ -1,0 +1,61 @@
+services:
+  # -------------------------------------------------------------
+  # AI CCTV Backend Gateway & Inference Engine (FastAPI + OpenCV)
+  # -------------------------------------------------------------
+  - type: web
+    name: ai-cctv-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: starter
+    region: oregon
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: CORS_ORIGINS
+        value: '["*"]'
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        value: sqlite:///./cctv.db
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        value: dheenacsgroup@gmail.com
+      - key: SMTP_PASSWORD
+        value: ugoc ebah cgxq oija
+      - key: SMTP_USE_TLS
+        value: "true"
+      - key: SMTP_SENDER_EMAIL
+        value: dheenacsgroup@gmail.com
+      - key: SMTP_SENDER_NAME
+        value: AI CCTV Monitor Alert
+      - key: ALERT_RECIPIENT_EMAILS
+        value: '["dheenacsgroup@gmail.com"]'
+      - key: EMAIL_ALERTS_ENABLED
+        value: "true"
+
+  # -------------------------------------------------------------
+  # AI CCTV Frontend SOC Dashboard (React + Vite)
+  # -------------------------------------------------------------
+  - type: web
+    name: ai-cctv-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: ai-cctv-backend
+          property: host

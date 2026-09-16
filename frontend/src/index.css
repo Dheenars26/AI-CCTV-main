@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased selection:bg-blue-500/20 selection:text-blue-700;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* Custom Clean Scrollbar for Light Theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F8FAFC;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Light Card & Panel Utilities */
+.glass-panel {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.02);
+}
+
+.glass-panel-glow {
+  background: #FFFFFF;
+  border: 1px solid #BFDBFE;
+  box-shadow: 0 4px 14px 0 rgba(37, 99, 235, 0.08);
+}
+
+/* Alert Glow Utilities */
+.glass-fire-glow {
+  background: #FFF1F2;
+  border: 1px solid #FECDD3;
+  box-shadow: 0 4px 14px 0 rgba(225, 29, 72, 0.12);
+}
+
+.glass-smoke-glow {
+  background: #FFFBEB;
+  border: 1px solid #FDE68A;
+  box-shadow: 0 4px 14px 0 rgba(217, 119, 6, 0.12);
+}
+
+/* Interactive Card Transitions */
+.interactive-card {
+  @apply transition-all duration-200 hover:shadow-md hover:border-slate-300;
+}

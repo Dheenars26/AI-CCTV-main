@@ -1,0 +1,5 @@
+search-path = [
+    ".",
+    ".venv/Lib/site-packages",
+]
+infer-with-first-use = false
