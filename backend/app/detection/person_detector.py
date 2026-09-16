@@ -43,7 +43,7 @@ class PersonDetector(BaseDetector):
                 torch.set_num_threads(min(8, max(4, cpu_cores - 2)))
             except Exception:
                 pass
-            self.is_cuda = torch.cuda.is_available() and str(self.device).lower() not in ["cpu", ""]
+            self.is_cuda = torch.cuda.is_available() and self.device.lower() not in ["cpu", ""]
         except (ImportError, OSError, Exception):
             self.is_cuda = False
         self.half = self.is_cuda
@@ -198,7 +198,7 @@ class PersonDetector(BaseDetector):
             try:
                 import torch
                 imgsz_val = getattr(settings, "AI_IMAGE_SIZE", getattr(settings, "YOLO_IMGSZ", 416))
-                if str(self.device).lower() in ["cpu", ""]:
+                if self.device.lower() in ["cpu", ""]:
                     imgsz_val = min(416, max(384, imgsz_val))
                 predict_kwargs = {
                     "source": image_bgr,

@@ -261,7 +261,7 @@ class YOLODetector(BaseDetector):
             t_start = time.time()
 
             imgsz_val = getattr(settings, "AI_IMAGE_SIZE", getattr(settings, "YOLO_IMGSZ", 416))
-            if str(self.device).lower() in ["cpu", ""]:
+            if self.device.lower() in ["cpu", ""]:
                 imgsz_val = min(416, max(384, imgsz_val))
             augment_val = getattr(settings, "YOLO_AUGMENT", False)
 

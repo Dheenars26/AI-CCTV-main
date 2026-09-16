@@ -64,7 +64,7 @@ class PPEDetector(BaseDetector):
                 torch.set_num_threads(min(8, max(4, cpu_cores - 2)))
             except Exception:
                 pass
-            self.is_cuda = torch.cuda.is_available() and str(self.device).lower() not in ["cpu", ""]
+            self.is_cuda = torch.cuda.is_available() and self.device.lower() not in ["cpu", ""]
         except (ImportError, OSError, Exception):
             self.is_cuda = False
         self.half = self.is_cuda
@@ -296,20 +296,7 @@ class PPEDetector(BaseDetector):
                     }
                 ))
 
-            if person_dets is not None and len(person_dets) > 0:
-                active_person_dets = list(person_dets)
-            else:
-                active_person_dets = [d for d in detections if d.label.lower() == "person"]
-
-            if active_person_dets:
-                ppe_items = [d for d in detections if d.label.lower() != "person"]
-                for p_idx, person in enumerate(active_person_dets):
-                    equipped = self._associate_ppe_to_worker(person.bbox, ppe_items)
-                    person.metadata["worker_id"] = p_idx + 1
-                    person.metadata["equipped_ppe"] = equipped
-                    person.metadata["is_compliant"] = bool("helmet" in equipped and "vest" in equipped)
-
-            return detections
+            return self._apply_nms(detections, iou_threshold=0.50)
 
         if self._is_mock_fallback or self._model is None:
             return self._detect_mock_fallback(image_bgr)
@@ -320,7 +307,7 @@ class PPEDetector(BaseDetector):
             t_start = time.time()
 
             imgsz_val = getattr(settings, "AI_IMAGE_SIZE", getattr(settings, "YOLO_IMGSZ", 416))
-            if str(self.device).lower() in ["cpu", ""]:
+            if self.device.lower() in ["cpu", ""]:
                 imgsz_val = min(416, max(384, imgsz_val))
             augment_val = getattr(settings, "YOLO_AUGMENT", False)
 
