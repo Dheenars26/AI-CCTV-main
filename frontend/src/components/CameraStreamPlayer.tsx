@@ -274,6 +274,16 @@ export const CameraStreamPlayer: React.FC<CameraStreamPlayerProps> = ({
         </div>
         <div className="pointer-events-auto flex items-center gap-2">
           <StatusBadge status={runtimeState?.status || (isStreamEnabled ? 'CONNECTED' : 'OFFLINE')} />
+          {interactive && (
+            <button
+              type="button"
+              onClick={toggleFullScreen}
+              className="p-1.5 bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white rounded-lg border border-slate-700 transition-colors opacity-0 group-hover:opacity-100"
+              title={isFullScreen ? "Exit Fullscreen" : "Full Screen Mode"}
+            >
+              {isFullScreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+            </button>
+          )}
         </div>
       </div>
 
@@ -292,32 +302,44 @@ export const CameraStreamPlayer: React.FC<CameraStreamPlayerProps> = ({
             }`}
           />
         ) : (
-          <div className="flex flex-col items-center justify-center p-6 text-center space-y-3 text-slate-400">
+          <div className="flex flex-col items-center justify-center p-4 text-center space-y-2 text-slate-400 relative z-20">
             {hasError && isStreamEnabled ? (
               <>
-                <AlertCircle className="w-9 h-9 text-red-400 animate-pulse" />
+                <AlertCircle className="w-8 h-8 text-red-400 animate-pulse" />
                 <p className="text-xs text-red-400 font-medium">Stream Disconnected</p>
                 <p className="text-[11px] text-slate-500">Auto-reconnecting…</p>
-                <button
-                  onClick={handleManualReconnect}
-                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded-lg flex items-center gap-1.5 border border-slate-700"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" /> Reconnect Stream
-                </button>
+                <div className="flex items-center gap-2 mt-1">
+                  <button
+                    type="button"
+                    onClick={handleManualReconnect}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded-lg flex items-center gap-1.5 border border-slate-700 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" /> Reconnect Stream
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleTurnOff}
+                    disabled={isPending}
+                    className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-xs text-red-400 rounded-lg flex items-center gap-1.5 border border-red-500/40 cursor-pointer disabled:opacity-50"
+                  >
+                    <Power className="w-3.5 h-3.5" /> Turn Off
+                  </button>
+                </div>
               </>
             ) : !isStreamEnabled ? (
               <>
-                <div className="p-3 rounded-full bg-slate-900 border border-slate-800 text-slate-500">
-                  <VideoOff className="w-8 h-8" />
+                <div className="p-2.5 rounded-full bg-slate-900 border border-slate-800 text-slate-500">
+                  <VideoOff className="w-6 h-6" />
                 </div>
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-slate-300">Camera Stream is Off</p>
-                  <p className="text-xs text-slate-500">Click below to turn on camera stream</p>
+                <div className="space-y-0.5">
+                  <p className="text-xs sm:text-sm font-semibold text-slate-300">Camera Stream is Off</p>
+                  <p className="text-[11px] text-slate-500">Click below to turn on camera stream</p>
                 </div>
                 <button
+                  type="button"
                   onClick={handleTurnOn}
                   disabled={isPending}
-                  className="mt-1 px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-semibold text-xs rounded-xl shadow-lg shadow-emerald-500/20 flex items-center gap-2 transition-all disabled:opacity-50"
+                  className="mt-1 px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-semibold text-xs rounded-xl shadow-lg shadow-emerald-500/20 flex items-center gap-2 transition-all disabled:opacity-50 active:scale-95 cursor-pointer relative z-30"
                 >
                   {startMutation.isPending ? (
                     <><Loader2 className="w-4 h-4 animate-spin" /> Turning On...</>
@@ -336,15 +358,15 @@ export const CameraStreamPlayer: React.FC<CameraStreamPlayerProps> = ({
         )}
       </div>
 
-      {/* Bottom Controls Overlay */}
-      {interactive && (
-        <div className="absolute bottom-0 inset-x-0 p-2.5 bg-gradient-to-t from-black/85 via-black/35 to-transparent z-10 flex items-center justify-between opacity-0 group-hover:opacity-100 transition-opacity">
-          <div className="flex items-center gap-2 text-[11px] font-mono text-slate-300">
+      {/* Bottom Controls Overlay (Active only when stream is playing) */}
+      {interactive && isStreamEnabled && !hasError && (
+        <div className="absolute bottom-0 inset-x-0 p-2.5 bg-gradient-to-t from-black/85 via-black/35 to-transparent z-10 flex items-center justify-between opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+          <div className="flex items-center gap-2 text-[11px] font-mono text-slate-300 pointer-events-auto">
             <span>FPS: {runtimeState?.fps || (camera.enabled ? 15 : 0)}</span>
             <span>•</span>
             <span>{(camera.source_type || 'RTSP').toUpperCase()}</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 pointer-events-auto">
             <button
               type="button"
               onClick={() => setFitMode(currentFitMode === 'contain' ? 'cover' : 'contain')}
@@ -357,18 +379,16 @@ export const CameraStreamPlayer: React.FC<CameraStreamPlayerProps> = ({
                 <><Scan className="w-3.5 h-3.5 text-cyan-400" /> <span>Full View</span></>
               )}
             </button>
-            {isStreamEnabled && (
-              <button
-                type="button"
-                onClick={handleTurnOff}
-                disabled={isPending}
-                className="px-2.5 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 text-xs rounded-lg flex items-center gap-1.5 font-semibold transition-colors disabled:opacity-50"
-                title="Turn Off Camera Stream"
-              >
-                {stopMutation.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Power className="w-3.5 h-3.5" />}
-                <span>Turn Off</span>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={handleTurnOff}
+              disabled={isPending}
+              className="px-2.5 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40 text-xs rounded-lg flex items-center gap-1.5 font-semibold transition-colors disabled:opacity-50"
+              title="Turn Off Camera Stream"
+            >
+              {stopMutation.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Power className="w-3.5 h-3.5" />}
+              <span>Turn Off</span>
+            </button>
             <button
               type="button"
               onClick={toggleFullScreen}
