@@ -1,8 +1,25 @@
-import { defineConfig } from 'vite';
+import { defineConfig, createLogger } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
+// Create custom logger to silence transient ECONNREFUSED/ECONNRESET during backend uvicorn reloads
+const customLogger = createLogger();
+const originalLoggerError = customLogger.error.bind(customLogger);
+customLogger.error = (msg, options) => {
+  if (
+    typeof msg === 'string' &&
+    (msg.includes('ECONNREFUSED') ||
+      msg.includes('ECONNRESET') ||
+      msg.includes('http proxy error') ||
+      msg.includes('ws proxy error'))
+  ) {
+    return; // Silently ignore temporary disconnection during uvicorn reload windows
+  }
+  originalLoggerError(msg, options);
+};
+
 export default defineConfig({
+  customLogger,
   plugins: [react()],
   resolve: {
     alias: {
@@ -51,7 +68,6 @@ export default defineConfig({
 
             if (isIdempotent && retryCount < MAX_RETRIES && (err as any).code === 'ECONNREFUSED' && res && 'writeHead' in res) {
               (req as any).__proxyRetry = retryCount + 1;
-              console.warn(`[vite proxy] Backend unavailable, retrying (${retryCount + 1}/${MAX_RETRIES}) in ${RETRY_DELAY_MS}ms...`);
               setTimeout(() => {
                 try {
                   proxy.web(req, res, { target: 'http://127.0.0.1:8000' });
@@ -60,7 +76,6 @@ export default defineConfig({
               return;
             }
 
-            console.warn('[vite proxy] Backend connection failed. Returning 502 for client failover.');
             if (res && 'headersSent' in res && !res.headersSent && 'writeHead' in res && typeof res.writeHead === 'function') {
               try {
                 res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -77,6 +92,20 @@ export default defineConfig({
       '/evidence': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('error', (_err, _req, res) => {
+            if (res && 'headersSent' in res && !res.headersSent && 'writeHead' in res && typeof res.writeHead === 'function') {
+              try {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ detail: 'Backend server unavailable.' }));
+              } catch (_) { /* ignore */ }
+            } else if (res && 'destroy' in res && typeof (res as any).destroy === 'function') {
+              try {
+                (res as any).destroy();
+              } catch (_) { /* ignore */ }
+            }
+          });
+        },
       },
     },
   },
