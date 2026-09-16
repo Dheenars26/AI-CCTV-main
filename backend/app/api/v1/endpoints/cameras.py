@@ -331,12 +331,10 @@ async def mjpeg_frame_generator(
     else:
         placeholder = _generate_placeholder_jpeg("Camera Stream is Off" if not is_enabled else "Connecting to Camera Stream...")
         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + placeholder + b"\r\n"
-        if not is_enabled:
-            return
 
     last_sent_count = -1
     last_real_frame_time = time.time()
-    last_placeholder_sent_time = 0.0
+    last_placeholder_sent_time = time.time()
     last_sent_time = 0.0
 
     try:
@@ -353,9 +351,13 @@ async def mjpeg_frame_generator(
             if not is_enabled:
                 if camera_manager.is_running(camera_id):
                     camera_manager.stop_camera(camera_id)
-                placeholder = _generate_placeholder_jpeg("Camera Stream is Off")
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + placeholder + b"\r\n"
-                break
+                now_t = time.time()
+                if (now_t - last_placeholder_sent_time) >= 2.0:
+                    last_placeholder_sent_time = now_t
+                    placeholder = _generate_placeholder_jpeg("Camera Stream is Off")
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + placeholder + b"\r\n"
+                await asyncio.sleep(0.5)
+                continue
 
             # Ensure background ingestion worker is running ONLY when enabled
             if is_enabled and not camera_manager.is_running(camera_id):

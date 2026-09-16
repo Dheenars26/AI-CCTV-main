@@ -203,12 +203,15 @@ export const CameraStreamPlayer: React.FC<CameraStreamPlayerProps> = ({
   const handleTurnOn = async () => {
     setIsLocallyActive(true);
     setHasError(false);
-    // Set fresh stream URL immediately so browser initiates new stream request
-    const url = getStreamUrl(camera.id, true);
-    setStreamUrl(url);
     try {
       await startMutation.mutateAsync(camera.id);
+      // Allow ingestion worker a brief moment to capture first frame before browser requests stream
+      setTimeout(() => {
+        const url = getStreamUrl(camera.id, true);
+        setStreamUrl(url);
+      }, 350);
     } catch {
+      setIsLocallyActive(false);
       setHasError(true);
       setStreamUrl('');
     }
@@ -227,12 +230,19 @@ export const CameraStreamPlayer: React.FC<CameraStreamPlayerProps> = ({
     }
   };
 
-  const handleManualReconnect = () => {
+  const handleManualReconnect = async () => {
     setHasError(false);
     setRetryCount(0);
-    // Always force-refresh on manual reconnect
-    const url = getStreamUrl(camera.id, true);
-    setStreamUrl(url);
+    try {
+      await startMutation.mutateAsync(camera.id);
+      setTimeout(() => {
+        const url = getStreamUrl(camera.id, true);
+        setStreamUrl(url);
+      }, 350);
+    } catch {
+      const url = getStreamUrl(camera.id, true);
+      setStreamUrl(url);
+    }
   };
 
   const toggleFullScreen = useCallback(async () => {

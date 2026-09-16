@@ -103,21 +103,35 @@ class RTSPCamera(CameraSource):
             self.state.resolution = (640, 480)
             return True
 
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
         try:
             # Set OpenCV RTSP transport protocol flags if supported
             import os
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
             url_to_open = self._normalize_url(self.raw_rtsp_url)
             self.cap = cv2.VideoCapture(url_to_open, cv2.CAP_FFMPEG)
-            
+
             # Configure OpenCV timeouts & low latency 1-frame buffer
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self.timeout_seconds * 1000)
-            self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self.timeout_seconds * 1000)
 
             if self.cap.isOpened():
-                ret, test_frame = self.cap.read()
-                if ret and test_frame is not None:
+                # Allow a retry window for H.264/H.265 keyframe arrival (up to 4.0s)
+                test_frame = None
+                deadline = time.time() + 4.0
+                while time.time() < deadline:
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None:
+                        test_frame = frame
+                        break
+                    time.sleep(0.08)
+
+                if test_frame is not None:
                     width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     stream_fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -138,6 +152,14 @@ class RTSPCamera(CameraSource):
                     )
                     return True
 
+            # Release VideoCapture handle immediately if initialization failed
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+
             error_msg = f"RTSP stream offline or unreachable ({self.sanitized_url})"
             logger.error(f"Camera {self.camera_id}: {error_msg}")
             self.state.connection_status = CameraStatus.ERROR
@@ -145,6 +167,12 @@ class RTSPCamera(CameraSource):
             return False
 
         except Exception as e:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
             error_msg = f"RTSP stream exception: {str(e)}"
             logger.error(f"Camera {self.camera_id}: {error_msg}")
             self.state.connection_status = CameraStatus.ERROR
@@ -191,15 +219,16 @@ class RTSPCamera(CameraSource):
         if self._reader_thread and self._reader_thread.is_alive():
             # Wait for next fresh frame arriving from RTSP network socket
             signaled = self._new_frame_event.wait(timeout=0.5)
-            if not signaled:
-                now_sec = time.time()
-                if self._last_frame_read_time > 0 and (now_sec - self._last_frame_read_time > self.timeout_seconds):
-                    logger.warning(f"Camera {self.camera_id}: RTSP frame arrival timed out ({self.timeout_seconds}s)")
-                    return False, None
             with self._frame_lock:
-                self._new_frame_event.clear()
                 if self._latest_raw_frame is not None:
+                    self._new_frame_event.clear()
                     return True, self._latest_raw_frame
+            now_sec = time.time()
+            if self._last_frame_read_time > 0 and (now_sec - self._last_frame_read_time > self.timeout_seconds):
+                logger.warning(f"Camera {self.camera_id}: RTSP frame arrival timed out ({self.timeout_seconds}s)")
+                return False, None
+            # Return current buffer or wait
+            return False, None
 
         try:
             ret, frame = self.cap.read()
