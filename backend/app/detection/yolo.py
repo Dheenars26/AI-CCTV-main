@@ -58,8 +58,8 @@ class YOLODetector(BaseDetector):
                 torch.set_num_threads(min(8, max(4, cpu_cores - 2)))
             except Exception:
                 pass
-            self.is_cuda = bool(torch.cuda.is_available() and self.device.lower() not in ["cpu", ""])
-        except (ImportError, Exception):
+            self.is_cuda = torch.cuda.is_available() and self.device.lower() not in ["cpu", ""]
+        except (ImportError, OSError, Exception):
             self.is_cuda = False
         self.half = self.is_cuda
 
