@@ -52,8 +52,17 @@ class ConnectionManager:
             except Exception:
                 pass
 
-        if subprotocol and websocket.headers.get("Sec-WebSocket-Protocol"):
-            await websocket.accept(subprotocol=subprotocol)
+        client_subprotocols = websocket.headers.get("Sec-WebSocket-Protocol", "")
+        client_protos = [p.strip() for p in client_subprotocols.split(",") if p.strip()]
+
+        selected_subprotocol: Optional[str] = None
+        if subprotocol and subprotocol in client_protos:
+            selected_subprotocol = subprotocol
+        elif client_protos:
+            selected_subprotocol = client_protos[0]
+
+        if selected_subprotocol:
+            await websocket.accept(subprotocol=selected_subprotocol)
         else:
             await websocket.accept()
 

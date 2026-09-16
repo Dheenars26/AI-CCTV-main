@@ -236,6 +236,12 @@ async def get_alert(
     summary="Update / Resolve Alert",
     description="Updates state of an active alert incident (e.g. set state to RESOLVED or CLEARED)."
 )
+@router.put(
+    "/{alert_id}",
+    response_model=ResponseModel[AlertResponse],
+    summary="Update / Resolve Alert (PUT)",
+    description="Updates state of an active alert incident."
+)
 @router.patch(
     "/{alert_id}/acknowledge",
     response_model=ResponseModel[AlertResponse],

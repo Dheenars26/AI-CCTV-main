@@ -47,6 +47,7 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const pingIntervalRef = useRef<number | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const isReconnectingRef = useRef<boolean>(false);
+  const isConnectingRef = useRef<boolean>(false);
   const processedSeqSet = useRef<Set<string>>(new Set());
   const reconnectAttemptRef = useRef<number>(0);
   const lastActivityTimeRef = useRef<number>(Date.now());
@@ -54,24 +55,41 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const connect = useCallback(async () => {
     if (!isAuthenticated) return;
 
-    // Prevent duplicate connection attempts if already open or connecting
+    // Prevent duplicate connection attempts if already open, connecting, or in-flight
+    if (isConnectingRef.current) return;
     if (wsRef.current && (wsRef.current.readyState === WebSocket.CONNECTING || wsRef.current.readyState === WebSocket.OPEN)) {
       return;
     }
 
+    isConnectingRef.current = true;
+
     try {
-      // 1. Obtain short-lived single-use WebSocket Ticket
-      const ticket = await authApi.getWSTicket();
-      if (!ticket) return;
+      // 1. Obtain short-lived single-use WebSocket Ticket with graceful token fallback
+      let ticket: string | null = null;
+      try {
+        ticket = await authApi.getWSTicket();
+      } catch (err: any) {
+        console.warn('[WebSocket] WS ticket retrieval delayed, attempting access token fallback:', err?.message);
+      }
 
-      // 2. Construct WS URL using Ticket (No raw JWT token!)
-      const wsUrl = getWebSocketUrl(ticket);
+      const token = localStorage.getItem('access_token');
+      const ticketOrToken = ticket || token;
+      if (!ticketOrToken) {
+        isConnectingRef.current = false;
+        return;
+      }
 
-      // Pass single-use ticket in Subprotocol header: cctv-auth-wst_... AND in query parameter
-      const ws = new WebSocket(wsUrl, [`cctv-auth-${ticket}`]);
+      // 2. Construct WS URL using Ticket or Token fallback
+      const wsUrl = getWebSocketUrl(ticketOrToken);
+
+      // Pass single-use ticket in Subprotocol header if available, otherwise standard query
+      const ws = ticket
+        ? new WebSocket(wsUrl, [`cctv-auth-${ticket}`])
+        : new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        isConnectingRef.current = false;
         setIsConnected(true);
         reconnectAttemptRef.current = 0;
         lastActivityTimeRef.current = Date.now();
@@ -179,37 +197,45 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        isConnectingRef.current = false;
         setIsConnected(false);
         if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
         isReconnectingRef.current = true;
 
-        // Schedule auto-reconnect with fast backoff (max 2.5s) if user is authenticated
+        // Schedule auto-reconnect with fast backoff (max 3s) if user is authenticated
         if (isAuthenticated) {
           reconnectAttemptRef.current += 1;
-          const delayMs = Math.min(2500, 500 * Math.pow(1.5, reconnectAttemptRef.current - 1));
-          console.log(`[WebSocket] Disconnected. Reconnecting attempt #${reconnectAttemptRef.current} in ${Math.round(delayMs)}ms...`);
+          const delayMs = Math.min(3000, 500 * Math.pow(1.3, reconnectAttemptRef.current - 1));
+          console.log(`[WebSocket] Disconnected (code: ${event.code}). Reconnecting attempt #${reconnectAttemptRef.current} in ${Math.round(delayMs)}ms...`);
+          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
           reconnectTimeoutRef.current = window.setTimeout(() => {
             connect();
           }, delayMs);
         }
       };
 
-      ws.onerror = () => {
-        ws.close();
+      ws.onerror = (e) => {
+        isConnectingRef.current = false;
+        console.warn('[WebSocket] Connection error event:', e);
+        try {
+          ws.close();
+        } catch (_) {}
       };
     } catch (err: any) {
-      // If unauthorized (401/403), user session is not valid. Stop retrying.
-      if (err?.response?.status === 401 || err?.response?.status === 403) {
-        setIsConnected(false);
-        return;
+      isConnectingRef.current = false;
+      const status = err?.response?.status;
+      if (status === 401 || status === 403) {
+        console.warn('[WebSocket] Token refresh or authorization required, retrying in 3s...');
+      } else {
+        const errMsg = err?.message || String(err);
+        console.warn('[WebSocket] Connection setup delayed:', errMsg);
       }
-      const errMsg = err?.message || String(err);
-      console.warn('[WebSocket] Ticket retrieval temporarily delayed:', errMsg);
       if (isAuthenticated) {
+        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = window.setTimeout(() => {
           connect();
-        }, 5000);
+        }, 3000);
       }
     }
   }, [isAuthenticated, queryClient]);

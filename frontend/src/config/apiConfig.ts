@@ -23,7 +23,7 @@ export const API_HOST_URL = normalizeApiBase(rawApiUrl);
 export const API_BASE_URL = API_HOST_URL ? `${API_HOST_URL}/api/v1` : '/api/v1';
 
 // WebSocket Base URL
-export function getWebSocketUrl(ticket?: string): string {
+export function getWebSocketUrl(ticketOrToken?: string): string {
   let wsOrigin = '';
   if (API_HOST_URL) {
     wsOrigin = API_HOST_URL.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
@@ -32,7 +32,12 @@ export function getWebSocketUrl(ticket?: string): string {
     wsOrigin = `${protocol}//${window.location.host}`;
   }
   const endpoint = `${wsOrigin}/api/v1/ws`;
-  return ticket ? `${endpoint}?ticket=${encodeURIComponent(ticket)}` : endpoint;
+  if (!ticketOrToken) return endpoint;
+
+  if (ticketOrToken.startsWith('wst_')) {
+    return `${endpoint}?ticket=${encodeURIComponent(ticketOrToken)}`;
+  }
+  return `${endpoint}?token=${encodeURIComponent(ticketOrToken)}`;
 }
 
 // Stream Base URL for MJPEG camera streams
