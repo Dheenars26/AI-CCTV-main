@@ -474,8 +474,8 @@ class StandardPostprocessor(BasePostprocessor):
                     self._draw_pill_badge(frame.image, badge_label, (x1, badge_y), is_found=True)
                     continue
 
-                # Fire & Smoke detection drawing with responsive confidence threshold
-                min_draw_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.18) if "fire" in label else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.18)
+                # Fire & Smoke detection drawing with hardened confidence threshold
+                min_draw_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50) if "fire" in label else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
                 if det.confidence < min_draw_conf:
                     continue
 
@@ -542,28 +542,30 @@ class StandardEventManager(BaseEventManager):
         # 2. Dispatch Verified State Machine Alert Events (ALERT_SENT, ACTIVE, CLEARED) - Instant
         verified_events = frame.metadata.get("verified_events", [])
         for evt_dict in verified_events:
-            event_name = f"VERIFIED_{evt_dict.get('state', 'ALERT')}"
+            state_val = evt_dict.get('state', 'ALERT')
+            event_name = f"VERIFIED_{state_val}"
             try:
                 self.event_callback(event_name, evt_dict)
             except Exception as e:
                 logger.warning(f"EventManager: Failed to dispatch verified alert callback: {str(e)}")
 
-        # 3. Dispatch Raw AI Detection Events (Throttled to max 2 per second to prevent WebSocket/frontend flooding)
+        # 3. Dispatch Live Frame Telemetry (Throttled to max 2 per second for HUD telemetry without false alerting)
         if frame.detections and (now - self._last_detection_dispatch_time) >= 0.5:
             self._last_detection_dispatch_time = now
             for det in frame.detections:
                 payload = {
                     "camera_id": frame.camera_id,
-                    "event_type": "DETECTION_ALERT",
+                    "event_type": "DETECTION_FRAME",
                     "label": det.label,
                     "confidence": det.confidence,
                     "bbox": det.bbox.to_dict(),
+                    "is_verified": False,
                     "timestamp": frame.timestamp.isoformat()
                 }
                 try:
-                    self.event_callback("DETECTION_ALERT", payload)
+                    self.event_callback("DETECTION_FRAME", payload)
                 except Exception as e:
-                    logger.warning(f"EventManager: Failed to dispatch detection alert callback: {str(e)}")
+                    logger.warning(f"EventManager: Failed to dispatch detection frame callback: {str(e)}")
 
 
 class FramePipeline:

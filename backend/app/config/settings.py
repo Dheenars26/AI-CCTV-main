@@ -59,8 +59,8 @@ class Settings(BaseSettings):
     ENABLE_PPE_ROI: bool = False  # Disabled by default; enable only if ROI benchmarking justifies extra cost
 
     # Class-Specific Confidence Thresholds (Tuned for High Precision & Zero False Alarms)
-    FIRE_CONFIDENCE_THRESHOLD: float = 0.45
-    SMOKE_CONFIDENCE_THRESHOLD: float = 0.42
+    FIRE_CONFIDENCE_THRESHOLD: float = 0.50
+    SMOKE_CONFIDENCE_THRESHOLD: float = 0.48
     PERSON_CONFIDENCE_THRESHOLD: float = 0.40
     VEST_CONFIDENCE_THRESHOLD: float = 0.35
     GLASSES_CONFIDENCE_THRESHOLD: float = 0.30
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
 
     # YOLO Model File Paths & Backward Compatibility Aliases
     YOLO_MODEL_PATH: str = "models/fire_smoke.onnx"
-    YOLO_CONF_THRESHOLD: float = 0.42
+    YOLO_CONF_THRESHOLD: float = 0.48
     YOLO_IOU_THRESHOLD: float = 0.45
     YOLO_IMGSZ: int = 416
     YOLO_AUGMENT: bool = False
@@ -94,10 +94,10 @@ class Settings(BaseSettings):
     PERSON_MODEL_PATH: str = "models/yolov8n.onnx"
 
     # Fire & Smoke Temporal Verification (Requires persistent spatial detection before confirming)
-    FIRE_MIN_CONSECUTIVE_FRAMES: int = 6
-    FIRE_MIN_DURATION_SECONDS: float = 1.2
-    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 8
-    SMOKE_MIN_DURATION_SECONDS: float = 2.0
+    FIRE_MIN_CONSECUTIVE_FRAMES: int = 7
+    FIRE_MIN_DURATION_SECONDS: float = 1.4
+    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 9
+    SMOKE_MIN_DURATION_SECONDS: float = 2.2
     SMOKE_ALERT_COOLDOWN_SECONDS: float = 30.0
 
     # Feature Toggles for Safety Engine
@@ -109,11 +109,11 @@ class Settings(BaseSettings):
     PPE_WEBHOOK_ALERT_ENABLED: bool = False
 
     # Temporal Verification & False Alarm Reduction Settings
-    VERIFICATION_MIN_CONFIDENCE: float = 0.38
-    VERIFICATION_MIN_CONSECUTIVE_FRAMES: int = 6
-    VERIFICATION_MIN_DURATION_SECONDS: float = 1.2
+    VERIFICATION_MIN_CONFIDENCE: float = 0.45
+    VERIFICATION_MIN_CONSECUTIVE_FRAMES: int = 7
+    VERIFICATION_MIN_DURATION_SECONDS: float = 1.4
     VERIFICATION_COOLDOWN_SECONDS: float = 30.0
-    SPATIAL_IOU_THRESHOLD: float = 0.15
+    SPATIAL_IOU_THRESHOLD: float = 0.18
 
     # Incident Evidence Management & Video Archiving Settings
     EVIDENCE_STORAGE_DIR: str = "evidence"

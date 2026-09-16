@@ -122,20 +122,51 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           const dataPayload = envelope.data || envelope.payload || envelope;
           const evtLower = (envelope.event || '').toLowerCase();
           const labelStr = (dataPayload.class_name || dataPayload.label || dataPayload.event_type || '').toLowerCase();
+          const stateStr = (dataPayload.state || '').toUpperCase();
 
-          const isFire = evtLower.includes('fire') || labelStr.includes('fire');
-          const isSmoke = evtLower.includes('smoke') || labelStr.includes('smoke');
-          const isAlert = evtLower.includes('alert') || evtLower.includes('detection') || isFire || isSmoke;
+          const isClearedOrResolved =
+            evtLower.includes('clear') ||
+            evtLower.includes('resolve') ||
+            stateStr === 'CLEARED' ||
+            stateStr === 'RESOLVED';
 
-          if (isAlert) {
-            if (isFire) {
-              setActiveFireCount((prev) => Math.max(1, prev + 1));
+          if (isClearedOrResolved) {
+            const isFireCleared = evtLower.includes('fire') || labelStr.includes('fire');
+            const isSmokeCleared = evtLower.includes('smoke') || labelStr.includes('smoke');
+            if (isFireCleared) {
+              setActiveFireCount((prev) => Math.max(0, prev - 1));
             }
-            if (isSmoke) {
-              setActiveSmokeCount((prev) => Math.max(1, prev + 1));
+            if (isSmokeCleared) {
+              setActiveSmokeCount((prev) => Math.max(0, prev - 1));
+            }
+            if (!isFireCleared && !isSmokeCleared) {
+              setActiveFireCount(0);
+              setActiveSmokeCount(0);
             }
             queryClient.invalidateQueries({ queryKey: ['alerts'] });
             queryClient.invalidateQueries({ queryKey: ['system-stats'] });
+          } else {
+            // Only increment threat counters on VERIFIED incidents (with alert_id or verified state)
+            const hasIncidentId = Boolean(dataPayload.alert_id || dataPayload.id || dataPayload.event_id);
+            const isVerifiedState = stateStr === 'ALERT_SENT' || stateStr === 'ACTIVE' || stateStr === 'CONFIRMED';
+            const isVerifiedIncident =
+              evtLower.startsWith('verified_') ||
+              evtLower.includes('incident') ||
+              (hasIncidentId && (evtLower.includes('fire') || evtLower.includes('smoke') || evtLower.includes('alert') || isVerifiedState));
+
+            if (isVerifiedIncident) {
+              const isFire = evtLower.includes('fire') || labelStr.includes('fire');
+              const isSmoke = evtLower.includes('smoke') || labelStr.includes('smoke');
+
+              if (isFire) {
+                setActiveFireCount((prev) => Math.max(1, prev + 1));
+              }
+              if (isSmoke) {
+                setActiveSmokeCount((prev) => Math.max(1, prev + 1));
+              }
+              queryClient.invalidateQueries({ queryKey: ['alerts'] });
+              queryClient.invalidateQueries({ queryKey: ['system-stats'] });
+            }
           }
 
           if (evtLower.includes('camera') || evtLower.includes('system') || evtLower.includes('dvr')) {

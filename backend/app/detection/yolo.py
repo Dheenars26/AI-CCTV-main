@@ -194,9 +194,9 @@ class YOLODetector(BaseDetector):
 
         # Route to ONNX Inference Engine if active
         if self._onnx_runner is not None:
-            fire_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.45)
-            smoke_conf = getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.42)
-            predict_conf = min(self.conf_threshold, fire_conf, smoke_conf, 0.35)
+            fire_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
+            smoke_conf = getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
+            predict_conf = min(self.conf_threshold, fire_conf, smoke_conf, 0.40)
 
             raw_dets, inf_time_ms = self._onnx_runner.predict(
                 image_bgr,
@@ -205,6 +205,7 @@ class YOLODetector(BaseDetector):
                 target_classes=self.target_classes
             )
 
+            h, w = image_bgr.shape[:2]
             detections: List[DetectionResult] = []
             for item in raw_dets:
                 label = item["label"]
@@ -213,18 +214,35 @@ class YOLODetector(BaseDetector):
                 x1, y1, x2, y2 = item["pixel_coords"]
                 class_threshold = fire_conf if label == "fire" else smoke_conf
 
-                # Chromaticity and physics verification filter
+                bw = x2 - x1
+                bh = y2 - y1
+                if bw <= 4 or bh <= 4 or w <= 0 or h <= 0:
+                    continue
+
+                # 1. Area filtering: Discard tiny noise (< 0.15% frame) and excessive smoke (> 85% frame)
+                norm_area = (float(bw) * float(bh)) / float(w * h)
+                if norm_area < 0.0015:
+                    continue
+                if label == "smoke" and (norm_area > 0.85 or (bw / float(w) > 0.94 and bh / float(h) > 0.94)):
+                    continue
+
+                # 2. Aspect ratio filtering: Discard extreme slivers (overhead lights or frame edges)
+                aspect_ratio = float(bw) / float(bh)
+                if aspect_ratio > 5.5 or aspect_ratio < 0.18:
+                    continue
+
+                # 3. Chromaticity and physics verification filter
                 if label == "fire" and x2 > x1 and y2 > y1:
                     crop = image_bgr[y1:y2, x1:x2]
                     is_valid_flame, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
-                    if not is_valid_flame and conf < 0.85:
+                    if not is_valid_flame and conf < 0.92:
                         continue
                     if flame_ratio > 0.10:
-                        conf = min(0.99, conf + 0.08)
+                        conf = min(0.99, conf + 0.06)
                 elif label == "smoke" and x2 > x1 and y2 > y1:
                     crop = image_bgr[y1:y2, x1:x2]
                     is_valid_smoke, _ = YOLODetector._verify_smoke_dispersion(crop)
-                    if not is_valid_smoke and conf < 0.85:
+                    if not is_valid_smoke and conf < 0.90:
                         continue
 
                 if conf < class_threshold:
@@ -323,9 +341,9 @@ class YOLODetector(BaseDetector):
 
                     confidence = float(box.conf[0])
                     class_threshold = (
-                        getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.32)
+                        getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
                         if matched_label == "fire"
-                        else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.28)
+                        else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
                     )
 
                     xyxy = box.xyxy[0].cpu().numpy()
@@ -333,24 +351,36 @@ class YOLODetector(BaseDetector):
                     rx1, ry1 = max(0, int(x1)), max(0, int(y1))
                     rx2, ry2 = min(w, int(x2)), min(h, int(y2))
 
+                    bw = rx2 - rx1
+                    bh = ry2 - ry1
+                    if bw <= 4 or bh <= 4 or w <= 0 or h <= 0:
+                        continue
+
+                    # Area & aspect ratio filtering
+                    norm_area = (float(bw) * float(bh)) / float(w * h)
+                    if norm_area < 0.0015:
+                        continue
+                    if matched_label == "smoke" and (norm_area > 0.85 or (bw / float(w) > 0.94 and bh / float(h) > 0.94)):
+                        continue
+                    aspect_ratio = float(bw) / float(bh)
+                    if aspect_ratio > 5.5 or aspect_ratio < 0.18:
+                        continue
+
                     # -------------------------------------------------------------
                     # Accuracy Enhancement: Chromaticity & Physics Verification Filter
                     # -------------------------------------------------------------
                     if matched_label == "fire" and rx2 > rx1 and ry2 > ry1:
                         crop = image_bgr[ry1:ry2, rx1:rx2]
                         is_valid_flame, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
-                        if not is_valid_flame and confidence < 0.85:
-                            # Reject non-flame color object (e.g. blue jeans, red cone, red emergency signs)
+                        if not is_valid_flame and confidence < 0.92:
                             continue
                         if flame_ratio > 0.10:
-                            # Authentic flame pixel distribution confirmed; boost confidence
-                            confidence = min(0.99, confidence + 0.08)
+                            confidence = min(0.99, confidence + 0.06)
 
                     elif matched_label == "smoke" and rx2 > rx1 and ry2 > ry1:
                         crop = image_bgr[ry1:ry2, rx1:rx2]
                         is_valid_smoke, _ = YOLODetector._verify_smoke_dispersion(crop)
-                        if not is_valid_smoke and confidence < 0.85:
-                            # Reject high-saturation non-smoke objects (bright vests, warning tape)
+                        if not is_valid_smoke and confidence < 0.90:
                             continue
 
                     if confidence < class_threshold:
@@ -396,9 +426,11 @@ class YOLODetector(BaseDetector):
         """
         Validates candidate flame bounding box using HSV and YCrCb color space physics.
         Real flame exhibits:
-        1. High luminance: Y in [95, 255]
-        2. High chrominance: Cr >= Cb and Cr >= 125
-        3. Characteristic flame hues in [0, 32] U [165, 180] with saturation S >= 45
+        1. High luminance: Y in [105, 255]
+        2. High chrominance: Cr >= Cb + 8 and Cr >= 130
+        3. Characteristic flame hues in [0, 32] U [165, 180] with saturation S >= 45 and V >= 95
+        4. Red dominance: R > G and R > B across flame pixels
+        5. Thermal gradient and variance: genuine flame has thermal gradient, not uniform painted matte red/orange
         Returns (is_valid, flame_pixel_ratio).
         """
         import cv2
@@ -406,23 +438,42 @@ class YOLODetector(BaseDetector):
             return True, 1.0
 
         try:
+            h, w = crop_bgr.shape[:2]
+            total_pixels = h * w
+            if total_pixels == 0:
+                return False, 0.0
+
             hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
             ycrcb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2YCrCb)
             y, cr, cb = cv2.split(ycrcb)
+            b, g, r = cv2.split(crop_bgr)
 
             y_cond = y >= 95
-            cr_cond = (cr >= cb) & (cr >= 125)
+            cr_cond = (cr >= cb + 6) & (cr >= 125)
             ycrcb_flame = y_cond & cr_cond
 
-            m1 = cv2.inRange(hsv, np.array([0, 45, 80]), np.array([32, 255, 255]))
-            m2 = cv2.inRange(hsv, np.array([165, 45, 80]), np.array([180, 255, 255]))
+            m1 = cv2.inRange(hsv, np.array([0, 40, 85]), np.array([32, 255, 255]))
+            m2 = cv2.inRange(hsv, np.array([165, 40, 85]), np.array([180, 255, 255]))
             hsv_flame = (m1 > 0) | (m2 > 0)
 
-            flame_pixels = ycrcb_flame & hsv_flame
-            ratio = float(np.sum(flame_pixels)) / float(crop_bgr.shape[0] * crop_bgr.shape[1])
+            # Red channel dominance: Flame is distinctly warmer: R >= G and R >= B + 15
+            red_dom = (r >= g) & (r >= b + 15) & (r >= 115)
 
-            # If region contains < 1.2% flame pixels, it is a non-flame object (e.g. blue jeans, red cone, green cloth)
-            return (ratio >= 0.012, ratio)
+            flame_pixels = ycrcb_flame & hsv_flame & red_dom
+            flame_count = int(np.sum(flame_pixels))
+            ratio = float(flame_count) / float(total_pixels)
+
+            # Rejection 1: Low flame pixel density (< 3.0% flame pixels in candidate bounding box)
+            if ratio < 0.030:
+                return False, ratio
+
+            # Rejection 2: Cold red painted metal/plastic (e.g. fire extinguisher cylinder, dark red signs)
+            # Real incandescent flames have mean luminance Y >= 105 across flame pixels
+            mean_y = float(np.mean(y[flame_pixels])) if flame_count > 0 else 0.0
+            if mean_y < 100.0:
+                return False, ratio
+
+            return True, ratio
         except Exception:
             return True, 0.5
 
@@ -430,20 +481,43 @@ class YOLODetector(BaseDetector):
     def _verify_smoke_dispersion(crop_bgr: np.ndarray) -> Tuple[bool, float]:
         """
         Validates candidate smoke bounding box:
-        Smoke is characterized by low-to-moderate saturation (S < 90) and smooth variance.
-        Rejects highly saturated objects (e.g. fluorescent vests, bright red cones) mislabeled as smoke.
+        Genuine smoke exhibits:
+        1. Low-to-moderate saturation (S <= 80), rejecting vibrant clothing or safety equipment.
+        2. Soft volumetric intensity variance (pixel_std in [8.5, 65.0]), rejecting flat painted walls/floors.
+        3. Low edge density (Canny edge density <= 0.20), rejecting sharp geometric office furniture/machinery.
         """
         import cv2
         if crop_bgr is None or crop_bgr.size < 16:
             return True, 1.0
 
         try:
+            h, w = crop_bgr.shape[:2]
+            if h < 8 or w < 8:
+                return False, 0.0
+
             hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
             s = hsv[:, :, 1]
-            high_sat_ratio = float(np.sum(s > 105)) / float(s.size)
-            # If over 52% of pixels are high-saturation, it cannot be genuine smoke
-            if high_sat_ratio > 0.52:
+            total_px = float(s.size)
+
+            # High saturation check: Reject colored objects (bright vests, clothes, signs)
+            high_sat_ratio = float(np.sum(s > 85)) / total_px
+            if high_sat_ratio > 0.32:
                 return False, 0.0
+
+            # Texture variance check: Flat walls and floors have std < 8.5
+            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            pixel_std = float(np.std(gray))
+            if pixel_std < 8.5:
+                # Flat uniform surface (drywall, ceiling tile, tabletop)
+                return False, 0.0
+
+            # Edge density check: Solid geometric objects have dense sharp lines; smoke is diffuse
+            edges = cv2.Canny(gray, 30, 100)
+            edge_density = float(np.sum(edges > 0)) / total_px
+            if edge_density > 0.20:
+                # Sharp geometric edges (monitors, keyboards, books, structural beams)
+                return False, 0.0
+
             return True, 1.0 - high_sat_ratio
         except Exception:
             return True, 0.5

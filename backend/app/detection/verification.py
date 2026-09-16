@@ -88,19 +88,19 @@ class ClassVerificationTracker:
         self.class_name = class_name
         cls_lower = class_name.lower()
         if cls_lower == "fire":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.45)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 6)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.2)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 7)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.4)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "VERIFICATION_COOLDOWN_SECONDS", 30.0)
         elif cls_lower == "smoke":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.42)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 8)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.0)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 9)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.2)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "SMOKE_ALERT_COOLDOWN_SECONDS", 30.0)
         else:
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.38)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 6
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 1.2
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 7
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 1.4
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else 30.0
         self.cleared_miss_tolerance = max(2, cleared_miss_tolerance)
 
@@ -131,12 +131,12 @@ class ClassVerificationTracker:
             if d.class_name.lower() == self.class_name.lower() and d.confidence >= self.min_confidence
         ]
 
-        spatial_iou_threshold = getattr(settings, "SPATIAL_IOU_THRESHOLD", 0.05)
+        spatial_iou_threshold = getattr(settings, "SPATIAL_IOU_THRESHOLD", 0.18)
         best_det = None
 
         if class_dets:
             if self.latest_bbox and self.state in [EventState.POSSIBLE, EventState.ALERT_SENT, EventState.ACTIVE]:
-                # Spatial tracking: match boxes that overlap (IoU >= threshold) OR have close centroids (< 0.45 normalized dist)
+                # Spatial tracking: match boxes that overlap (IoU >= threshold) OR have close centroids (< 0.35 normalized dist)
                 matching_dets = []
                 for d in class_dets:
                     iou = d.bbox.iou(self.latest_bbox)
@@ -145,7 +145,7 @@ class ClassVerificationTracker:
                     c_curr_x = (d.bbox.x_min + d.bbox.x_max) / 2.0
                     c_curr_y = (d.bbox.y_min + d.bbox.y_max) / 2.0
                     dist = ((c_prev_x - c_curr_x) ** 2 + (c_prev_y - c_curr_y) ** 2) ** 0.5
-                    if iou >= spatial_iou_threshold or dist <= 0.45:
+                    if iou >= spatial_iou_threshold or dist <= 0.35:
                         matching_dets.append((d, max(iou, 1.0 - dist)))
 
                 if matching_dets:
