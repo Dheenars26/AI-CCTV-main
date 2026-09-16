@@ -88,19 +88,19 @@ class ClassVerificationTracker:
         self.class_name = class_name
         cls_lower = class_name.lower()
         if cls_lower == "fire":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.32)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 3)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 0.5)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.45)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 6)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.2)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "VERIFICATION_COOLDOWN_SECONDS", 30.0)
         elif cls_lower == "smoke":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.28)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 3)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 0.5)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.42)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 8)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.0)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "SMOKE_ALERT_COOLDOWN_SECONDS", 30.0)
         else:
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.30)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 3
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 0.5
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.38)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 6
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 1.2
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else 30.0
         self.cleared_miss_tolerance = max(2, cleared_miss_tolerance)
 

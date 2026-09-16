@@ -52,6 +52,7 @@ class PersonDetector(BaseDetector):
         self.loaded_at: Optional[str] = None
         self.model_hash: str = "unknown"
         self._model: Any = None
+        self._onnx_runner: Any = None
         self._is_mock_fallback: bool = False
 
         self.initialize()
@@ -71,6 +72,7 @@ class PersonDetector(BaseDetector):
             if cache_key in _PERSON_MODEL_CACHE:
                 cached = _PERSON_MODEL_CACHE[cache_key]
                 self._model = cached.get("model")
+                self._onnx_runner = cached.get("onnx_runner")
                 self._is_mock_fallback = cached.get("is_mock", True)
                 self.status = DetectorStatus.DEGRADED if self._is_mock_fallback else DetectorStatus.HEALTHY
                 self.loaded_at = cached.get("loaded_at", datetime.now(timezone.utc).isoformat())
@@ -81,9 +83,38 @@ class PersonDetector(BaseDetector):
                 self._is_mock_fallback = True
                 self.status = DetectorStatus.DEGRADED
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PERSON_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True, "loaded_at": self.loaded_at}
+                _PERSON_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True, "loaded_at": self.loaded_at}
                 return True
 
+            # Attempt 1: High-Performance ONNX Runtime Model Engine
+            onnx_candidates = []
+            if self.model_path.endswith(".onnx"):
+                onnx_candidates.append(self.model_path)
+            else:
+                onnx_candidates.append(os.path.splitext(self.model_path)[0] + ".onnx")
+            onnx_candidates.append("models/yolov8n.onnx")
+            onnx_candidates.append("models/ppe.onnx")
+            backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            onnx_candidates.append(os.path.join(backend_root, "models", "yolov8n.onnx"))
+            onnx_candidates.append(os.path.join(backend_root, "models", "ppe.onnx"))
+
+            for cand in onnx_candidates:
+                if cand and os.path.isfile(cand):
+                    try:
+                        from app.detection.onnx_engine import get_onnx_yolo_runner
+                        runner = get_onnx_yolo_runner(cand, device=self.device)
+                        self._onnx_runner = runner
+                        self._model = None
+                        self._is_mock_fallback = False
+                        self.status = DetectorStatus.HEALTHY
+                        self.loaded_at = datetime.now(timezone.utc).isoformat()
+                        _PERSON_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": runner, "is_mock": False, "loaded_at": self.loaded_at}
+                        logger.info(f"PersonDetector: Successfully initialized ONNX model from '{cand}'.")
+                        return True
+                    except Exception as oe:
+                        logger.warning(f"PersonDetector: Could not initialize ONNX runner from '{cand}': {oe}")
+
+            # Attempt 2: Ultralytics PyTorch Engine
             try:
                 import logging as _logging
                 try:
@@ -115,7 +146,7 @@ class PersonDetector(BaseDetector):
                 self._is_mock_fallback = False
                 self.status = DetectorStatus.HEALTHY
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PERSON_MODEL_CACHE[cache_key] = {"model": model, "is_mock": False, "loaded_at": self.loaded_at}
+                _PERSON_MODEL_CACHE[cache_key] = {"model": model, "onnx_runner": None, "is_mock": False, "loaded_at": self.loaded_at}
                 return True
 
             except Exception as e:
@@ -123,7 +154,7 @@ class PersonDetector(BaseDetector):
                 self._is_mock_fallback = True
                 self.status = DetectorStatus.DEGRADED
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PERSON_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True, "loaded_at": self.loaded_at}
+                _PERSON_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True, "loaded_at": self.loaded_at}
                 return True
 
     def detect(self, image_bgr: Any, candidate_rois: Optional[List[BoundingBox]] = None, **kwargs: Any) -> List[DetectionResult]:
@@ -132,6 +163,36 @@ class PersonDetector(BaseDetector):
 
         h, w = image_bgr.shape[:2]
         detections: List[DetectionResult] = []
+
+        # High-Performance ONNX Runner
+        if self._onnx_runner is not None:
+            try:
+                raw_dets, inf_time_ms = self._onnx_runner.predict(
+                    image_bgr,
+                    conf_threshold=self.conf_threshold,
+                    iou_threshold=0.45,
+                    target_classes=None
+                )
+                for d in raw_dets:
+                    label = d["label"].lower().strip()
+                    cid = d.get("class_id", -1)
+                    # COCO class 0 is 'person', or name is 'person' / 'worker'
+                    if cid == 0 or label in ["person", "worker", "human"]:
+                        detections.append(DetectionResult(
+                            label="person",
+                            confidence=d["confidence"],
+                            bbox=d["bbox"],
+                            metadata={
+                                "detector_module": "PersonDetector",
+                                "engine": "ONNXYOLORunner",
+                                "device": self.device,
+                                "inference_time_ms": inf_time_ms
+                            }
+                        ))
+                if detections:
+                    return detections
+            except Exception as oe:
+                logger.error(f"PersonDetector: Error during ONNX inference: {oe}")
 
         if not self._is_mock_fallback and self._model is not None:
             try:
@@ -175,8 +236,8 @@ class PersonDetector(BaseDetector):
             except Exception as e:
                 logger.error(f"PersonDetector: Error during YOLO detection: {str(e)}")
 
-        # If YOLO model is unavailable or in mock fallback, run OpenCV Face/Upperbody cascade detector
-        if not detections and (self._is_mock_fallback or self._model is None):
+        # If neural network detector produced no detections and fallback is allowed, run OpenCV cascade
+        if not detections and (self._is_mock_fallback or (self._model is None and self._onnx_runner is None)):
             cv_persons = self._detect_opencv_person_fallback(image_bgr)
             detections.extend(cv_persons)
 

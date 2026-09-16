@@ -58,19 +58,19 @@ class Settings(BaseSettings):
     ENABLE_PERSON_TRACKING: bool = True
     ENABLE_PPE_ROI: bool = False  # Disabled by default; enable only if ROI benchmarking justifies extra cost
 
-    # Class-Specific Confidence Thresholds
-    FIRE_CONFIDENCE_THRESHOLD: float = 0.32
-    SMOKE_CONFIDENCE_THRESHOLD: float = 0.28
-    PERSON_CONFIDENCE_THRESHOLD: float = 0.28
-    VEST_CONFIDENCE_THRESHOLD: float = 0.22
-    GLASSES_CONFIDENCE_THRESHOLD: float = 0.22
+    # Class-Specific Confidence Thresholds (Tuned for High Precision & Zero False Alarms)
+    FIRE_CONFIDENCE_THRESHOLD: float = 0.45
+    SMOKE_CONFIDENCE_THRESHOLD: float = 0.42
+    PERSON_CONFIDENCE_THRESHOLD: float = 0.40
+    VEST_CONFIDENCE_THRESHOLD: float = 0.35
+    GLASSES_CONFIDENCE_THRESHOLD: float = 0.30
     ENABLE_CV_VEST_DETECTION: bool = True
     ENABLE_CV_HELMET_DETECTION: bool = False
     ENABLE_CV_GLASSES_DETECTION: bool = True
 
     # YOLO Model File Paths & Backward Compatibility Aliases
-    YOLO_MODEL_PATH: str = "models/fire_smoke.pt"
-    YOLO_CONF_THRESHOLD: float = 0.32
+    YOLO_MODEL_PATH: str = "models/fire_smoke.onnx"
+    YOLO_CONF_THRESHOLD: float = 0.42
     YOLO_IOU_THRESHOLD: float = 0.45
     YOLO_IMGSZ: int = 416
     YOLO_AUGMENT: bool = False
@@ -83,20 +83,21 @@ class Settings(BaseSettings):
     AI_PPE_ENABLED: bool = True
     AI_PERSON_ENABLED: bool = True
     AI_ZONE_ENABLED: bool = True
-    PPE_MODEL_PATH: str = "models/ppe.pt"
-    PPE_CONFIDENCE_THRESHOLD: float = 0.25
+    PPE_MODEL_PATH: str = "models/ppe.onnx"
+    PPE_CONFIDENCE_THRESHOLD: float = 0.38
     PPE_IOU_THRESHOLD: float = 0.45
     PPE_DEVICE: str = "cpu"
-    PPE_VERIFICATION_FRAMES: int = 4
-    PPE_VERIFICATION_DURATION_SECONDS: float = 1.0
+    PPE_VERIFICATION_FRAMES: int = 6
+    PPE_VERIFICATION_DURATION_SECONDS: float = 1.2
     PPE_INFERENCE_INTERVAL_SEC: float = 0.25
     PPE_ALERT_COOLDOWN_SECONDS: float = 60.0
+    PERSON_MODEL_PATH: str = "models/yolov8n.onnx"
 
-    # Fire & Smoke Temporal Verification
-    FIRE_MIN_CONSECUTIVE_FRAMES: int = 3
-    FIRE_MIN_DURATION_SECONDS: float = 0.5
-    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 4
-    SMOKE_MIN_DURATION_SECONDS: float = 0.8
+    # Fire & Smoke Temporal Verification (Requires persistent spatial detection before confirming)
+    FIRE_MIN_CONSECUTIVE_FRAMES: int = 6
+    FIRE_MIN_DURATION_SECONDS: float = 1.2
+    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 8
+    SMOKE_MIN_DURATION_SECONDS: float = 2.0
     SMOKE_ALERT_COOLDOWN_SECONDS: float = 30.0
 
     # Feature Toggles for Safety Engine
@@ -108,11 +109,11 @@ class Settings(BaseSettings):
     PPE_WEBHOOK_ALERT_ENABLED: bool = False
 
     # Temporal Verification & False Alarm Reduction Settings
-    VERIFICATION_MIN_CONFIDENCE: float = 0.30
-    VERIFICATION_MIN_CONSECUTIVE_FRAMES: int = 3
-    VERIFICATION_MIN_DURATION_SECONDS: float = 0.5
+    VERIFICATION_MIN_CONFIDENCE: float = 0.38
+    VERIFICATION_MIN_CONSECUTIVE_FRAMES: int = 6
+    VERIFICATION_MIN_DURATION_SECONDS: float = 1.2
     VERIFICATION_COOLDOWN_SECONDS: float = 30.0
-    SPATIAL_IOU_THRESHOLD: float = 0.10
+    SPATIAL_IOU_THRESHOLD: float = 0.15
 
     # Incident Evidence Management & Video Archiving Settings
     EVIDENCE_STORAGE_DIR: str = "evidence"

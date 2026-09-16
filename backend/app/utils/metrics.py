@@ -17,7 +17,7 @@ except ImportError:
 try:
     import torch
     TORCH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError, Exception):
     TORCH_AVAILABLE = False
 
 

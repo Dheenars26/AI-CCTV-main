@@ -73,6 +73,7 @@ class PPEDetector(BaseDetector):
         self.loaded_at: Optional[str] = None
         self.model_hash: str = "unknown"
         self._model: Any = None
+        self._onnx_runner: Any = None
         self._is_mock_fallback: bool = False
 
         self.initialize()
@@ -80,8 +81,11 @@ class PPEDetector(BaseDetector):
     def has_person_class(self) -> bool:
         """
         Inspects model names dictionary to verify if a 'person' or 'worker' class exists.
-        Returns True if ppe.pt supports person/worker detection directly.
+        Returns True if the loaded weights support person/worker detection directly.
         """
+        if self._onnx_runner is not None and hasattr(self._onnx_runner, "names"):
+            return any(str(name).lower() in ["person", "worker"] for name in self._onnx_runner.names.values())
+
         if self._is_mock_fallback or self._model is None or not hasattr(self._model, "names"):
             return any(c in ["person", "worker"] for c in self.target_classes)
 
@@ -95,7 +99,7 @@ class PPEDetector(BaseDetector):
     def initialize(self) -> bool:
         """
         Loads PPE YOLO model weights into compute device safely.
-        If weights file or libraries are missing, falls back to safe mode without crashing.
+        Prioritizes ONNX runtime for cross-platform speed and compliance, with Ultralytics fallback.
         """
         cache_key = f"{self.model_path}_{self.device}"
 
@@ -112,6 +116,7 @@ class PPEDetector(BaseDetector):
             if cache_key in _PPE_MODEL_CACHE:
                 cached = _PPE_MODEL_CACHE[cache_key]
                 self._model = cached.get("model")
+                self._onnx_runner = cached.get("onnx_runner")
                 self._is_mock_fallback = cached.get("is_mock", True)
                 self.status = DetectorStatus.DEGRADED if self._is_mock_fallback else DetectorStatus.HEALTHY
                 self.loaded_at = cached.get("loaded_at", datetime.now(timezone.utc).isoformat())
@@ -121,24 +126,51 @@ class PPEDetector(BaseDetector):
             if settings.APP_ENV == "testing" or "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
                 logger.warning(
                     f"PPEDetector: Safe Testing Mode active (APP_ENV={settings.APP_ENV}). "
-                    f"Skipping PyTorch heavy CUDA/CPU initialization."
+                    f"Skipping heavy neural network initialization."
                 )
                 self._is_mock_fallback = True
                 self.status = DetectorStatus.DEGRADED
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PPE_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True, "loaded_at": self.loaded_at}
+                _PPE_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True, "loaded_at": self.loaded_at}
                 return True
 
+            # Attempt 1: High-Performance ONNX Runtime Model Engine
+            onnx_candidates = []
+            if self.model_path.endswith(".onnx"):
+                onnx_candidates.append(self.model_path)
+            else:
+                onnx_candidates.append(os.path.splitext(self.model_path)[0] + ".onnx")
+            onnx_candidates.append("models/ppe.onnx")
+            backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            onnx_candidates.append(os.path.join(backend_root, "models", "ppe.onnx"))
+
+            for cand in onnx_candidates:
+                if cand and os.path.isfile(cand):
+                    try:
+                        from app.detection.onnx_engine import get_onnx_yolo_runner
+                        runner = get_onnx_yolo_runner(cand, device=self.device)
+                        self._onnx_runner = runner
+                        self._model = None
+                        self._is_mock_fallback = False
+                        self.status = DetectorStatus.HEALTHY
+                        self.loaded_at = datetime.now(timezone.utc).isoformat()
+                        _PPE_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": runner, "is_mock": False, "loaded_at": self.loaded_at}
+                        logger.info(f"PPEDetector: Successfully loaded ONNX PPE model from '{cand}'.")
+                        return True
+                    except Exception as oe:
+                        logger.warning(f"PPEDetector: Could not initialize ONNX runner from '{cand}': {oe}")
+
+            # Attempt 2: Ultralytics PyTorch Engine
             if not os.path.isfile(self.model_path):
                 logger.warning(
                     "PPEDetector: PPE weights are missing at '%s'. PPE detection "
-                    "is disabled until a trained PPE model is configured.",
+                    "is running in fallback mode.",
                     self.model_path,
                 )
                 self._is_mock_fallback = True
                 self.status = DetectorStatus.DEGRADED
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PPE_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True, "loaded_at": self.loaded_at}
+                _PPE_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True, "loaded_at": self.loaded_at}
                 return True
 
             try:
@@ -158,7 +190,6 @@ class PPEDetector(BaseDetector):
                     logger.warning(f"PPEDetector: Model fuse notice: {fe}")
                 model.to(self.device)
 
-                # Pre-warm model graph with a dummy pass to eliminate initial cold-start lag
                 try:
                     dummy_img = np.zeros((416, 416, 3), dtype=np.uint8)
                     import torch
@@ -175,7 +206,7 @@ class PPEDetector(BaseDetector):
                 self._is_mock_fallback = False
                 self.status = DetectorStatus.HEALTHY
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PPE_MODEL_CACHE[cache_key] = {"model": model, "is_mock": False, "loaded_at": self.loaded_at}
+                _PPE_MODEL_CACHE[cache_key] = {"model": model, "onnx_runner": None, "is_mock": False, "loaded_at": self.loaded_at}
                 return True
 
             except Exception as e:
@@ -183,7 +214,7 @@ class PPEDetector(BaseDetector):
                 self._is_mock_fallback = True
                 self.status = DetectorStatus.DEGRADED
                 self.loaded_at = datetime.now(timezone.utc).isoformat()
-                _PPE_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True, "loaded_at": self.loaded_at}
+                _PPE_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True, "loaded_at": self.loaded_at}
                 return True
 
     def detect(
@@ -199,6 +230,86 @@ class PPEDetector(BaseDetector):
         """
         if not getattr(settings, "AI_PPE_ENABLED", True) or image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
+
+        h, w = image_bgr.shape[:2]
+
+        # Route to ONNX Inference Engine if active
+        if self._onnx_runner is not None:
+            predict_conf = min(
+                self.conf_threshold,
+                getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35),
+                getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.30),
+                getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38)
+            )
+            raw_dets, inference_time_ms = self._onnx_runner.predict(
+                image_bgr,
+                conf_threshold=predict_conf,
+                iou_threshold=self.iou_threshold,
+                target_classes=None
+            )
+            detections: List[DetectionResult] = []
+            for item in raw_dets:
+                raw_class_name = item["label"].lower().strip()
+                confidence = item["confidence"]
+                bbox = item["bbox"]
+                x1, y1, x2, y2 = item["pixel_coords"]
+
+                matched_label = None
+                if raw_class_name in ["person", "worker", "human"]:
+                    matched_label = "person"
+                elif raw_class_name in ["helmet", "hard_hat", "hardhat", "cap", "headgear"]:
+                    matched_label = "helmet"
+                elif raw_class_name in ["vest", "safety_vest", "safety vest", "jacket", "hivis", "waistcoat", "high_vis_vest", "reflective_vest"]:
+                    matched_label = "vest"
+                elif raw_class_name in ["mask", "face_mask", "n95", "respirator"]:
+                    matched_label = "mask"
+                elif raw_class_name in ["goggles", "glasses", "safety_glasses", "safety_glass", "safety glass", "eyewear", "eye_protection", "eye protection", "protective_glasses", "protective glasses"]:
+                    matched_label = "goggles"
+                elif raw_class_name in ["gloves", "glove", "hand_protection"]:
+                    matched_label = "gloves"
+                elif raw_class_name in ["safety_shoes", "safety_shoe", "shoes", "shoe", "boots", "boot"]:
+                    matched_label = "safety_shoes"
+                elif self.target_classes and raw_class_name in self.target_classes:
+                    matched_label = raw_class_name
+
+                if not matched_label or (self.target_classes and matched_label not in self.target_classes and matched_label != "person"):
+                    continue
+
+                class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35) if matched_label == "vest" else (
+                    getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.30) if matched_label == "goggles" else (
+                        getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40) if matched_label == "person" else getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38)
+                    )
+                )
+                if confidence < class_threshold:
+                    continue
+
+                detections.append(DetectionResult(
+                    label=matched_label,
+                    confidence=confidence,
+                    bbox=bbox,
+                    metadata={
+                        "detector_module": "PPEDetector",
+                        "engine": "ONNXYOLORunner",
+                        "inference_time_ms": inference_time_ms,
+                        "device": self.device,
+                        "raw_pixel_coords": [x1, y1, x2, y2]
+                    }
+                ))
+
+            if person_dets is not None and len(person_dets) > 0:
+                active_person_dets = list(person_dets)
+            else:
+                active_person_dets = [d for d in detections if d.label.lower() == "person"]
+
+            if active_person_dets:
+                ppe_items = [d for d in detections if d.label.lower() != "person"]
+                for p_idx, person in enumerate(active_person_dets):
+                    equipped = self._associate_ppe_to_worker(person.bbox, ppe_items)
+                    person.metadata["worker_id"] = p_idx + 1
+                    person.metadata["equipped_ppe"] = equipped
+                    person.metadata["is_compliant"] = bool("helmet" in equipped and "vest" in equipped)
+
+            return detections
 
         if self._is_mock_fallback or self._model is None:
             return self._detect_mock_fallback(image_bgr)

@@ -64,13 +64,14 @@ class YOLODetector(BaseDetector):
         self.half = self.is_cuda
 
         self._model = None
+        self._onnx_runner = None
         self._is_mock_fallback: bool = False
         self._load_model()
 
     def _load_model(self) -> None:
         """
         Loads YOLO model instance once using global registry cache.
-        Handles missing files or uninstalled libraries gracefully without crashing server.
+        Prioritizes ONNX runtime for cross-platform speed and compliance, with Ultralytics fallback.
         """
         cache_key = f"{self.model_path}_{self.device}"
 
@@ -79,6 +80,7 @@ class YOLODetector(BaseDetector):
                 logger.info(f"YOLODetector: Reusing cached YOLO model from '{self.model_path}' on device '{self.device}'.")
                 cached = _YOLO_MODEL_CACHE[cache_key]
                 self._model = cached.get("model")
+                self._onnx_runner = cached.get("onnx_runner")
                 self._is_mock_fallback = cached.get("is_mock", False)
                 return
 
@@ -93,20 +95,45 @@ class YOLODetector(BaseDetector):
             if settings.APP_ENV == "testing" or "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
                 logger.warning(
                     f"YOLODetector: Safe Mode active (APP_ENV={settings.APP_ENV}, model_path='{self.model_path}'). "
-                    f"Skipping PyTorch heavy CUDA/CPU driver initialization."
+                    f"Skipping heavy neural network initialization."
                 )
                 self._is_mock_fallback = True
-                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True}
+                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True}
                 return
 
+            # Attempt 1: High-Performance ONNX Runtime Model Engine
+            onnx_candidates = []
+            if self.model_path.endswith(".onnx"):
+                onnx_candidates.append(self.model_path)
+            else:
+                onnx_candidates.append(os.path.splitext(self.model_path)[0] + ".onnx")
+            onnx_candidates.append("models/fire_smoke.onnx")
+            backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            onnx_candidates.append(os.path.join(backend_root, "models", "fire_smoke.onnx"))
+
+            for cand in onnx_candidates:
+                if cand and os.path.isfile(cand):
+                    try:
+                        from app.detection.onnx_engine import get_onnx_yolo_runner
+                        runner = get_onnx_yolo_runner(cand, device=self.device)
+                        self._onnx_runner = runner
+                        self._model = None
+                        self._is_mock_fallback = False
+                        _YOLO_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": runner, "is_mock": False}
+                        logger.info(f"YOLODetector: Successfully loaded ONNX YOLO model from '{cand}'.")
+                        return
+                    except Exception as oe:
+                        logger.warning(f"YOLODetector: Could not initialize ONNX runner from '{cand}': {oe}")
+
+            # Attempt 2: Ultralytics PyTorch Engine
             if not os.path.isfile(self.model_path):
                 logger.warning(
                     "YOLODetector: Fire/smoke weights are missing at '%s'. "
-                    "Using candidate ROI fallback mode.",
+                    "Running in fallback mode.",
                     self.model_path,
                 )
                 self._is_mock_fallback = True
-                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True}
+                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True}
                 return
 
             try:
@@ -128,7 +155,6 @@ class YOLODetector(BaseDetector):
 
                 model.to(self.device)
 
-                # Pre-warm model graph with a dummy pass to eliminate initial 8.7s cold-start lag
                 try:
                     dummy_img = np.zeros((416, 416, 3), dtype=np.uint8)
                     with torch.inference_mode():
@@ -142,23 +168,22 @@ class YOLODetector(BaseDetector):
                 logger.info(f"YOLODetector: Successfully loaded YOLO model from '{self.model_path}' on {self.device} in {load_time_sec}s.")
                 self._model = model
                 self._is_mock_fallback = False
-                _YOLO_MODEL_CACHE[cache_key] = {"model": model, "is_mock": False}
+                _YOLO_MODEL_CACHE[cache_key] = {"model": model, "onnx_runner": None, "is_mock": False}
 
             except ImportError:
                 logger.warning(
-                    "YOLODetector: 'ultralytics' library is not installed. "
-                    "Running in Safe Fallback Mode."
+                    "YOLODetector: Neither ONNX nor 'ultralytics' is available. Running in Safe Fallback Mode."
                 )
                 self._is_mock_fallback = True
-                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True}
+                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True}
 
             except Exception as e:
                 logger.error(
-                    f"YOLODetector: Unexpected error loading YOLO model from '{self.model_path}': {str(e)}. "
-                    f"Falling back to Safe Mode to prevent server crash."
+                    f"YOLODetector: Error loading YOLO model from '{self.model_path}': {str(e)}. "
+                    f"Falling back to Safe Mode."
                 )
                 self._is_mock_fallback = True
-                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "is_mock": True}
+                _YOLO_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True}
 
     def detect(self, image_bgr: Any, candidate_rois: Optional[List[BoundingBox]] = None, **kwargs: Any) -> List[DetectionResult]:
         """
@@ -167,8 +192,68 @@ class YOLODetector(BaseDetector):
         if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
 
+        # Route to ONNX Inference Engine if active
+        if self._onnx_runner is not None:
+            fire_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.45)
+            smoke_conf = getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.42)
+            predict_conf = min(self.conf_threshold, fire_conf, smoke_conf, 0.35)
+
+            raw_dets, inf_time_ms = self._onnx_runner.predict(
+                image_bgr,
+                conf_threshold=predict_conf,
+                iou_threshold=self.iou_threshold,
+                target_classes=self.target_classes
+            )
+
+            detections: List[DetectionResult] = []
+            for item in raw_dets:
+                label = item["label"]
+                conf = item["confidence"]
+                bbox = item["bbox"]
+                x1, y1, x2, y2 = item["pixel_coords"]
+                class_threshold = fire_conf if label == "fire" else smoke_conf
+
+                # Chromaticity and physics verification filter
+                if label == "fire" and x2 > x1 and y2 > y1:
+                    crop = image_bgr[y1:y2, x1:x2]
+                    is_valid_flame, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
+                    if not is_valid_flame and conf < 0.85:
+                        continue
+                    if flame_ratio > 0.10:
+                        conf = min(0.99, conf + 0.08)
+                elif label == "smoke" and x2 > x1 and y2 > y1:
+                    crop = image_bgr[y1:y2, x1:x2]
+                    is_valid_smoke, _ = YOLODetector._verify_smoke_dispersion(crop)
+                    if not is_valid_smoke and conf < 0.85:
+                        continue
+
+                if conf < class_threshold:
+                    continue
+
+                detections.append(DetectionResult(
+                    label=label,
+                    confidence=conf,
+                    bbox=bbox,
+                    metadata={
+                        "inference_time_ms": inf_time_ms,
+                        "device": self.device,
+                        "engine": "ONNXYOLORunner",
+                        "raw_pixel_coords": [x1, y1, x2, y2]
+                    }
+                ))
+
+            enable_hsv = getattr(settings, "YOLO_ENABLE_HSV_FALLBACK", False)
+            if enable_hsv and not any(d.label.lower() in ["fire", "smoke"] for d in detections):
+                hsv_dets = self._detect_color_hsv(image_bgr, candidate_rois=candidate_rois)
+                detections.extend(hsv_dets)
+
+            return detections
+
         if self._is_mock_fallback or self._model is None:
-            return self._detect_color_hsv(image_bgr, candidate_rois=candidate_rois)
+            enable_hsv = getattr(settings, "YOLO_ENABLE_HSV_FALLBACK", False)
+            if enable_hsv:
+                return self._detect_color_hsv(image_bgr, candidate_rois=candidate_rois)
+            return []
 
         try:
             import torch
