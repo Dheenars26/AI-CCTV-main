@@ -201,5 +201,56 @@ def test_cv_ppe_prescription_spectacles_detection():
     assert goggle_det.confidence >= 0.70
 
 
+def test_cv_ppe_clear_polycarbonate_glasses_with_glare():
+    """Verifies that clear polycarbonate glasses with lens glare and dual orbit rims are detected even without heavy bridge."""
+    import cv2
+    from app.detection.base import BoundingBox, DetectionResult
+    from app.detection.ppe_detector import PPEDetector
+
+    detector = PPEDetector(device="cpu")
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    # Face skin tone
+    cv2.rectangle(img, (260, 80), (380, 220), (140, 175, 225), -1)
+    # Clear safety glasses: top brow contour + dual orbit lower curves + lens specular glare
+    cv2.line(img, (280, 110), (360, 110), (80, 80, 80), 2)  # Top brow contour
+    cv2.ellipse(img, (300, 125), (15, 12), 0, 0, 180, (70, 70, 70), 2)  # Left orbit lower rim
+    cv2.ellipse(img, (340, 125), (15, 12), 0, 0, 180, (70, 70, 70), 2)  # Right orbit lower rim
+    # Clear polycarbonate specular glare reflections on both lenses
+    cv2.circle(img, (300, 120), 4, (255, 255, 255), -1)
+    cv2.circle(img, (340, 120), 4, (255, 255, 255), -1)
+
+    person_box = BoundingBox(x_min=0.30, y_min=0.10, x_max=0.70, y_max=0.90)
+    person_det = DetectionResult(label="person", confidence=0.90, bbox=person_box)
+
+    ppe_dets = detector._detect_glasses_cv(img, [person_det])
+    labels = [d.label for d in ppe_dets]
+    assert "goggles" in labels
+    goggle = next(d for d in ppe_dets if d.label == "goggles")
+    assert goggle.confidence >= 0.80
+    assert goggle.metadata["glare_ratio"] > 0
 
 
+def test_ppe_detector_detect_method_integrates_optical_glasses():
+    """Verifies that PPEDetector.detect() autonomously returns goggles on a worker with glasses."""
+    import cv2
+    from app.detection.base import BoundingBox, DetectionResult
+    from app.detection.ppe_detector import PPEDetector
+
+    detector = PPEDetector(device="cpu")
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.rectangle(img, (260, 80), (380, 220), (140, 175, 225), -1)
+    cv2.line(img, (280, 110), (360, 110), (30, 30, 30), 4)  # Brow bar
+    cv2.rectangle(img, (285, 110), (315, 135), (20, 20, 20), 3)  # Left frame
+    cv2.rectangle(img, (325, 110), (355, 135), (20, 20, 20), 3)  # Right frame
+    cv2.line(img, (315, 118), (325, 118), (20, 20, 20), 3)  # Bridge
+    cv2.circle(img, (300, 122), 3, (255, 255, 255), -1)  # Glare
+
+    person_box = BoundingBox(x_min=0.30, y_min=0.10, x_max=0.70, y_max=0.90)
+    person_det = DetectionResult(label="person", confidence=0.90, bbox=person_box)
+
+    # Calling detect() directly with person_dets
+    dets = detector.detect(img, person_dets=[person_det])
+    labels = [d.label for d in dets]
+    assert "goggles" in labels
+    goggle = next(d for d in dets if d.label == "goggles")
+    assert goggle.confidence >= 0.80

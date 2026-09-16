@@ -238,7 +238,7 @@ class PPEDetector(BaseDetector):
             predict_conf = min(
                 self.conf_threshold,
                 getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35),
-                getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.30),
+                getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22),
                 getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38)
             )
             raw_dets, inference_time_ms = self._onnx_runner.predict(
@@ -263,7 +263,7 @@ class PPEDetector(BaseDetector):
                     matched_label = "vest"
                 elif raw_class_name in ["mask", "face_mask", "n95", "respirator"]:
                     matched_label = "mask"
-                elif raw_class_name in ["goggles", "glasses", "safety_glasses", "safety_glass", "safety glass", "eyewear", "eye_protection", "eye protection", "protective_glasses", "protective glasses"]:
+                elif raw_class_name in ["goggles", "glasses", "safety_glasses", "safety_glass", "safety glass", "eyewear", "eye_protection", "eye protection", "protective_glasses", "protective glasses", "spec", "specs", "spectacles", "safety_goggles", "safety goggles"]:
                     matched_label = "goggles"
                 elif raw_class_name in ["gloves", "glove", "hand_protection"]:
                     matched_label = "gloves"
@@ -276,7 +276,7 @@ class PPEDetector(BaseDetector):
                     continue
 
                 class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35) if matched_label == "vest" else (
-                    getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.30) if matched_label == "goggles" else (
+                    getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22) if matched_label == "goggles" else (
                         getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40) if matched_label == "person" else getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38)
                     )
                 )
@@ -296,9 +296,50 @@ class PPEDetector(BaseDetector):
                     }
                 ))
 
+            # Active person detections from pipeline or ONNX output
+            if person_dets is not None and len(person_dets) > 0:
+                active_person_dets = list(person_dets)
+            else:
+                active_person_dets = [d for d in detections if d.label.lower() in ["person", "worker"]]
+                if not active_person_dets and (self._is_mock_fallback or self._model is None):
+                    from app.detection.person_detector import PersonDetector
+                    active_person_dets = PersonDetector._detect_opencv_person_fallback_static(image_bgr)
+                    detections.extend(active_person_dets)
+
+            # Optical Eye-Crop Verification for active workers lacking goggles
+            if active_person_dets and getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
+                existing_goggles = [d for d in detections if d.label.lower() == "goggles"]
+                workers_needing_glasses_check = []
+                for p_det in active_person_dets:
+                    has_goggles = False
+                    p_xmin, p_ymin, p_xmax, p_ymax = p_det.bbox.x_min, p_det.bbox.y_min, p_det.bbox.x_max, p_det.bbox.y_max
+                    p_h = max(0.01, p_ymax - p_ymin)
+                    for g in existing_goggles:
+                        g_cy = (g.bbox.y_min + g.bbox.y_max) / 2.0
+                        g_cx = (g.bbox.x_min + g.bbox.x_max) / 2.0
+                        if (p_xmin - 0.10) <= g_cx <= (p_xmax + 0.10) and (p_ymin - 0.15) <= g_cy <= (p_ymin + 0.55 * p_h):
+                            has_goggles = True
+                            break
+                    if not has_goggles:
+                        workers_needing_glasses_check.append(p_det)
+
+                if workers_needing_glasses_check:
+                    cv_glasses = self._detect_glasses_cv(image_bgr, workers_needing_glasses_check)
+                    if cv_glasses:
+                        detections.extend(cv_glasses)
+
+            # Standalone vest detection fallback if enabled
+            if "vest" not in {d.label.lower() for d in detections} and getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", False):
+                standalone_vests = self._detect_standalone_vest_hsv(image_bgr)
+                if standalone_vests:
+                    detections.extend(standalone_vests)
+
             return self._apply_nms(detections, iou_threshold=0.50)
 
         if self._is_mock_fallback or self._model is None:
+            if person_dets:
+                ppe_cv_dets = self._detect_cv_ppe_features(image_bgr, person_dets)
+                return self._apply_nms(person_dets + ppe_cv_dets, iou_threshold=0.50)
             return self._detect_mock_fallback(image_bgr)
 
         try:
@@ -694,215 +735,201 @@ class PPEDetector(BaseDetector):
                                     ))
 
                 # 4. Eye Protection / Safety Glasses Region (Native High-Res Optical Crop + Multi-Modal Analysis)
-                if "goggles" in detected_gear_types or not getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
-                    continue
+                if "goggles" not in detected_gear_types and getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
+                    cv_glasses = self._detect_glasses_cv(image_bgr, [p_det])
+                    if cv_glasses:
+                        ppe_results.extend(cv_glasses)
 
+        except Exception as e:
+            logger.warning(f"PPEDetector: CV feature extraction exception: {str(e)}")
+
+        return self._apply_nms(ppe_results, iou_threshold=0.50)
+
+    def _detect_glasses_cv(
+        self,
+        image_bgr: np.ndarray,
+        person_dets: List[DetectionResult]
+    ) -> List[DetectionResult]:
+        """
+        Multi-modal optical eye-crop feature extractor for safety glasses, spectacles, and protective goggles.
+        Evaluates 5 independent confirming modalities:
+          1. Dual Orbit Rim Symmetry + Brow line (no nose bridge required)
+          2. Structural Dark or Wireframe Frames
+          3. Clear Polycarbonate Specular Lens Glare & Reflections
+          4. Nasal Bridge Notch + Frame Contour
+          5. Tinted / Amber Polycarbonate Lenses & Neon Safety Temple Accents
+        Uses human skin verification gate to eliminate false positives on background walls and furniture.
+        """
+        import cv2
+        if not getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True) or image_bgr is None or image_bgr.size == 0 or not person_dets:
+            return []
+
+        h, w = image_bgr.shape[:2]
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        results: List[DetectionResult] = []
+
+        try:
+            for p_det in person_dets:
                 orig_px1, orig_py1, orig_px2, orig_py2 = p_det.bbox.to_pixel_coords(w, h)
                 orig_pw = max(1, orig_px2 - orig_px1)
                 orig_ph = max(1, orig_py2 - orig_py1)
 
-                head_y1 = max(0, orig_py1 - int(orig_ph * 0.06))
-                head_y2 = min(h, orig_py1 + int(orig_ph * 0.55))
-                head_x1 = max(0, orig_px1 - int(orig_pw * 0.06))
-                head_x2 = min(w, orig_px2 + int(orig_pw * 0.06))
-
-                if head_y2 <= head_y1 or head_x2 <= head_x1:
+                if orig_pw < 20 or orig_ph < 30:
                     continue
 
-                head_bgr = image_bgr[head_y1:head_y2, head_x1:head_x2]
-                ch, cw = head_bgr.shape[:2]
-                if cw < 15 or ch < 15:
+                aspect = float(orig_pw) / float(orig_ph)
+                if aspect <= 0.50:  # Full-body standing worker
+                    ey1 = max(0, orig_py1 + int(orig_ph * 0.03))
+                    ey2 = min(h, orig_py1 + int(orig_ph * 0.22))
+                    ex1 = max(0, orig_px1 + int(orig_pw * 0.12))
+                    ex2 = min(w, orig_px2 - int(orig_pw * 0.12))
+                elif aspect <= 0.85:  # Upper body / seated worker / torso
+                    ey1 = max(0, orig_py1 + int(orig_ph * 0.05))
+                    ey2 = min(h, orig_py1 + int(orig_ph * 0.35))
+                    ex1 = max(0, orig_px1 + int(orig_pw * 0.08))
+                    ex2 = min(w, orig_px2 - int(orig_pw * 0.08))
+                else:  # Close-up head / bust
+                    ey1 = max(0, orig_py1 + int(orig_ph * 0.10))
+                    ey2 = min(h, orig_py1 + int(orig_ph * 0.55))
+                    ex1 = max(0, orig_px1 + int(orig_pw * 0.05))
+                    ex2 = min(w, orig_px2 - int(orig_pw * 0.05))
+
+                if ey2 <= ey1 + 10 or ex2 <= ex1 + 16:
                     continue
 
-                head_gray = cv2.cvtColor(head_bgr, cv2.COLOR_BGR2GRAY)
-
-                # Fast face cascade search on lightweight downscaled head crop (~5ms)
-                faces = []
-                if PPEDetector._face_cascade_alt2_obj is not None and cw >= 35 and ch >= 35:
-                    try:
-                        max_w = 120
-                        if cw > max_w:
-                            s = max_w / float(cw)
-                            small_gray = cv2.resize(head_gray, (max_w, int(ch * s)), interpolation=cv2.INTER_LINEAR)
-                            small_faces = PPEDetector._face_cascade_alt2_obj.detectMultiScale(
-                                small_gray, scaleFactor=1.22, minNeighbors=3, minSize=(16, 16)
-                            )
-                            faces = [[int(f[0] / s), int(f[1] / s), int(f[2] / s), int(f[3] / s)] for f in small_faces]
-                        else:
-                            faces = PPEDetector._face_cascade_alt2_obj.detectMultiScale(
-                                head_gray, scaleFactor=1.22, minNeighbors=3, minSize=(16, 16)
-                            )
-                    except Exception:
-                        faces = []
-
-                # Pinpoint eye region localization
-                if len(faces) > 0:
-                    fx, fy, fw, fh = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
-                    ey1 = fy + int(fh * 0.15)
-                    ey2 = fy + int(fh * 0.58)
-                    ex1 = max(0, fx + int(fw * 0.04))
-                    ex2 = min(cw, fx + fw - int(fw * 0.04))
-                elif detected_helmet_box is not None:
-                    hl_y1, hl_y2 = int(detected_helmet_box.y_min * h), int(detected_helmet_box.y_max * h)
-                    hl_x1, hl_x2 = int(detected_helmet_box.x_min * w), int(detected_helmet_box.x_max * w)
-                    rel_hy2 = max(0, hl_y2 - head_y1)
-                    ey1 = rel_hy2 - int((hl_y2 - hl_y1) * 0.10)
-                    ey2 = rel_hy2 + int((hl_y2 - hl_y1) * 0.60)
-                    ex1 = max(0, hl_x1 - head_x1 + int((hl_x2 - hl_x1) * 0.08))
-                    ex2 = min(cw, hl_x2 - head_x1 - int((hl_x2 - hl_x1) * 0.08))
-                else:
-                    aspect = float(orig_pw) / float(orig_ph) if orig_ph > 0 else 0.5
-                    if aspect <= 0.50:  # Full-body standing worker
-                        ey1 = int(ch * 0.05)
-                        ey2 = int(ch * 0.40)
-                        ex1 = int(cw * 0.14)
-                        ex2 = int(cw * 0.86)
-                    elif aspect <= 0.85:  # Seated worker / webcam view / upper torso
-                        ey1 = int(ch * 0.10)
-                        ey2 = int(ch * 0.52)
-                        ex1 = int(cw * 0.10)
-                        ex2 = int(cw * 0.90)
-                    else:  # Close face / bust crop
-                        ey1 = int(ch * 0.16)
-                        ey2 = int(ch * 0.64)
-                        ex1 = int(cw * 0.08)
-                        ex2 = int(cw * 0.92)
-
-                ey1 = max(0, min(ch - 10, ey1))
-                ey2 = max(ey1 + 10, min(ch, ey2))
-                ex1 = max(0, min(cw - 10, ex1))
-                ex2 = max(ex1 + 10, min(cw, ex2))
-
-                if ey2 <= ey1 or ex2 <= ex1:
-                    continue
-
-                eye_crop_bgr = head_bgr[ey1:ey2, ex1:ex2]
-                if eye_crop_bgr.size == 0:
-                    continue
-
+                eye_crop_bgr = image_bgr[ey1:ey2, ex1:ex2]
                 eh, ew = eye_crop_bgr.shape[:2]
-                if eh < 12 or ew < 20:
+                if eh < 10 or ew < 16:
                     continue
 
-                eye_crop_gray = cv2.cvtColor(eye_crop_bgr, cv2.COLOR_BGR2GRAY)
-                eye_clahe = clahe.apply(eye_crop_gray)
                 eye_crop_hsv = cv2.cvtColor(eye_crop_bgr, cv2.COLOR_BGR2HSV)
+                eye_crop_gray = cv2.cvtColor(eye_crop_bgr, cv2.COLOR_BGR2GRAY)
 
-                # CRITICAL HUMAN SKIN VERIFICATION:
-                # Rejects inanimate backgrounds (window grills, window panes, walls, furniture)
-                # Adaptive human skin tone mask across varying complexions & lighting
-                skin_m1 = cv2.inRange(eye_crop_hsv, np.array([0, 15, 35]), np.array([35, 210, 255]))
+                # 1. Human Skin Verification Gate
+                # Rejects inanimate backgrounds (window panes, furniture, walls, floor tiles)
+                skin_m1 = cv2.inRange(eye_crop_hsv, np.array([0, 15, 35]), np.array([32, 210, 255]))
                 skin_m2 = cv2.inRange(eye_crop_hsv, np.array([168, 15, 35]), np.array([180, 210, 255]))
                 eye_skin_mask = cv2.bitwise_or(skin_m1, skin_m2)
-                eye_skin_ratio = float(np.sum(eye_skin_mask > 0)) / float(max(1, eye_skin_mask.size))
-                if eye_skin_ratio < 0.08:
+                skin_ratio = float(np.sum(eye_skin_mask > 0)) / float(max(1, eye_skin_mask.size))
+                if skin_ratio < 0.06:
                     continue
 
-                # High-contrast Canny edges & fast integer Sobel filters
-                eye_edges = cv2.Canny(eye_clahe, 80, 180)
+                # 2. Enhanced Edge & Gradient Processing
+                eye_clahe = clahe.apply(eye_crop_gray)
+                eye_edges = cv2.Canny(eye_clahe, 40, 140)
                 sobely = cv2.Sobel(eye_clahe, cv2.CV_16S, 0, 1, ksize=3)
                 sobelx = cv2.Sobel(eye_clahe, cv2.CV_16S, 1, 0, ksize=3)
-                horiz_edges = (np.abs(sobely) > 60) & (eye_edges > 0)
-                vert_edges = (np.abs(sobelx) > 60) & (eye_edges > 0)
+                horiz_edges = (np.abs(sobely) > 35) & (eye_edges > 0)
+                vert_edges = (np.abs(sobelx) > 35) & (eye_edges > 0)
 
-                # 1. Nasal Bridge Bar across the notch (middle 16% width: 0.42 to 0.58, y: 0.35 to 0.85)
-                notch_horiz = horiz_edges[int(eh * 0.35):int(eh * 0.85), int(ew * 0.42):int(ew * 0.58)]
-                bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(ew * 0.05)), 1))
-                notch_bridge = cv2.morphologyEx(notch_horiz.astype(np.uint8), cv2.MORPH_OPEN, bridge_kernel)
+                # Nasal Bridge Notch (strictly between eye orbits, y: 0.32 to 0.70, x: 0.42 to 0.58)
+                notch_horiz = horiz_edges[int(eh * 0.32):int(eh * 0.70), int(ew * 0.42):int(ew * 0.58)]
+                bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(ew * 0.04)), 1))
+                notch_opened = cv2.morphologyEx(notch_horiz.astype(np.uint8), cv2.MORPH_OPEN, bridge_kernel)
                 notch_ratio = float(np.sum(notch_horiz)) / float(max(1, notch_horiz.size))
-                has_bridge = bool(np.sum(notch_bridge) > 0) or (notch_ratio >= 0.12)
+                has_bridge = (notch_ratio >= 0.08) or (float(np.sum(notch_opened)) >= max(3.0, ew * 0.04))
 
-                # 2. Lower under-eye cheekbone rims (y: 0.65 to 0.95, left: 0.12 to 0.42, right: 0.58 to 0.88)
-                left_lower = horiz_edges[int(eh * 0.65):int(eh * 0.95), int(ew * 0.12):int(ew * 0.42)]
-                right_lower = horiz_edges[int(eh * 0.65):int(eh * 0.95), int(ew * 0.58):int(ew * 0.88)]
+                # Dual Orbit Lower/Side Rim Edges (y: 0.35 to 0.85, left: 0.12 to 0.46, right: 0.54 to 0.88)
+                left_lower = horiz_edges[int(eh * 0.35):int(eh * 0.85), int(ew * 0.12):int(ew * 0.46)]
+                right_lower = horiz_edges[int(eh * 0.35):int(eh * 0.85), int(ew * 0.54):int(ew * 0.88)]
                 left_lower_ratio = float(np.sum(left_lower)) / float(max(1, left_lower.size))
                 right_lower_ratio = float(np.sum(right_lower)) / float(max(1, right_lower.size))
-                dual_lower_rim = (left_lower_ratio >= 0.08 and right_lower_ratio >= 0.08)
+                dual_orbit_rim = (left_lower_ratio >= 0.028 and right_lower_ratio >= 0.028)
 
-                # 3. Horizontal frame edges across eye orbits (y: 0.55 to 0.95, x: 0.20 to 0.80)
-                frame_edges = horiz_edges[int(eh * 0.55):int(eh * 0.95), int(ew * 0.20):int(ew * 0.80)]
-                frame_edge_ratio = float(np.sum(frame_edges)) / float(max(1, frame_edges.size))
-
-                # 4. Brow bar (y: 0.08 to 0.32, x: 0.18 to 0.82)
-                brow_horiz = horiz_edges[int(eh * 0.08):int(eh * 0.32), int(ew * 0.18):int(ew * 0.82)]
+                # Brow Bar (Top horizontal line across brow: y: 0.10 to 0.45, x: 0.18 to 0.82)
+                brow_horiz = horiz_edges[int(eh * 0.10):int(eh * 0.45), int(ew * 0.18):int(ew * 0.82)]
                 brow_ratio = float(np.sum(brow_horiz)) / float(max(1, brow_horiz.size))
 
-                # 5. Specular Lens Glare (clear polycarbonate reflections on safety lenses)
-                lens_glare_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 215]), np.array([180, 50, 255]))
-                glare_center = lens_glare_mask[int(eh * 0.25):int(eh * 0.85), int(ew * 0.15):int(ew * 0.85)]
+                # Frame Edges across Eye Orbits (y: 0.25 to 0.85, x: 0.15 to 0.85)
+                frame_edges = horiz_edges[int(eh * 0.25):int(eh * 0.85), int(ew * 0.15):int(ew * 0.85)]
+                frame_edge_ratio = float(np.sum(frame_edges)) / float(max(1, frame_edges.size))
+
+                # Specular Glare on Clear Polycarbonate Safety Lenses (V >= 195, S <= 60)
+                glare_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 195]), np.array([180, 60, 255]))
+                glare_center = glare_mask[int(eh * 0.20):int(eh * 0.80), int(ew * 0.15):int(ew * 0.85)]
                 glare_ratio = float(np.sum(glare_center > 0)) / float(max(1, glare_center.size))
 
-                # 6. High-contrast dark frames across eye region and outer temples
-                dark_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 10]), np.array([180, 255, 75]))
-                dark_rims = dark_mask[int(eh * 0.55):int(eh * 0.95), int(ew * 0.20):int(ew * 0.80)]
+                # Dark / Wireframe Rims and Outer Temple Arms (V <= 85)
+                dark_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 10]), np.array([180, 255, 85]))
+                dark_rims = dark_mask[int(eh * 0.25):int(eh * 0.85), int(ew * 0.18):int(ew * 0.82)]
                 dark_rim_ratio = float(np.sum(dark_rims > 0)) / float(max(1, dark_rims.size))
                 dark_temples = np.concatenate([dark_mask[:, :max(1, int(ew * 0.16))], dark_mask[:, int(ew * 0.84):]], axis=1)
                 dark_temple_ratio = float(np.sum(dark_temples > 0)) / float(max(1, dark_temples.size))
 
-                # 7. Vivid Amber / Yellow Polycarbonate Lenses (S >= 140, V >= 120, H in 18..36)
-                amber_mask = cv2.inRange(eye_crop_hsv, np.array([18, 140, 120]), np.array([36, 255, 255]))
+                # Vivid Amber / Yellow Polycarbonate Safety Lenses (H in 16..38, S >= 120, V >= 110)
+                amber_mask = cv2.inRange(eye_crop_hsv, np.array([16, 120, 110]), np.array([38, 255, 255]))
                 amber_ratio = float(np.sum(amber_mask > 0)) / float(max(1, amber_mask.size))
 
-                # 8. Fluorescent Neon Safety Frame Accents (S >= 160, V >= 130 on outer temples)
-                neon_orange = cv2.inRange(eye_crop_hsv, np.array([5, 160, 130]), np.array([22, 255, 255]))
-                neon_yellow = cv2.inRange(eye_crop_hsv, np.array([28, 160, 130]), np.array([75, 255, 255]))
+                # Fluorescent Neon Safety Frame Accents
+                neon_orange = cv2.inRange(eye_crop_hsv, np.array([5, 140, 120]), np.array([22, 255, 255]))
+                neon_yellow = cv2.inRange(eye_crop_hsv, np.array([26, 140, 120]), np.array([75, 255, 255]))
                 neon_mask = cv2.bitwise_or(neon_orange, neon_yellow)
                 neon_temples = np.concatenate([neon_mask[:, :max(1, int(ew * 0.18))], neon_mask[:, int(ew * 0.82):]], axis=1)
                 neon_ratio = float(np.sum(neon_temples > 0)) / float(max(1, neon_temples.size))
 
-                # Multi-modal eyewear validation:
-                # 1. Structural / heavy dark safety frames or prescription frames
+                # Multi-Modal Eyewear Confirmation Rules:
+                # 1. Dual Orbit Rim Symmetry + Brow line or Frame edge (No bridge strictly required)
+                is_dual_rim_glasses = (
+                    dual_orbit_rim and (brow_ratio >= 0.035 or frame_edge_ratio >= 0.030 or has_bridge)
+                )
+
+                # 2. Structural Dark or Wireframe Frames
                 is_structural_dark_glasses = (
-                    (has_bridge and dark_rim_ratio >= 0.08 and frame_edge_ratio >= 0.035) or
-                    (has_bridge and dark_temple_ratio >= 0.08 and frame_edge_ratio >= 0.035)
+                    (dark_rim_ratio >= 0.06 or dark_temple_ratio >= 0.06) and
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.030 or brow_ratio >= 0.040)
                 )
 
-                # 2. Clear polycarbonate safety glasses / spectacles with lens reflections
+                # 3. Clear Polycarbonate Specular Glare & Reflections
                 is_clear_safety_glasses = (
-                    (has_bridge and glare_ratio >= 0.035 and frame_edge_ratio >= 0.030) or
-                    (has_bridge and dual_lower_rim and brow_ratio >= 0.040)
+                    glare_ratio >= 0.008 and
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025 or brow_ratio >= 0.035)
                 )
 
-                # 3. Rim and bridge glasses
-                is_rim_and_bridge_glasses = (
-                    has_bridge and dual_lower_rim and brow_ratio >= 0.045
+                # 4. Classic Nasal Bridge + Frame Contour
+                is_bridge_and_contour_glasses = (
+                    has_bridge and
+                    (
+                        (frame_edge_ratio >= 0.032 and max(left_lower_ratio, right_lower_ratio) >= 0.040) or
+                        dual_orbit_rim or
+                        (dark_rim_ratio >= 0.06) or
+                        (glare_ratio >= 0.02)
+                    )
                 )
 
-                # 4. Vivid Amber / Yellow Polycarbonate Safety Lenses
-                is_vivid_amber_glasses = (
-                    amber_ratio >= 0.08 and (has_bridge or dual_lower_rim or frame_edge_ratio >= 0.030)
-                )
-
-                # 5. Fluorescent Neon High-Vis Safety Frame Accents
-                is_neon_safety_glasses = (
-                    neon_ratio >= 0.05 and (has_bridge or frame_edge_ratio >= 0.030)
+                # 5. Tinted / Amber Polycarbonate & Neon Safety Frame Accents
+                is_tinted_or_neon_glasses = (
+                    (amber_ratio >= 0.06 or neon_ratio >= 0.04) and
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025)
                 )
 
                 is_safety_glasses = (
+                    is_dual_rim_glasses or
                     is_structural_dark_glasses or
                     is_clear_safety_glasses or
-                    is_rim_and_bridge_glasses or
-                    is_vivid_amber_glasses or
-                    is_neon_safety_glasses
+                    is_bridge_and_contour_glasses or
+                    is_tinted_or_neon_glasses
                 )
 
                 if is_safety_glasses:
-                    abs_gx1 = head_x1 + ex1
-                    abs_gy1 = head_y1 + ey1
-                    abs_gx2 = head_x1 + ex2
-                    abs_gy2 = head_y1 + ey2
+                    # Calculate tight normalized bounding box for eyewear
+                    gx1 = ex1 + int(ew * 0.04)
+                    gx2 = ex2 - int(ew * 0.04)
+                    gy1 = ey1 + int(eh * 0.12)
+                    gy2 = ey1 + int(eh * 0.88)
 
                     norm_goggles_box = BoundingBox(
-                        x_min=max(0.0, min(1.0, float(abs_gx1) / float(w))),
-                        y_min=max(0.0, min(1.0, float(abs_gy1) / float(h))),
-                        x_max=max(0.0, min(1.0, float(abs_gx2) / float(w))),
-                        y_max=max(0.0, min(1.0, float(abs_gy2) / float(h)))
+                        x_min=max(0.0, min(1.0, float(gx1) / float(w))),
+                        y_min=max(0.0, min(1.0, float(gy1) / float(h))),
+                        x_max=max(0.0, min(1.0, float(gx2) / float(w))),
+                        y_max=max(0.0, min(1.0, float(gy2) / float(h)))
                     )
 
-                    conf = min(0.96, 0.78 + notch_ratio * 0.8 + max(left_lower_ratio, right_lower_ratio) * 0.6)
-                    min_conf = getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20)
+                    conf_boost = max(notch_ratio, glare_ratio * 2.0, dark_rim_ratio, dark_temple_ratio)
+                    conf = min(0.96, 0.78 + conf_boost * 0.8 + max(left_lower_ratio, right_lower_ratio) * 0.6)
+                    min_conf = getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22)
+
                     if conf >= min_conf:
-                        ppe_results.append(DetectionResult(
+                        results.append(DetectionResult(
                             label="goggles",
                             confidence=round(conf, 2),
                             bbox=norm_goggles_box,
@@ -912,6 +939,7 @@ class PPEDetector(BaseDetector):
                                 "brow_ratio": round(brow_ratio, 3),
                                 "left_lower_ratio": round(left_lower_ratio, 3),
                                 "right_lower_ratio": round(right_lower_ratio, 3),
+                                "dark_rim_ratio": round(dark_rim_ratio, 3),
                                 "dark_temple_ratio": round(dark_temple_ratio, 3),
                                 "frame_edge_ratio": round(frame_edge_ratio, 3),
                                 "glare_ratio": round(glare_ratio, 3),
@@ -919,11 +947,10 @@ class PPEDetector(BaseDetector):
                                 "neon_ratio": round(neon_ratio, 3)
                             }
                         ))
-
         except Exception as e:
-            logger.warning(f"PPEDetector: CV feature extraction exception: {str(e)}")
+            logger.warning(f"PPEDetector: Optical glasses detection error: {str(e)}")
 
-        return self._apply_nms(ppe_results, iou_threshold=0.50)
+        return self._apply_nms(results, iou_threshold=0.50)
 
     @staticmethod
     def _apply_nms(detections: List[DetectionResult], iou_threshold: float = 0.50) -> List[DetectionResult]:

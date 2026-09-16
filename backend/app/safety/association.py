@@ -59,6 +59,7 @@ class PPEAssociationEngine:
         "mask": (-0.10, 0.45),
         "face_mask": (-0.10, 0.45),
         "goggles": (-0.15, 0.65),
+        "glasses": (-0.15, 0.65),
         "safety_glasses": (-0.15, 0.65),
         "safety_glass": (-0.15, 0.65),
         "glass": (-0.15, 0.65),

@@ -832,7 +832,11 @@ class FramePipeline:
                 worker_gear_times = self._worker_compliance_history[pid]
 
                 for item in w.detected_equipment:
-                    worker_gear_times[item.lower()] = now_ts + 1.2
+                    l_item = item.lower()
+                    worker_gear_times[l_item] = now_ts + 1.5
+                    if l_item in ["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection"]:
+                        for alt in ["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection"]:
+                            worker_gear_times[alt] = now_ts + 1.5
 
                 # If an item is in missing_equipment but was detected recently (within 0.75s),
                 # grace it as detected to prevent 1-frame strobe/violation
