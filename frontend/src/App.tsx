@@ -42,6 +42,7 @@ const queryClient = new QueryClient({
 
 const ProtectedLayout: React.FC = () => {
   const { isAuthenticated, isLoading } = useAuth();
+  const [isMobileNavOpen, setIsMobileNavOpen] = React.useState(false);
 
   if (isLoading) {
     return (
@@ -70,10 +71,10 @@ const ProtectedLayout: React.FC = () => {
       <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans">
         <MobileNotificationToast />
         <AlertBanner />
-        <Navbar />
+        <Navbar onToggleMobileNav={() => setIsMobileNavOpen(prev => !prev)} />
         <div className="flex flex-1 min-h-0">
-          <Sidebar />
-          <main className="flex-1 p-4 sm:p-6 overflow-y-auto flex flex-col min-h-0 bg-slate-50">
+          <Sidebar isOpen={isMobileNavOpen} onClose={() => setIsMobileNavOpen(false)} />
+          <main className="flex-1 p-3 sm:p-4 md:p-6 overflow-y-auto flex flex-col min-h-0 bg-slate-50 min-w-0">
             <Suspense fallback={<PageFallback />}>
               <Outlet />
             </Suspense>

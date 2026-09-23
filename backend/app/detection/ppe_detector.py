@@ -955,8 +955,15 @@ class PPEDetector(BaseDetector):
                             m_tape_stripes = cv2.morphologyEx(m_tape, cv2.MORPH_OPEN, tape_kernel)
                             tape_ratio = float(np.sum(m_tape_stripes > 0)) / float(m_tape.size) if m_tape.size > 0 else 0.0
 
-                            # High-vis safety vest detection: fluorescent neon color presence with reflective tape or edge density
-                            if (vest_ratio >= 0.16 and (tape_ratio >= 0.001 or edge_density >= 0.02)) or vest_ratio >= 0.28:
+                            # High-vis safety vest detection: fluorescent colour is necessary but never
+                            # sufficient. A plain yellow/orange garment is a t-shirt, not a vest - what
+                            # separates them is the retroreflective tape (or, failing that, real garment
+                            # structure such as seams, pockets and quilting). Previously any patch with
+                            # >28% fluorescent coverage passed on colour alone, so a uniformly coloured
+                            # shirt scored vest 0.95 with tape_ratio 0.0.
+                            has_tape = tape_ratio >= 0.001
+                            has_structure = edge_density >= 0.02
+                            if (vest_ratio >= 0.12 and has_tape) or (vest_ratio >= 0.16 and has_structure):
                                 norm_vest_box = BoundingBox(
                                     x_min=max(0.0, min(1.0, float(vx1) / float(proc_w))),
                                     y_min=max(0.0, min(1.0, float(vy1) / float(proc_h))),
@@ -1137,8 +1144,33 @@ class PPEDetector(BaseDetector):
 
                 # Multi-Modal Eyewear Confirmation Rules:
                 # 1. Dual Orbit Rim Symmetry + Brow line or Frame edge (No bridge strictly required)
+                #    Shape alone is not enough: two bright creases in a plastic sheet or bag reproduce
+                #    "dual orbits". Require one material confirmation as well - an opaque frame, tinted
+                #    lens, neon temple or genuine specular glare on a polycarbonate lens.
+                # Opaque or tinted frame material. Specular glare is deliberately excluded here:
+                # a sheet of plastic, a bag or a polished panel produces glare without ever being
+                # eyewear, whereas an opaque frame, an amber lens or a neon temple is material a
+                # garment or a wall does not have.
+                _has_frame_material = (
+                    dark_rim_ratio >= 0.03
+                    or dark_temple_ratio >= 0.03
+                    or amber_ratio >= 0.04
+                    or neon_ratio >= 0.03
+                )
+                # Eyewear is worn *on a face*, and a face has dark structure in the eye band - pupils,
+                # irises, brows, lashes or the frame itself. A skin-toned flat surface with bright
+                # creases (a plastic sheet, a bag, a wall panel) has none. Without this, specular
+                # glints on any pale surface were read as lenses.
+                _facial_dark_feature = (
+                    dark_rim_ratio >= 0.005
+                    or dark_temple_ratio >= 0.005
+                    or amber_ratio > 0.0
+                    or neon_ratio > 0.0
+                )
                 is_dual_rim_glasses = (
-                    dual_orbit_rim and (brow_ratio >= 0.035 or frame_edge_ratio >= 0.030 or has_bridge)
+                    dual_orbit_rim
+                    and (brow_ratio >= 0.035 or frame_edge_ratio >= 0.030 or has_bridge)
+                    and _has_frame_material
                 )
 
                 # 2. Structural Dark or Wireframe Frames
@@ -1150,6 +1182,7 @@ class PPEDetector(BaseDetector):
                 # 3. Clear Polycarbonate Specular Glare & Reflections
                 is_clear_safety_glasses = (
                     glare_ratio >= 0.008 and
+                    _facial_dark_feature and
                     (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025 or brow_ratio >= 0.035)
                 )
 
@@ -1158,7 +1191,7 @@ class PPEDetector(BaseDetector):
                     has_bridge and
                     (
                         (frame_edge_ratio >= 0.032 and max(left_lower_ratio, right_lower_ratio) >= 0.040) or
-                        dual_orbit_rim or
+                        (dual_orbit_rim and _has_frame_material) or
                         (dark_rim_ratio >= 0.06) or
                         (glare_ratio >= 0.02)
                     )
@@ -1170,12 +1203,18 @@ class PPEDetector(BaseDetector):
                     (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025)
                 )
 
+                # Every positive must stand on one of two physical facts: eyewear material is
+                # visible (opaque frame, tinted or neon lens/temple), or the crop contains real
+                # facial structure (dark pupils, irises, brows, lashes) that eyewear sits on. A
+                # pale flat surface with bright creases and glints satisfies neither, which is the
+                # exact shape of the plastic-sheet / bag false positive.
                 is_safety_glasses = (
-                    is_dual_rim_glasses or
-                    is_structural_dark_glasses or
-                    is_clear_safety_glasses or
-                    is_bridge_and_contour_glasses or
-                    is_tinted_or_neon_glasses
+                    (is_dual_rim_glasses or
+                     is_structural_dark_glasses or
+                     is_clear_safety_glasses or
+                     is_bridge_and_contour_glasses or
+                     is_tinted_or_neon_glasses) and
+                    (_has_frame_material or _facial_dark_feature)
                 )
 
                 if is_safety_glasses:

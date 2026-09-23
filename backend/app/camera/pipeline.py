@@ -6,6 +6,7 @@ Fully frontend-independent and thread-isolated.
 """
 
 import time
+import uuid
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -309,7 +310,24 @@ class StandardPostprocessor(BasePostprocessor):
                 cv2.rectangle(frame.image, (int(w * 0.25), 5), (int(w * 0.75), 38), (0, 0, 220), -1)
                 cv2.putText(frame.image, freeze_text, (int(w * 0.28), 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # 2. Draw Safety Zone Polygons
+            # 2. Active zone breaches, used to escalate the overlay below
+            zone_violator_pids: Dict[int, str] = {}
+            for decision in (frame.metadata.get("safety_decisions") or []):
+                if decision.get("incident_type") != "ZONE_VIOLATION":
+                    continue
+                pid = decision.get("person_id")
+                if pid is not None:
+                    zone_violator_pids[pid] = decision.get("zone_name") or "RESTRICTED AREA"
+
+            if zone_violator_pids:
+                first_zone = next(iter(zone_violator_pids.values())).upper()
+                banner_text = f"SECURITY ALERT: RESTRICTED AREA INTRUSION ({first_zone})"
+                cv2.rectangle(frame.image, (int(w * 0.08), 6), (int(w * 0.92), 42), (20, 20, 220), -1)
+                cv2.rectangle(frame.image, (int(w * 0.08), 6), (int(w * 0.92), 42), (0, 0, 255), 2)
+                cv2.putText(frame.image, banner_text, (int(w * 0.10), 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # 3. Draw Safety Zone Polygons
             zones = frame.metadata.get("safety_zones", [])
             for zone in zones:
                 poly_coords = zone.get("polygon_coordinates", [])
@@ -317,7 +335,16 @@ class StandardPostprocessor(BasePostprocessor):
                     pts = np.array([[int(pt[0] * w), int(pt[1] * h)] for pt in poly_coords], np.int32)
                     pts = pts.reshape((-1, 1, 2))
                     z_type = zone.get("zone_type", "HAZARD").upper()
-                    zone_color = (0, 0, 255) if z_type == "RESTRICTED" else (0, 140, 255) if z_type == "HAZARD" else (255, 200, 0)
+                    z_name = zone.get("name", "")
+                    is_active_violation = any(
+                        z_name and z_name.lower() in v.lower() for v in zone_violator_pids.values()
+                    )
+                    if is_active_violation or z_type == "RESTRICTED":
+                        zone_color = (0, 0, 255)
+                    elif z_type == "HAZARD":
+                        zone_color = (0, 140, 255)
+                    else:
+                        zone_color = (255, 200, 0)
                     cv2.polylines(frame.image, [pts], True, zone_color, 2, cv2.LINE_AA)
                     z_name = zone.get("name", "Zone")
                     cv2.putText(frame.image, f"ZONE: {z_name} ({z_type})", (pts[0][0][0], max(pts[0][0][1] - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, zone_color, 2, cv2.LINE_AA)
@@ -1031,7 +1058,43 @@ class FramePipeline:
             self.ppe_verification_engine.process_worker_analyses(worker_analyses)
             if run_worker_frame else []
         )
-        all_verified = verified_events + verified_ppe_events
+        all_verified = list(verified_events) + list(verified_ppe_events)
+
+        # Zone breaches and correlated safety incidents are decisions, not detections: the rule
+        # engine already applied per-zone policy and deduplication, so they become verified events
+        # directly and travel the same alert path as fire/smoke/PPE (ported from main).
+        for decision in safety_decisions:
+            if decision.incident_type not in ("ZONE_VIOLATION", "SAFETY_INCIDENT"):
+                continue
+            intrusion_box = None
+            raw_box = (decision.details or {}).get("bounding_box")
+            if raw_box:
+                try:
+                    intrusion_box = BoundingBox(**raw_box)
+                except Exception:
+                    intrusion_box = None
+            all_verified.append(VerifiedEvent(
+                event_id=str(uuid.uuid4()),
+                camera_id=self.camera_id,
+                class_name="zone_violation",
+                state=EventState.ALERT_SENT,
+                consecutive_frames=1,
+                duration_seconds=0.0,
+                max_confidence=float(decision.confidence or 0.0),
+                latest_confidence=float(decision.confidence or 0.0),
+                start_time=ts,
+                updated_time=ts,
+                bounding_box=intrusion_box,
+                metadata={
+                    "zone_id": decision.zone_id,
+                    "zone_name": decision.zone_name,
+                    "person_id": decision.person_id,
+                    "events": decision.events,
+                    "severity": decision.severity,
+                    "incident_type": decision.incident_type,
+                },
+            ))
+
         frame.metadata["verified_events"] = [e.to_dict() for e in all_verified]
 
         # 9. Stage 8: Postprocessor (Visual Overlay Generation)

@@ -57,6 +57,8 @@ class SafetyRuleEngine:
         "goggles": "HIGH",
         "safety_glasses": "HIGH",
         "safety_glass": "HIGH",
+        "glass": "HIGH",
+        "glasses": "HIGH",
         "mask": "MEDIUM",
         "gloves": "MEDIUM",
         "safety_shoes": "MEDIUM",

@@ -13,7 +13,7 @@ export interface MobileNotificationItem {
   timestamp: string;
 }
 
-export const playNotificationChime = () => {
+const playNotificationChime = () => {
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
     if (!AudioCtx) return;
@@ -125,13 +125,15 @@ export const MobileNotificationToast: React.FC = () => {
     if (seenEventsRef.current.has(eventKey)) return;
     seenEventsRef.current.add(eventKey);
 
-    const className = payload.class_name || payload.label || (evtLower.includes('fire') ? 'fire' : evtLower.includes('smoke') ? 'smoke' : 'Incident');
+    const rawClass = payload.class_name || payload.label || (evtLower.includes('fire') ? 'fire' : evtLower.includes('smoke') ? 'smoke' : evtLower.includes('zone') ? 'zone_violation' : 'Incident');
+    const isZoneEvent = evtLower.includes('zone') || String(rawClass).toLowerCase().includes('zone') || payload.incident_type === 'ZONE_VIOLATION';
+    const className = isZoneEvent ? 'Restricted Area Intrusion' : rawClass;
 
     showNotification({
       id: alertId || 'latest',
       class_name: className,
       camera_name: payload.camera_name || `Camera #${payload.camera_id || 1}`,
-      location: payload.camera_location || payload.location || 'Facility Zone',
+      location: payload.camera_location || payload.location || (payload.zone_name ? `Zone: ${payload.zone_name}` : 'Facility Perimeter'),
       confidence: payload.confidence || payload.max_confidence || 0.95,
       timestamp: new Date().toLocaleTimeString(),
     });
@@ -156,8 +158,10 @@ export const MobileNotificationToast: React.FC = () => {
 
   if (!activeNotification) return null;
 
-  const isFire = (activeNotification.class_name || '').toLowerCase().includes('fire');
-  const isSmoke = (activeNotification.class_name || '').toLowerCase().includes('smoke');
+  const classLower = (activeNotification.class_name || '').toLowerCase();
+  const isFire = classLower.includes('fire');
+  const isSmoke = classLower.includes('smoke');
+  const isZone = classLower.includes('zone') || classLower.includes('intrusion') || classLower.includes('restricted');
 
   const handleClick = () => {
     const targetId = activeNotification?.id;
@@ -174,7 +178,9 @@ export const MobileNotificationToast: React.FC = () => {
       <div
         onClick={handleClick}
         className={`group relative overflow-hidden rounded-2xl shadow-2xl border cursor-pointer backdrop-blur-xl transition-all hover:scale-[1.02] active:scale-[0.99] ${
-          isFire
+          isZone
+            ? 'bg-gradient-to-br from-slate-900 via-rose-950/90 to-slate-900 border-red-500/50 text-white shadow-rose-950/40'
+            : isFire
             ? 'bg-gradient-to-br from-slate-900 via-rose-950/90 to-slate-900 border-rose-500/40 text-white shadow-rose-950/40'
             : isSmoke
             ? 'bg-gradient-to-br from-slate-900 via-amber-950/90 to-slate-900 border-amber-500/40 text-white shadow-amber-950/40'
@@ -209,14 +215,18 @@ export const MobileNotificationToast: React.FC = () => {
         <div className="p-4 flex items-start gap-3.5">
           <div
             className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 shadow-inner border ${
-              isFire
+              isZone
+                ? 'bg-red-600/25 text-red-400 border-red-500/50 animate-pulse'
+                : isFire
                 ? 'bg-rose-600/20 text-rose-400 border-rose-500/40 animate-pulse'
                 : isSmoke
                 ? 'bg-amber-600/20 text-amber-400 border-amber-500/40'
                 : 'bg-blue-600/20 text-blue-400 border-blue-500/40'
             }`}
           >
-            {isFire ? (
+            {isZone ? (
+              <ShieldAlert className="w-6 h-6 animate-bounce text-red-400" />
+            ) : isFire ? (
               <Flame className="w-6 h-6 animate-bounce text-rose-400" />
             ) : isSmoke ? (
               <Wind className="w-6 h-6 text-amber-400" />
@@ -256,7 +266,7 @@ export const MobileNotificationToast: React.FC = () => {
         <div className="h-1 w-full bg-white/10 overflow-hidden">
           <div
             className={`h-full transition-all duration-75 ${
-              isFire ? 'bg-rose-500' : isSmoke ? 'bg-amber-500' : 'bg-blue-500'
+              isZone || isFire ? 'bg-rose-500' : isSmoke ? 'bg-amber-500' : 'bg-blue-500'
             }`}
             style={{ width: `${progress}%` }}
           />

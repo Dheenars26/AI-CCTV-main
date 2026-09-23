@@ -13,6 +13,7 @@ from app.models.detection import Detection
 from app.models.evidence import Evidence
 from app.models.notification import Notification
 from app.models.system_log import SystemLog
+from app.services.mongo_service import schedule_mongo_detection_log, schedule_mongo_detections_batch
 from app.utils.logger import logger
 
 
@@ -144,6 +145,22 @@ class AlertService:
         )
         self.db.add(det)
         self.db.commit()
+
+        # Non-blocking async forward to MongoDB (Hybrid telemetry store)
+        try:
+            schedule_mongo_detection_log(
+                camera_id=camera_id,
+                camera_name=f"Camera #{camera_id}",
+                class_name=class_name,
+                confidence=confidence,
+                bounding_box=bounding_box,
+                frame_number=frame_number,
+                fps=fps,
+                timestamp=ts
+            )
+        except Exception:
+            pass
+
         return det
 
     def create_detections_batch(
@@ -156,12 +173,14 @@ class AlertService:
     ) -> List[Detection]:
         """
         Persists a batch of AI detections in a single atomic database transaction.
+        Also pushes telemetry records to MongoDB detection_logs if connected.
         """
         if not detections:
             return []
 
         ts = timestamp or datetime.now(timezone.utc)
         records = []
+        mongo_docs = []
         for det in detections:
             bbox_dict = det.bbox.to_dict() if hasattr(det, "bbox") else det.get("bbox", {})
             lbl = det.label if hasattr(det, "label") else det.get("label", "unknown")
@@ -177,9 +196,28 @@ class AlertService:
                     timestamp=ts
                 )
             )
+            mongo_docs.append({
+                "class_name": str(lbl),
+                "confidence": float(conf),
+                "bounding_box": bbox_dict
+            })
 
         self.db.add_all(records)
         self.db.commit()
+
+        # Non-blocking async forward to MongoDB
+        try:
+            schedule_mongo_detections_batch(
+                camera_id=camera_id,
+                camera_name=f"Camera #{camera_id}",
+                detections=mongo_docs,
+                frame_number=frame_number,
+                fps=fps,
+                timestamp=ts
+            )
+        except Exception:
+            pass
+
         return records
 
     def create_evidence_record(

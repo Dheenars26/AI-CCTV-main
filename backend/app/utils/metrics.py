@@ -9,7 +9,7 @@ import time
 import threading
 from typing import Dict, Any, List, Optional
 try:
-    import psutil
+    import psutil  # type: ignore
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
@@ -34,6 +34,7 @@ class MetricsRegistry:
         self.camera_connection_status: Dict[str, int] = {}  # key: camera_name (1=CONNECTED, 0=DISCONNECTED)
         self.dvr_connection_status: Dict[str, int] = {}  # key: dvr_name (1=ONLINE, 0=OFFLINE)
         self.ai_queue_depth: Dict[str, int] = {}  # key: camera_name
+        self.frame_age_ms: Dict[str, float] = {}  # key: camera_name
         self.websocket_connected_clients: int = 0
         self.evidence_storage_bytes: int = 0
 
@@ -76,6 +77,10 @@ class MetricsRegistry:
     def record_queue_depth(self, camera_name: str, depth: int) -> None:
         with self._lock:
             self.ai_queue_depth[camera_name] = depth
+
+    def record_frame_age(self, camera_name: str, age_ms: float) -> None:
+        with self._lock:
+            self.frame_age_ms[camera_name] = round(float(age_ms), 2)
 
     def record_frame_dropped(self, camera_name: str) -> None:
         with self._lock:
@@ -195,6 +200,12 @@ class MetricsRegistry:
             for cam, depth in self.ai_queue_depth.items():
                 safe_cam = cam.replace('"', '\\"')
                 lines.append(f'cctv_ai_queue_depth{{camera="{safe_cam}"}} {depth}')
+
+            lines.append("# HELP cctv_frame_age_milliseconds AI processing latency / frame age in milliseconds")
+            lines.append("# TYPE cctv_frame_age_milliseconds gauge")
+            for cam, age in self.frame_age_ms.items():
+                safe_cam = cam.replace('"', '\\"')
+                lines.append(f'cctv_frame_age_milliseconds{{camera="{safe_cam}"}} {age}')
 
             lines.append("# HELP cctv_frame_dropped_total Total dropped frames")
             lines.append("# TYPE cctv_frame_dropped_total counter")

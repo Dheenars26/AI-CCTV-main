@@ -290,6 +290,14 @@ that should be quiet raises something.
   (measured 0.25-0.42 on a head crop versus 0.116 full-frame), but a worker 40 m from a 1080p camera
   has ~4 px of eyewear - below what any detector can resolve. Cameras covering PPE-critical areas
   should be positioned or zoomed accordingly.
+* **The legacy OpenCV PPE fallbacks remain unreliable and stay off by default.** Measured on the
+  sample set, the geometric glasses heuristic reported "goggles 0.95-0.96" on **every** image,
+  including firefighters wearing none, and the vest heuristic reported a vest at 0.95 with
+  `tape_ratio 0.0` for a plain yellow shirt. They are now gated on real evidence (opaque/tinted
+  frame material or facial structure for eyewear; reflective tape or garment structure for a vest),
+  which removes those specific fabrications, but they are still heuristics. They only run in mock
+  mode or when `ENABLE_CV_GLASSES_FALLBACK_ON_NEURAL_PATH` / `ENABLE_CV_VEST_DETECTION` are
+  explicitly enabled.
 * **The motion gate is not a replacement for the fire path.** Fire/smoke inference runs on every
   frame regardless of motion, by design: a fire that starts in a still scene must still be seen.
 

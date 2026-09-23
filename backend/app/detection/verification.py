@@ -121,6 +121,11 @@ class ClassVerificationTracker:
         self.cleared_miss_tolerance = max(2, cleared_miss_tolerance)
 
         # Internal state metrics
+        # Confirmation credit: accrues faster while corroborated evidence keeps arriving and decays
+        # when it stops, so a flickering-but-real event confirms on fewer clean frames while a
+        # one-off blip never accumulates enough to alert.
+        self.detection_credit: float = 0.0
+
         self.state: EventState = EventState.NORMAL
         self.event_id: Optional[str] = None
         self.consecutive_frames: int = 0
@@ -177,6 +182,17 @@ class ClassVerificationTracker:
         if best_det:
             self.missed_frames = 0
             self.consecutive_frames += 1
+            _evidence = best_det.metadata or {}
+            # Strong, corroborated evidence earns credit faster than a lone weak box.
+            _corroborated = (
+                float(best_det.confidence) >= 0.60
+                or int(_evidence.get("box_agreement", 1) or 1) >= 4
+                or bool(_evidence.get("physics_valid"))
+            )
+            self.detection_credit = min(
+                float(self.min_consecutive_frames) + 2.0,
+                self.detection_credit + (1.8 if _corroborated else 1.0),
+            )
             self.latest_confidence = best_det.confidence
             self.max_confidence = max(self.max_confidence, best_det.confidence)
             self.latest_bbox = best_det.bbox
@@ -197,7 +213,37 @@ class ClassVerificationTracker:
 
             # Transition 2: POSSIBLE -> CONFIRMED -> ALERT_SENT
             if self.state == EventState.POSSIBLE:
-                sustained = (self.consecutive_frames >= self.min_consecutive_frames) and (duration >= self.min_duration_seconds)
+                # Fast-track is earned by measurable evidence, never by an inflated score: either
+                # the model is genuinely confident, or several overlapping candidate boxes agreed on
+                # the same object (the fusion step counts them). Everything else waits for sustained
+                # proof.
+                _meta = best_det.metadata or {}
+                strong_evidence = (
+                    float(best_det.confidence) >= 0.60
+                    or int(_meta.get("box_agreement", 1) or 1) >= 4
+                )
+                is_fast_track = bool(strong_evidence)
+
+                if is_fast_track:
+                    if self.min_consecutive_frames > 4:
+                        req_frames = max(3, int(self.min_consecutive_frames) - 3)
+                    else:
+                        req_frames = max(2, int(self.min_consecutive_frames) - 1)
+                else:
+                    req_frames = int(self.min_consecutive_frames)
+
+                req_duration = (
+                    max(0.5, self.min_duration_seconds * 0.5)
+                    if (is_fast_track and self.min_duration_seconds > 0.5)
+                    else self.min_duration_seconds
+                )
+                credit_threshold_met = (
+                    self.consecutive_frames >= req_frames or self.detection_credit >= float(req_frames)
+                )
+                sustained = credit_threshold_met and (duration >= req_duration)
+
+                # Two-tier policy: sustained evidence below the alert floor stays a *visible
+                # detection* (drawn, logged, streamed) without dispatching an alert.
                 if sustained and self.max_confidence < self.alert_min_confidence:
                     # Persistent but weak: keep tracking as a visible detection without raising an
                     # alert. Logged once per streak at debug level to avoid log spam.
@@ -268,6 +314,7 @@ class ClassVerificationTracker:
             # Sub-case B1: False Alarm Recovery (POSSIBLE -> NORMAL)
             if self.state == EventState.POSSIBLE:
                 self.missed_frames += 1
+                self.detection_credit = max(0.0, self.detection_credit - 1.0)
                 if self.consecutive_frames <= 1 or self.missed_frames >= self.cleared_miss_tolerance:
                     logger.info(
                         f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "
@@ -279,6 +326,7 @@ class ClassVerificationTracker:
             # Sub-case B2: Active Event Clearing (ALERT_SENT / ACTIVE -> CLEARED -> NORMAL)
             if self.state in [EventState.ALERT_SENT, EventState.ACTIVE]:
                 self.missed_frames += 1
+                self.detection_credit = max(0.0, self.detection_credit - 1.0)
                 if self.missed_frames >= self.cleared_miss_tolerance:
                     duration = now_ts - self.start_timestamp
                     evt_id = self.event_id or f"evt_{uuid.uuid4().hex[:10]}"
@@ -314,6 +362,7 @@ class ClassVerificationTracker:
         self.event_id = None
         self.consecutive_frames = 0
         self.missed_frames = 0
+        self.detection_credit = 0.0
         self.start_time = None
         self.start_timestamp = 0.0
         self.last_alert_timestamp = 0.0

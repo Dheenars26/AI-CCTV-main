@@ -56,20 +56,20 @@ class PPEAssociationEngine:
         "helmet": (-0.25, 0.40),
         "hard_hat": (-0.25, 0.40),
         "cap": (-0.25, 0.40),
-        "mask": (-0.10, 0.45),
-        "face_mask": (-0.10, 0.45),
-        "goggles": (-0.15, 0.65),
-        "glasses": (-0.15, 0.65),
-        "safety_glasses": (-0.15, 0.65),
-        "safety_glass": (-0.15, 0.65),
-        "glass": (-0.15, 0.65),
-        "eyewear": (-0.15, 0.65),
-        "eye_protection": (-0.15, 0.65),
-        "spec": (-0.15, 0.65),
-        "specs": (-0.15, 0.65),
-        "spectacles": (-0.15, 0.65),
-        "protective_glasses": (-0.15, 0.65),
-        "safety_goggles": (-0.15, 0.65),
+        "mask": (-0.12, 0.48),
+        "face_mask": (-0.12, 0.48),
+        "goggles": (-0.12, 0.50),
+        "glasses": (-0.12, 0.50),
+        "safety_glasses": (-0.12, 0.50),
+        "safety_glass": (-0.12, 0.50),
+        "glass": (-0.12, 0.50),
+        "eyewear": (-0.12, 0.50),
+        "eye_protection": (-0.12, 0.50),
+        "spec": (-0.12, 0.50),
+        "specs": (-0.12, 0.50),
+        "spectacles": (-0.12, 0.50),
+        "protective_glasses": (-0.12, 0.50),
+        "safety_goggles": (-0.12, 0.50),
         "vest": (0.02, 0.95),
         "safety_vest": (0.02, 0.95),
         "jacket": (0.02, 0.95),
@@ -202,10 +202,16 @@ class PPEAssociationEngine:
         ppe_area = max(0.0, e_xmax - e_xmin) * max(0.0, e_ymax - e_ymin)
         ioa = (inter_area / ppe_area) if ppe_area > 0 else 0.0
 
+        # Strict centroid height verification for head/facial items (goggles, glasses, helmet, mask)
+        # Prevents plastic bottles or cups held at chest/stomach from being associated as eye gear
+        is_head_item = any(k in label for k in ["goggles", "glasses", "glass", "eyewear", "spec", "helmet", "hard_hat", "cap", "mask"])
+        if is_head_item and not cy_in_range:
+            return False, 0.0
+
         is_valid = (
             (ioa >= 0.10 and x_in_range and cy_in_range) or
             (cy_in_range and x_in_range and ioa >= 0.04) or
-            (ioa >= 0.30)
+            (ioa >= 0.30 and cy_in_range)
         )
         if not is_valid:
             return False, 0.0
@@ -221,14 +227,19 @@ class PPEAssociationEngine:
 
     @staticmethod
     def _normalize_label(label: str) -> str:
-        l = label.lower().replace("_", " ").replace("-", " ")
+        l = label.lower().replace("_", " ").replace("-", " ").strip()
+        # Inanimate glassware / cups / bottles / plastic items are NOT safety goggles
+        if any(non_ppe in l for non_ppe in ["wine glass", "drinking glass", "glass bottle", "magnifying glass", "hourglass", "cup", "bottle", "plastic"]):
+            return l
         if any(w in l for w in ["helmet", "hard hat", "hardhat", "cap", "headgear"]):
             return "helmet"
         if any(w in l for w in ["vest", "jacket", "hivis", "hi vis", "high vis", "reflective", "safety vest"]):
             return "vest"
         if any(w in l for w in ["mask", "face mask", "n95", "respirator"]):
             return "mask"
-        if any(w in l for w in ["goggles", "glasses", "safety glasses", "safety glass", "glass", "eye protection", "eyewear", "spec", "specs", "spectacles", "protective glasses", "safety goggles"]):
+        if any(w in l for w in ["goggles", "safety glasses", "safety glass", "eye protection", "eyewear", "specs", "spectacles", "protective glasses", "safety goggles", "eyeglass", "eyeglasses", "eye glass", "sunglasses"]):
+            return "goggles"
+        if l in ["glasses", "glass"]:
             return "goggles"
         if any(w in l for w in ["glove", "gloves", "hand protection"]):
             return "gloves"

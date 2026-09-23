@@ -113,7 +113,7 @@ class RTSPCamera(CameraSource):
         try:
             # Set OpenCV RTSP transport protocol flags if supported
             import os
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|stimeout;2000000"
             url_to_open = self._normalize_url(self.raw_rtsp_url)
             self.cap = cv2.VideoCapture(url_to_open, cv2.CAP_FFMPEG)
 
@@ -193,12 +193,18 @@ class RTSPCamera(CameraSource):
 
         if self.cap is not None:
             logger.info(f"Releasing RTSP VideoCapture for Camera {self.camera_id}")
-            try:
-                self.cap.release()
-            except Exception as e:
-                logger.warning(f"Error releasing VideoCapture for Camera {self.camera_id}: {str(e)}")
-            finally:
-                self.cap = None
+            cap_to_release = self.cap
+            self.cap = None
+
+            def _safe_release(c: cv2.VideoCapture) -> None:
+                try:
+                    c.release()
+                except Exception as e:
+                    logger.warning(f"Error releasing VideoCapture for Camera {self.camera_id}: {str(e)}")
+
+            t = threading.Thread(target=_safe_release, args=(cap_to_release,), daemon=True)
+            t.start()
+            t.join(timeout=1.0)
 
         self.state.connection_status = CameraStatus.DISCONNECTED
 

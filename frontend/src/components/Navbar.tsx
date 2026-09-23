@@ -1,24 +1,56 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Flame, Wind, Radio, LogOut, Bell, ShieldAlert, CheckCircle, Trash2 } from 'lucide-react';
+import { Flame, Wind, Radio, LogOut, Bell, ShieldAlert, CheckCircle, Trash2, Menu } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useWebSocket } from '../context/WebSocketContext';
 import { alertsApi } from '../api/alerts';
 import { getSafeTimestamp, formatSafeTime } from '../utils/dateUtils';
 import synterionLogo from '../assets/synterionx_icon.png';
 
-export const Navbar: React.FC = () => {
+interface NavbarProps {
+  onToggleMobileNav?: () => void;
+}
+
+export const Navbar: React.FC<NavbarProps> = ({ onToggleMobileNav }) => {
   const { user, logout } = useAuth();
   const queryClient = useQueryClient();
   const { isConnected, activeFireCount, activeSmokeCount } = useWebSocket();
   const [showNotifications, setShowNotifications] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
   const [isClearing, setIsClearing] = useState(false);
   const [clearedAt, setClearedAt] = useState<number>(() => {
     const saved = localStorage.getItem('cctv_notif_cleared_at');
     return saved ? parseInt(saved, 10) : 0;
   });
   const [clearedIds, setClearedIds] = useState<Set<string>>(new Set());
+
+  // Close dropdown when clicking anywhere outside of it or pressing Escape
+  useEffect(() => {
+    if (!showNotifications) return;
+
+    const handleClickOutside = (event: MouseEvent | TouchEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowNotifications(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowNotifications(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('touchstart', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('touchstart', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [showNotifications]);
 
   const { data: alertsRes } = useQuery({
     queryKey: ['navbar-notifications'],
@@ -32,11 +64,11 @@ export const Navbar: React.FC = () => {
   // Order chronologically (newest at the very top).
   const displayList = useMemo(() => {
     return rawNotifications
-      .filter((notif) => {
+      .filter((notif: any) => {
         if (clearedIds.has(String(notif.id))) return false;
 
         const stateUpper = (notif.state || notif.status || '').toUpperCase();
-        if (stateUpper === 'RESOLVED' || stateUpper === 'CLEARED') {
+        if (stateUpper === 'RESOLVED' || stateUpper === 'CLEARED' || notif.resolved === true) {
           return false;
         }
 
@@ -46,17 +78,27 @@ export const Navbar: React.FC = () => {
         }
         return true;
       })
-      .sort((a, b) => getSafeTimestamp(b) - getSafeTimestamp(a));
+      .sort((a: any, b: any) => getSafeTimestamp(b) - getSafeTimestamp(a));
   }, [rawNotifications, clearedIds, clearedAt]);
 
   const unreadCount = displayList.length;
 
-  const handleClearAll = async () => {
-    // 1. Instant optimistic clear (0ms UI latency)
+  const handleDismissNotification = (id: string | number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setClearedIds(prev => new Set(prev).add(String(id)));
+  };
+
+  const handleClearAll = async (e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+    // 1. Instant optimistic clear
     const now = Date.now();
     setClearedAt(now);
-    localStorage.setItem('cctv_notif_cleared_at', now.toString());
-    const allIds = new Set(rawNotifications.map((n) => String(n.id)));
+    localStorage.setItem('cctv_notif_cleared_at', String(now));
+    const allIds = new Set(rawNotifications.map((n: any) => String(n.id)));
     setClearedIds(allIds);
 
     // 2. Background async resolve-all
@@ -74,33 +116,41 @@ export const Navbar: React.FC = () => {
   };
 
   return (
-    <header className="h-16 bg-white/95 border-b border-slate-200/80 px-6 flex items-center justify-between sticky top-0 z-40 backdrop-blur-md shadow-sm">
-      {/* Brand Title */}
-      <div className="flex items-center gap-3">
-        <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-50 via-white to-indigo-50/50 flex items-center justify-center shadow-sm border border-slate-200/80 overflow-hidden p-1">
+    <header className="h-16 bg-white/95 border-b border-slate-200/80 px-3 sm:px-6 flex items-center justify-between sticky top-0 z-40 backdrop-blur-md shadow-sm">
+      {/* Brand Title & Mobile Menu Button */}
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+        <button
+          type="button"
+          onClick={onToggleMobileNav}
+          className="lg:hidden p-2 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200/80 shrink-0"
+          aria-label="Open navigation menu"
+        >
+          <Menu className="w-4 h-4" />
+        </button>
+        <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-br from-blue-50 via-white to-indigo-50/50 flex items-center justify-center shadow-sm border border-slate-200/80 overflow-hidden p-1 shrink-0">
           <img src={synterionLogo} alt="SynterionX Logo" className="w-full h-full object-contain" />
         </div>
-        <div>
-          <h1 className="font-extrabold text-base tracking-tight text-slate-900">
+        <div className="min-w-0">
+          <h1 className="font-extrabold text-sm sm:text-base tracking-tight text-slate-900 truncate">
             SYNTERION X
           </h1>
-          <p className="text-[11px] text-slate-500 font-medium">Smart AI Surveillance & Safety Platform</p>
+          <p className="hidden md:block text-[11px] text-slate-500 font-medium truncate">Smart AI Surveillance & Safety Platform</p>
         </div>
       </div>
 
       {/* Status Badges & Live Metrics */}
-      <div className="flex items-center gap-4 sm:gap-6">
+      <div className="flex items-center gap-2 sm:gap-4 shrink-0">
         {/* Real-time Threat Indicators */}
-        <div className="flex items-center gap-2.5">
-          <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border transition-all ${
-            activeFireCount > 0 ? 'bg-rose-50 text-rose-700 border-rose-300 shadow-sm animate-pulse' : 'bg-slate-100 text-slate-600 border-slate-200'
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          <div className={`items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full text-xs font-semibold border transition-all ${
+            activeFireCount > 0 ? 'flex bg-rose-50 text-rose-700 border-rose-300 shadow-sm animate-pulse' : 'hidden sm:flex bg-slate-100 text-slate-600 border-slate-200'
           }`}>
             <Flame className={`w-3.5 h-3.5 ${activeFireCount > 0 ? 'text-rose-600 animate-bounce' : 'text-slate-400'}`} />
             <span>Fire: {activeFireCount}</span>
           </div>
 
-          <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border transition-all ${
-            activeSmokeCount > 0 ? 'bg-amber-50 text-amber-800 border-amber-300 shadow-sm' : 'bg-slate-100 text-slate-600 border-slate-200'
+          <div className={`items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full text-xs font-semibold border transition-all ${
+            activeSmokeCount > 0 ? 'flex bg-amber-50 text-amber-800 border-amber-300 shadow-sm' : 'hidden sm:flex bg-slate-100 text-slate-600 border-slate-200'
           }`}>
             <Wind className={`w-3.5 h-3.5 ${activeSmokeCount > 0 ? 'text-amber-600' : 'text-slate-400'}`} />
             <span>Smoke: {activeSmokeCount}</span>
@@ -108,15 +158,15 @@ export const Navbar: React.FC = () => {
         </div>
 
         {/* WebSocket Connectivity Status */}
-        <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border ${
+        <div className={`flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1 rounded-full text-xs font-medium border ${
           isConnected ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'
         }`}>
           <Radio className={`w-3.5 h-3.5 ${isConnected ? 'text-emerald-600 animate-pulse' : 'text-rose-600'}`} />
-          <span>{isConnected ? 'System Live' : 'Reconnecting'}</span>
+          <span className="hidden sm:inline">{isConnected ? 'System Live' : 'Reconnecting'}</span>
         </div>
 
         {/* Quick-Access Notification Bell Dropdown */}
-        <div className="relative">
+        <div className="relative" ref={dropdownRef}>
           <button
             onClick={() => setShowNotifications(!showNotifications)}
             className={`relative p-2 rounded-xl border transition-all ${

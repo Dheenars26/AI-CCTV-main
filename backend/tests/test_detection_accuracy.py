@@ -344,20 +344,35 @@ def test_evidence_fusion_boosts_corroborated_detection_without_erasing_a_weak_on
     import cv2
     from app.detection.yolo import YOLODetector
 
-    # Bright, saturated flame-coloured patch.
+    # A real flame has internal structure: an incandescent core and turbulent colour gradients.
+    rng = np.random.default_rng(7)
     flame = np.zeros((80, 80, 3), dtype=np.uint8)
-    flame[:, :] = (40, 180, 250)
+    for y in range(80):
+        for x in range(80):
+            d = float(np.hypot(x - 40, y - 46)) / 40.0
+            flame[y, x] = (30 + int(120 * d), 120 + int(100 * (1 - d)), 245)
+    cv2.circle(flame, (40, 40), 8, (185, 235, 255), -1)
+    flame = np.clip(
+        flame.astype(np.int16) + rng.normal(0, 8, flame.shape).astype(np.int16), 0, 255
+    ).astype(np.uint8)
+
     strong_evidence, strong_physics = YOLODetector._fuse_fire_smoke_evidence("fire", 0.30, flame)
     assert strong_physics["corroboration"] > 0.25
     assert strong_evidence > 0.30, "physical corroboration must raise the evidence score"
 
-    # Flat grey patch: no flame colours at all.
+    # A flat, uniformly coloured patch is paint, plastic or fabric, never fire: colour alone cannot
+    # tell an orange shirt from a flame, so a flat patch earns no corroboration at all.
+    flat = np.full((80, 80, 3), (40, 180, 250), dtype=np.uint8)
+    flat_evidence, flat_physics = YOLODetector._fuse_fire_smoke_evidence("fire", 0.30, flat)
+    assert flat_physics["painted_surface"] is True
+    assert flat_physics["corroboration"] == 0.0
+    assert flat_evidence == pytest.approx(0.30, abs=1e-6)
+
+    # Flat grey patch: no flame colours at all, and the model's own score is never reduced.
     dull = np.full((80, 80, 3), 120, dtype=np.uint8)
     weak_evidence, weak_physics = YOLODetector._fuse_fire_smoke_evidence("fire", 0.30, dull)
     assert weak_physics["corroboration"] < 0.05
-    # The model's own score is never reduced, so a confident fire is not thrown away.
     assert weak_evidence >= 0.30
-
 
 def test_exclusion_roi_suppresses_fire_on_detected_person_or_ppe():
     from app.detection.yolo import YOLODetector

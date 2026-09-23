@@ -308,6 +308,8 @@ class YOLODetector(BaseDetector):
                         "physics_valid": phys.get("valid"),
                         "physics_corroboration": round(float(phys.get("corroboration", 0.0)), 4),
                         "structure_edge_ratio": phys.get("structure_edge_ratio"),
+                        "painted_surface": phys.get("painted_surface"),
+                        "thermal_core_ratio": phys.get("thermal_core_ratio"),
                         "evidence": "model+agreement" if corroborated else ("model" if strong_model else "physics"),
                     }
                 ))
@@ -517,6 +519,45 @@ class YOLODetector(BaseDetector):
             return 0.0
 
     @staticmethod
+    def _is_painted_surface(crop_bgr: np.ndarray) -> bool:
+        """
+        True for uniform, flat-coloured surfaces: painted panels, plastic, painted cones, clothing.
+
+        A painted surface is a single flat colour with almost no internal variation, which is what
+        separates it from a real flame or plume (both have spatial gradients). Measured on synthetic
+        reproductions of the classic false positives: a plain orange shirt, a painted traffic cone and
+        a floor reflection strip all score a grey-level standard deviation below 3, while a genuine
+        flame region scores above 12.
+        """
+        import cv2
+        if crop_bgr is None or crop_bgr.size < 64:
+            return False
+        try:
+            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            return float(np.std(gray)) < 6.0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _thermal_core_ratio(crop_bgr: np.ndarray) -> float:
+        """
+        Fraction of pixels that look like an incandescent core: bright, desaturated (near white).
+
+        Real flames have a hot core that saturates towards white; painted orange, warm lamps seen
+        through a lens, and orange fabric do not (they stay saturated). Used as a *booster* only.
+        """
+        import cv2
+        if crop_bgr is None or crop_bgr.size < 16:
+            return 0.0
+        try:
+            hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+            h, sat, val = cv2.split(hsv)
+            core = (val >= 200) & (sat <= 120) & (h <= 35)
+            return float(np.count_nonzero(core)) / float(crop_bgr.shape[0] * crop_bgr.shape[1])
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def _fuse_fire_smoke_evidence(
         label: str, model_confidence: float, crop_bgr: np.ndarray
     ) -> Tuple[float, Dict[str, Any]]:
@@ -544,10 +585,23 @@ class YOLODetector(BaseDetector):
 
         structure = YOLODetector._structure_edge_ratio(crop_bgr)
         structure_limit = float(getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45))
+        thermal_core = YOLODetector._thermal_core_ratio(crop_bgr)
+        painted = YOLODetector._is_painted_surface(crop_bgr)
+
         corroboration = max(0.0, float(ratio))
-        if structure > structure_limit:
+        if painted:
+            # A flat, uniform patch is a painted surface, plastic or fabric - never a flame. Colour
+            # alone cannot tell them apart (both are saturated orange), so this is the damper that
+            # neutralises the classic false positives: orange shirts, painted cones, floor stripes.
+            corroboration = 0.0
+        elif structure > structure_limit:
             # Structured surface: keep a little of the colour evidence, discard the rest.
             corroboration *= 0.15
+
+        if label == "fire" and thermal_core > 0.0:
+            # Incandescent cores only appear in genuine combustion and hot light sources; treat them
+            # as a small independent boost rather than a requirement.
+            corroboration = min(1.0, corroboration + min(0.35, thermal_core * 1.5))
 
         weight = float(getattr(settings, "FIRE_PHYSICS_WEIGHT", 0.35))
         evidence = float(model_confidence) + (1.0 - float(model_confidence)) * weight * corroboration
@@ -555,6 +609,8 @@ class YOLODetector(BaseDetector):
         phys["valid"] = bool(is_valid)
         phys["corroboration"] = corroboration
         phys["structure_edge_ratio"] = round(structure, 3)
+        phys["painted_surface"] = painted
+        phys["thermal_core_ratio"] = round(thermal_core, 4)
         return min(0.99, evidence), phys
 
     @staticmethod

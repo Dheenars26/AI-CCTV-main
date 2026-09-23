@@ -11,6 +11,7 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  mongo_data:
   evidence_storage:
   recordings_storage:
 
@@ -186,4 +187,19 @@ services:
         limits:
           cpus: '1.0'
           memory: 2G
+    restart: always
+
+  # 9. MongoDB 7.0 High-Throughput Detection & Telemetry Store (Hybrid Architecture)
+  mongo:
+    image: mongo:7.0
+    container_name: cctv_mongo
+    environment:
+      MONGO_INITDB_DATABASE: cctv_ai_surveillance
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - data
+      - backend
     restart: always

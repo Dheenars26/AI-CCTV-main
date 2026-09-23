@@ -35,7 +35,12 @@ class Settings(BaseSettings):
     CORS_ORIGINS: Union[List[str], str] = ["*"]
     SECRET_KEY: str = "development-secret-key-change-in-production"
 
-    # Database Settings
+    # Database Settings (SQLAlchemy / Relational)
+    # MongoDB Settings (Hybrid Architecture for Detection Logs & Telemetry)
+    MONGODB_ENABLED: bool = True
+    MONGODB_URL: str = "mongodb://localhost:27017"
+    MONGODB_DB_NAME: str = "cctv_ai_surveillance"
+    MONGODB_SERVER_TIMEOUT_MS: int = 2500
     DATABASE_URL: str = "sqlite:///./cctv.db"
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
@@ -89,6 +94,10 @@ class Settings(BaseSettings):
 
     # YOLO Model File Paths & Backward Compatibility Aliases
     YOLO_MODEL_PATH: str = "models/fire_smoke.onnx"
+    # Legacy OpenCV standalone vest/worker CV fallbacks: measured to fabricate detections,
+    # so they stay off unless an operator explicitly opts in.
+    ENABLE_STANDALONE_VEST_FALLBACK: bool = False
+    ENABLE_HIGHVIS_WORKER_ANCHOR: bool = False
     YOLO_CONF_THRESHOLD: float = 0.48
     YOLO_IOU_THRESHOLD: float = 0.45
     YOLO_IMGSZ: int = 416

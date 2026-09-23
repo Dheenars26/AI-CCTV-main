@@ -35,6 +35,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Configured CORS Origins: {settings.CORS_ORIGINS}")
     logger.info("=" * 60)
 
+    # Initialize Hybrid MongoDB Connection (non-blocking, graceful fallback)
+    from app.database.mongodb import connect_to_mongo, close_mongo_connection
+    await connect_to_mongo()
+
+
     # Register running event loop with WebSocket Connection Manager for worker thread broadcasts
     import asyncio
     try:
@@ -171,10 +176,23 @@ async def lifespan(app: FastAPI):
             db.commit()
             logger.info("App Lifespan: Auto-created default Admin user ('admin' / 'admin123').")
 
+        from app.models.zone import SafetyZone
         all_cameras = db.query(Camera).all()
         logger.info(f"App Lifespan: Loaded {len(all_cameras)} camera(s) into CameraManager.")
         for cam in all_cameras:
-            camera_manager.add_camera(cam)
+            cam_zones = db.query(SafetyZone).filter(SafetyZone.camera_id == cam.id, SafetyZone.enabled == True).all()
+            zone_dicts = [
+                {
+                    "id": z.id,
+                    "name": z.name,
+                    "zone_type": z.zone_type,
+                    "polygon_coordinates": z.polygon_coordinates,
+                    "ppe_profile_id": z.ppe_profile_id,
+                    "enabled": z.enabled
+                }
+                for z in cam_zones
+            ]
+            camera_manager.add_camera(cam, zones=zone_dicts)
             if cam.enabled and getattr(settings, "APP_ENV", "development") != "testing":
                 camera_manager.start_camera(cam.id)
         
@@ -208,6 +226,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown tasks
     logger.info("Shutting down AI CCTV Monitor Application backend gracefully...")
+    try:
+        from app.database.mongodb import close_mongo_connection
+        await close_mongo_connection()
+    except Exception as mongo_err:
+        logger.warning(f"MongoDB Shutdown Exception: {mongo_err}")
+
     if hasattr(app, "state") and hasattr(app.state, "camera_manager") and app.state.camera_manager:
         try:
             app.state.camera_manager.stop_all()

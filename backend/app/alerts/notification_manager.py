@@ -179,10 +179,16 @@ class NotificationManager:
 
         # Construct descriptive subject line
         cls_lower = event.class_name.lower()
+        inc_type = str(evt_meta.get("incident_type", "")).upper()
+        is_zone = "zone" in cls_lower or "restricted" in cls_lower or inc_type == "ZONE_VIOLATION" or "unauthorized" in cls_lower
+
         if "fire" in cls_lower:
             subj_tag = "CRITICAL FIRE"
         elif "smoke" in cls_lower:
             subj_tag = "WARNING SMOKE"
+        elif is_zone:
+            z_name = str(evt_meta.get("zone_name") or "Restricted Area").upper()
+            subj_tag = f"CRITICAL SECURITY - RESTRICTED AREA INTRUSION ({z_name})"
         elif clean_display_missing:
             missing_fmt = " & ".join([f"NO {item}" for item in clean_display_missing])
             subj_tag = f"PPE VIOLATION ({missing_fmt})"
@@ -203,6 +209,10 @@ class NotificationManager:
             "longitude": lon,
             "google_maps_link": maps_link,
             "class_name": event.class_name,
+            "zone_id": evt_meta.get("zone_id"),
+            "zone_name": evt_meta.get("zone_name"),
+            "incident_type": evt_meta.get("incident_type", "ZONE_VIOLATION" if is_zone else event.class_name.upper()),
+            "events": evt_meta.get("events", ["UNAUTHORIZED_AREA_ENTRY"] if is_zone else []),
             "missing_items": clean_display_missing if clean_display_missing else clean_missing,
             "person_id": person_id,
             "confidence": event.max_confidence,

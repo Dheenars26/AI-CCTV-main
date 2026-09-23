@@ -254,3 +254,19 @@ def test_ppe_detector_detect_method_integrates_optical_glasses():
     assert "goggles" in labels
     goggle = next(d for d in dets if d.label == "goggles")
     assert goggle.confidence >= 0.80
+
+
+def test_glass_raw_class_mapped_to_goggles_in_detector():
+    """Verifies that raw class name 'glass' or 'safety_glass' maps to 'goggles' in PPEDetector."""
+    detector = PPEDetector(device="cpu")
+    # Verify target classes include goggles / vest
+    assert "vest" in detector.target_classes or "safety_vest" in detector.target_classes
+    assert "goggles" in detector.target_classes or "safety_glasses" in detector.target_classes
+
+    from app.safety.association import PPEAssociationEngine
+    engine = PPEAssociationEngine()
+    assert engine._normalize_label("glass") == "goggles"
+    assert engine._normalize_label("safety glass") == "goggles"
+    assert engine._normalize_label("safety_glass") == "goggles"
+    assert engine._normalize_label("safety glasses") == "goggles"
+
