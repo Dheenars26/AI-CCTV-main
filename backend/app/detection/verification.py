@@ -222,7 +222,7 @@ class ClassVerificationTracker:
                     float(best_det.confidence) >= 0.60
                     or int(_meta.get("box_agreement", 1) or 1) >= 4
                 )
-                is_fast_track = bool(strong_evidence)
+                is_fast_track = strong_evidence
 
                 if is_fast_track:
                     if self.min_consecutive_frames > 4:

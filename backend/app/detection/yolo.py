@@ -606,7 +606,7 @@ class YOLODetector(BaseDetector):
         weight = float(getattr(settings, "FIRE_PHYSICS_WEIGHT", 0.35))
         evidence = float(model_confidence) + (1.0 - float(model_confidence)) * weight * corroboration
 
-        phys["valid"] = bool(is_valid)
+        phys["valid"] = is_valid
         phys["corroboration"] = corroboration
         phys["structure_edge_ratio"] = round(structure, 3)
         phys["painted_surface"] = painted

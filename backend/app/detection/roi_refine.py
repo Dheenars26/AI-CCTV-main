@@ -17,6 +17,7 @@ short TTL so a confirmed item is not re-checked for several seconds. Compliant w
 
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+import numpy as np
 
 from app.detection.base import BoundingBox, DetectionResult
 from app.detection.preprocess import clip_roi, prepare_worker_roi, upscale_if_small
@@ -66,7 +67,7 @@ def normalise_ppe_label(raw_label: str) -> Optional[str]:
     """
     if raw_label is None:
         return None
-    label = str(raw_label).lower().strip().replace("_", " ").replace("-", " ")
+    label = raw_label.lower().strip().replace("_", " ").replace("-", " ")
     label = " ".join(label.split())
 
     if any(label.startswith(prefix.replace("-", " ").replace("_", " ")) for prefix in NEGATIVE_CLASS_PREFIXES):
@@ -145,10 +146,10 @@ class PPERoiRefiner:
     # ------------------------------------------------------------------ #
     def refine(
         self,
-        image_bgr,
-        persons: Sequence,
+        image_bgr: np.ndarray,
+        persons: Sequence[Any],
         missing_by_person: Dict[int, List[str]],
-        infer_fn: Callable[[object], List[Tuple[str, float, Tuple[float, float, float, float]]]],
+        infer_fn: Callable[[np.ndarray], List[Tuple[str, float, Tuple[float, float, float, float]]]],
     ) -> List[DetectionResult]:
         """
         Runs at most one ROI inference and returns any newly found PPE as detections.
@@ -167,11 +168,11 @@ class PPERoiRefiner:
         h, w = image_bgr.shape[:2]
 
         # Build the pending work list, skipping anything covered by the cache.
-        pending: List[Tuple[int, object, str, str]] = []
+        pending: List[Tuple[int, Any, str, str]] = []
         for index, person in enumerate(persons[: self.max_persons]):
             pid = person_key(person, index)
             for item in missing_by_person.get(pid, []):
-                item_l = str(item).lower()
+                item_l = item.lower()
                 cached = self._cached(pid, item_l)
                 if cached is True:
                     continue  # already corroborated recently - nothing to prove
@@ -251,7 +252,7 @@ class PPERoiRefiner:
         improve = any(item in found_items for item in _items_for_region(region)) or (
             item in found_items
         )
-        self._remember(pid, item, found=bool(improve), confidence=max(
+        self._remember(pid, item, found=improve, confidence=max(
             [r.confidence for r in results], default=0.0
         ))
         # Any additional item corroborated by this crop is cached too.
@@ -285,8 +286,8 @@ def person_key(person: Any, index: int = 0) -> int:
         cy = (float(bbox.y_min) + float(bbox.y_max)) / 2.0
         # 10x10 grid cells over the frame - coarse enough to be stable, fine enough to separate
         # two workers standing side by side.
-        return 100000 + int(round(cx * 10)) * 100 + int(round(cy * 10))
-    return 100000 + int(index)
+        return 100000 + round(cx * 10) * 100 + round(cy * 10)
+    return 100000 + index
 
 
 def _items_for_region(region: str) -> Tuple[str, ...]:
