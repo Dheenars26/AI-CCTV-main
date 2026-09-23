@@ -6,20 +6,21 @@ Fully frontend-independent and thread-isolated.
 """
 
 import time
+import uuid
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple, Callable
-import uuid
 import cv2
 import numpy as np
 
-from app.detection.base import BaseDetector, DummyDetector, DetectionResult, BoundingBox
-from app.detection.verification import CameraVerificationEngine, VerifiedEvent, EventState
+from app.detection.base import BaseDetector, DummyDetector, DetectionResult
+from app.detection.verification import CameraVerificationEngine, VerifiedEvent
 from app.detection.fire_smoke_detector import FireSmokeDetector
 from app.detection.ppe_detector import PPEDetector
 from app.detection.person_detector import PersonDetector
+from app.detection.motion_gate import MotionGate
 from app.safety.tracker import PersonTracker
 from app.safety.association import PPEAssociationEngine
 from app.zones.engine import ZoneEngine
@@ -261,14 +262,14 @@ class StandardPostprocessor(BasePostprocessor):
     def _draw_pill_badge(self, img: np.ndarray, text: str, pos: Tuple[int, int], is_found: bool) -> None:
         """Renders green ('✓') / red ('✕') rounded pill badges matching modern CCTV UI."""
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.58
-        thickness = 2
+        font_scale = 0.48
+        thickness = 1
         (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
         x, y = pos
-        pad_x, pad_y = 10, 6
-        icon_w = 18
-        badge_w = icon_w + tw + pad_x * 2 + 6
-        badge_h = max(th + pad_y * 2 + 2, 30)
+        pad_x, pad_y = 10, 5
+        icon_w = 16
+        badge_w = icon_w + tw + pad_x * 2 + 4
+        badge_h = max(th + pad_y * 2, 26)
 
         img_h, img_w = img.shape[:2]
         x1 = max(5, min(x, img_w - badge_w - 5))
@@ -284,13 +285,13 @@ class StandardPostprocessor(BasePostprocessor):
 
         icon_center_y = y1 + badge_h // 2
         if is_found:
-            pts = np.array([[x1 + 8, icon_center_y], [x1 + 13, icon_center_y + 4], [x1 + 21, icon_center_y - 5]], np.int32)
+            pts = np.array([[x1 + 8, icon_center_y], [x1 + 12, icon_center_y + 4], [x1 + 19, icon_center_y - 4]], np.int32)
             cv2.polylines(img, [pts], False, (255, 255, 255), 2, cv2.LINE_AA)
         else:
             cv2.line(img, (x1 + 9, icon_center_y - 4), (x1 + 17, icon_center_y + 4), (255, 255, 255), 2, cv2.LINE_AA)
             cv2.line(img, (x1 + 17, icon_center_y - 4), (x1 + 9, icon_center_y + 4), (255, 255, 255), 2, cv2.LINE_AA)
 
-        cv2.putText(img, text, (x1 + icon_w + pad_x + 2, y1 + pad_y + th), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.putText(img, text, (x1 + icon_w + pad_x + 2, y1 + badge_h - pad_y - 1), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     def process(self, frame: Frame) -> Frame:
         if frame.image is None or frame.image.size == 0:
@@ -309,25 +310,24 @@ class StandardPostprocessor(BasePostprocessor):
                 cv2.rectangle(frame.image, (int(w * 0.25), 5), (int(w * 0.75), 38), (0, 0, 220), -1)
                 cv2.putText(frame.image, freeze_text, (int(w * 0.28), 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # 1b. Check for Active Restricted Zone Violations & Intrusion Warnings
-            safety_decisions = frame.metadata.get("safety_decisions", [])
+            # 2. Active zone breaches, used to escalate the overlay below
             zone_violator_pids: Dict[int, str] = {}
-            for s_dec in safety_decisions:
-                if s_dec.get("incident_type") == "ZONE_VIOLATION":
-                    pid = s_dec.get("person_id")
-                    z_name = s_dec.get("zone_name", "RESTRICTED AREA")
-                    if pid is not None:
-                        zone_violator_pids[pid] = z_name
+            for decision in (frame.metadata.get("safety_decisions") or []):
+                if decision.get("incident_type") != "ZONE_VIOLATION":
+                    continue
+                pid = decision.get("person_id")
+                if pid is not None:
+                    zone_violator_pids[pid] = decision.get("zone_name") or "RESTRICTED AREA"
 
-            # Emergency Intrusion Banner at top of captured frame
             if zone_violator_pids:
-                first_zname = next(iter(zone_violator_pids.values())).upper()
-                banner_text = f"SECURITY ALERT: RESTRICTED AREA INTRUSION ({first_zname})"
+                first_zone = next(iter(zone_violator_pids.values())).upper()
+                banner_text = f"SECURITY ALERT: RESTRICTED AREA INTRUSION ({first_zone})"
                 cv2.rectangle(frame.image, (int(w * 0.08), 6), (int(w * 0.92), 42), (20, 20, 220), -1)
                 cv2.rectangle(frame.image, (int(w * 0.08), 6), (int(w * 0.92), 42), (0, 0, 255), 2)
-                cv2.putText(frame.image, banner_text, (int(w * 0.10), 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame.image, banner_text, (int(w * 0.10), 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
-            # 2. Draw Safety Zone Polygons
+            # 3. Draw Safety Zone Polygons
             zones = frame.metadata.get("safety_zones", [])
             for zone in zones:
                 poly_coords = zone.get("polygon_coordinates", [])
@@ -335,22 +335,19 @@ class StandardPostprocessor(BasePostprocessor):
                     pts = np.array([[int(pt[0] * w), int(pt[1] * h)] for pt in poly_coords], np.int32)
                     pts = pts.reshape((-1, 1, 2))
                     z_type = zone.get("zone_type", "HAZARD").upper()
-                    z_name = zone.get("name", "Zone")
-                    is_active_violation = any(z_name.lower() in zv.lower() for zv in zone_violator_pids.values())
-                    
+                    z_name = zone.get("name", "")
+                    is_active_violation = any(
+                        z_name and z_name.lower() in v.lower() for v in zone_violator_pids.values()
+                    )
                     if is_active_violation or z_type == "RESTRICTED":
                         zone_color = (0, 0, 255)
-                        thick = 3 if is_active_violation else 2
                     elif z_type == "HAZARD":
                         zone_color = (0, 140, 255)
-                        thick = 2
                     else:
                         zone_color = (255, 200, 0)
-                        thick = 2
-
-                    cv2.polylines(frame.image, [pts], True, zone_color, thick, cv2.LINE_AA)
-                    label_text = f"RESTRICTED ZONE: {z_name}" if z_type == "RESTRICTED" else f"ZONE: {z_name} ({z_type})"
-                    cv2.putText(frame.image, label_text, (pts[0][0][0], max(pts[0][0][1] - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, zone_color, 2, cv2.LINE_AA)
+                    cv2.polylines(frame.image, [pts], True, zone_color, 2, cv2.LINE_AA)
+                    z_name = zone.get("name", "Zone")
+                    cv2.putText(frame.image, f"ZONE: {z_name} ({z_type})", (pts[0][0][0], max(pts[0][0][1] - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, zone_color, 2, cv2.LINE_AA)
 
             # 3. Draw Worker & Item-level PPE Analyses
             worker_analyses = frame.metadata.get("worker_ppe_analyses", [])
@@ -375,28 +372,16 @@ class StandardPostprocessor(BasePostprocessor):
                 detected = [d.lower() for d in worker.get("detected_equipment", [])]
 
                 is_pass = (status == "PASS")
-                is_intruder = person_id in zone_violator_pids
 
                 # Worker Box with HUD Corner Brackets
-                if is_intruder:
-                    worker_box_color = (0, 0, 255)      # Intense Crimson Red for Intruder
-                elif is_pass:
-                    worker_box_color = (0, 215, 80)     # Emerald Green
-                else:
-                    worker_box_color = (40, 40, 240)    # Orange-Red for PPE violation
-
+                worker_box_color = (0, 215, 80) if is_pass else (40, 40, 240)
                 self._draw_corner_brackets(frame.image, (x1, y1), (x2, y2), worker_box_color, line_len=18, thickness=2)
 
-                # Worker Header ID & Status Tag
+                # Worker Header ID & Status Tag (High-contrast bright white text on solid status badge)
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.65
-                thickness = 2
-                if is_intruder:
-                    z_target = zone_violator_pids[person_id].upper()
-                    worker_tag = f"INTRUDER #{person_id} | RESTRICTED: {z_target}"
-                    badge_bg_color = (20, 20, 220)       # Solid High-Alert Crimson Red
-                    text_color = (255, 255, 255)
-                elif is_pass:
+                font_scale = 0.50
+                thickness = 1
+                if is_pass:
                     worker_tag = f"Worker #{person_id} | PASS"
                     badge_bg_color = (0, 160, 60)       # Solid Emerald Green
                     text_color = (255, 255, 255)       # Crisp Pure White Text
@@ -418,20 +403,17 @@ class StandardPostprocessor(BasePostprocessor):
                     text_color = (255, 255, 255)       # Crisp Pure White Text
 
                 (tw, th), _ = cv2.getTextSize(worker_tag, font, font_scale, thickness)
-                from app.detection.yolo import YOLODetector
-                (badge_x1, badge_y1), (badge_x2, badge_y2), (text_x, text_y) = YOLODetector.calculate_ppe_status_anchor(
-                    (x1, y1, x2, y2), (w, h), (tw, th), (12, 6)
-                )
-
-                self._draw_rounded_rect(frame.image, (badge_x1, badge_y1), (badge_x2, badge_y2), badge_bg_color, radius=7, thickness=-1)
-                self._draw_rounded_rect(frame.image, (badge_x1, badge_y1), (badge_x2, badge_y2), worker_box_color, radius=7, thickness=1)
-                cv2.putText(frame.image, worker_tag, (text_x, text_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+                tag_y = max(th + 10, y1 - 8)
+                badge_x2 = min(w - 5, x1 + tw + 16)
+                self._draw_rounded_rect(frame.image, (x1, tag_y - th - 8), (badge_x2, tag_y + 4), badge_bg_color, radius=6, thickness=-1)
+                self._draw_rounded_rect(frame.image, (x1, tag_y - th - 8), (badge_x2, tag_y + 4), worker_box_color, radius=6, thickness=1)
+                cv2.putText(frame.image, worker_tag, (x1 + 8, tag_y - 2), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
                 # Equipment categories to render (ONLY draw badges for DETECTED items; helmet removed per requirements)
                 equipment_specs = [
                     (["vest", "jacket", "safety_vest", "safety_jacket"], "Safety Vest Found"),
                     (["gloves", "glove"], "Gloves Found"),
-                    (["goggles", "glasses", "safety_glasses", "safety_glass", "eyewear", "eye_protection", "spectacles", "safety_goggles"], "Safety Glasses Found"),
+                    (["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection", "spectacles", "safety_goggles"], "Safety Glasses Found"),
                     (["safety_shoes", "shoes", "boots"], "Safety Shoes Found"),
                 ]
 
@@ -500,9 +482,10 @@ class StandardPostprocessor(BasePostprocessor):
                 y2 = min(h - 5, max(y1 + 20, dy2))
 
                 # Handle standalone PPE items (e.g. vest held up to camera, exclude helmet)
-                # Standalone PPE badge rendering is strictly for vests (high-vis gear held or hung).
-                # Standalone inanimate plastic objects or bottles must NEVER be rendered as goggles/glasses.
-                is_ppe = label in ["vest", "jacket", "safety_vest"]
+                if label in ["helmet", "cap", "hard_hat", "headgear"]:
+                    continue
+
+                is_ppe = label in ["vest", "jacket", "mask", "goggles", "gloves", "safety_shoes", "glass"]
                 if is_ppe:
                     # Check if already covered by an associated worker's detected equipment
                     already_associated = any(
@@ -519,12 +502,16 @@ class StandardPostprocessor(BasePostprocessor):
                     self._draw_pill_badge(frame.image, badge_label, (x1, badge_y), is_found=True)
                     continue
 
-                # Fire & Smoke detection drawing with hardened confidence threshold
-                # ONLY fire and smoke hazards are drawn here; PPE items (vest, goggles, glasses) are handled above
-                if "fire" not in label and "smoke" not in label:
-                    continue
-
-                min_draw_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.40) if "fire" in label else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.35)
+                # Fire & Smoke overlay threshold = the *candidate* floor, not the alert floor.
+                # The detector deliberately reports real-but-weak evidence (a distant plume scored
+                # 0.21) so it can be corroborated over time; hiding it from the operator because it
+                # is below the alert floor would make the system look blind while it is in fact
+                # tracking the event.
+                min_draw_conf = (
+                    float(getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.14))
+                    if "fire" in label
+                    else float(getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.13))
+                )
                 if det.confidence < min_draw_conf:
                     continue
 
@@ -535,19 +522,16 @@ class StandardPostprocessor(BasePostprocessor):
 
                 conf_str = f"{label.upper()} ({int(det.confidence * 100)}%)"
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.58
-                thickness = 2
+                font_scale = 0.48
+                thickness = 1
                 (tw, th), _ = cv2.getTextSize(conf_str, font, font_scale, thickness)
 
-                pad_x = 9
-                pad_y = 5
-                badge_h = th + pad_y * 2
-                badge_y1 = max(5, y1 - badge_h - 4) if y1 >= badge_h + 6 else y1
-                badge_x2 = min(w - 5, x1 + tw + pad_x * 2)
-                badge_y2 = badge_y1 + badge_h
+                badge_y1 = max(5, y1 - th - 8) if y1 >= th + 10 else y1
+                badge_x2 = min(w - 5, x1 + tw + 12)
+                badge_y2 = badge_y1 + th + 6
 
                 self._draw_rounded_rect(frame.image, (x1, badge_y1), (badge_x2, badge_y2), box_color, radius=6, thickness=-1)
-                cv2.putText(frame.image, conf_str, (x1 + pad_x, badge_y1 + pad_y + th), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                cv2.putText(frame.image, conf_str, (x1 + 6, badge_y2 - 4), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
         return frame
 
@@ -667,6 +651,18 @@ class FramePipeline:
         self.ppe_inference_interval_sec = ppe_inference_interval_sec
         self._last_ppe_inference_time: float = 0.0
 
+        # Motion gate: suppresses the worker/PPE branch on provably static frames.
+        self.motion_gate = MotionGate(
+            enabled=bool(getattr(settings, "AI_MOTION_GATE_ENABLED", True)),
+            min_area_ratio=float(getattr(settings, "AI_MOTION_MIN_AREA_RATIO", 0.0012)),
+            sweep_interval_seconds=float(getattr(settings, "AI_MOTION_SWEEP_SECONDS", 2.5)),
+        )
+        # Measured worker-branch cost; the scheduler interval is derived from it so the pipeline
+        # consumes frames at the rate it can actually finish them (no queue growth, no stale alerts).
+        self._adaptive_worker_interval: float = 0.0
+        self._worker_cost_ms_ema: float = 0.0
+        self._last_frame_latency_ms: float = 0.0
+
         # Subsystems
         self.verification_engine = verification_engine or CameraVerificationEngine(
             camera_id=camera_id,
@@ -681,7 +677,7 @@ class FramePipeline:
         self.ppe_verification_engine = PPETemporalVerificationEngine(
             camera_id=camera_id,
             min_consecutive_frames=getattr(settings, "PPE_VERIFICATION_FRAMES", 3),
-            min_duration_seconds=getattr(settings, "PPE_VERIFICATION_DURATION_SECONDS", 1.0)
+            min_duration_seconds=getattr(settings, "PPE_VERIFICATION_DURATION_SECONDS", 1.2)
         )
 
         self.postprocessor = postprocessor or StandardPostprocessor(debug_overlay=True)
@@ -691,6 +687,8 @@ class FramePipeline:
         self.active_ppe_profile: Optional[Dict[str, Any]] = None
         
         self._latest_detections: List[DetectionResult] = []
+        self._last_worker_analyses_objs: List[Any] = []
+        self._last_worker_analysis_time: float = 0.0
         self._latest_worker_analyses: List[Dict[str, Any]] = []
         self._latest_safety_zones: List[Dict[str, Any]] = []
         self._latest_is_frozen: bool = False
@@ -714,6 +712,54 @@ class FramePipeline:
     def set_ppe_profile(self, profile: Dict[str, Any]) -> None:
         with self._lock:
             self.active_ppe_profile = profile
+        # A profile change alters which items are "missing" and therefore which ROIs are examined;
+        # cached refiner conclusions from the previous profile are no longer valid.
+        refiner = getattr(self.ppe_detector, "_roi_refiner", None)
+        if refiner is not None:
+            refiner.forget()
+
+    def _required_equipment(self) -> List[str]:
+        """Required PPE items from the active profile, with helmet always excluded by design."""
+        profile = self.active_ppe_profile
+        raw_req = profile.get("required_equipment", ["vest", "goggles"]) if profile else ["vest", "goggles"]
+        required = [e for e in raw_req if str(e).lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
+        return required or ["vest", "goggles"]
+
+    def _observe_worker_cost(self, cost_ms: float) -> None:
+        """
+        Adapts the worker-branch cadence to the measured cost of that branch.
+
+        A fixed 250 ms interval on hardware that needs 600 ms per frame means every frame is
+        re-scheduled while the previous one is unfinished: the queue backs up, alerts arrive stale,
+        and the visual overlay strobes. Tracking the cost and aiming slightly above it keeps the
+        pipeline at its true throughput instead of at a configured fiction.
+        """
+        if not bool(getattr(settings, "PPE_ADAPTIVE_CADENCE", True)):
+            # Measurement / benchmarking mode: keep the requested interval untouched.
+            self._worker_cost_ms_ema = cost_ms
+            self._adaptive_worker_interval = 0.0
+            return
+
+        alpha = 0.3
+        if self._worker_cost_ms_ema <= 0:
+            self._worker_cost_ms_ema = cost_ms
+        else:
+            self._worker_cost_ms_ema = alpha * cost_ms + (1.0 - alpha) * self._worker_cost_ms_ema
+
+        target = (self._worker_cost_ms_ema / 1000.0) * 1.25
+        max_interval = float(getattr(settings, "PPE_MAX_INFERENCE_INTERVAL_SEC", 2.0))
+        self._adaptive_worker_interval = max(0.0, min(max_interval, target - self.ppe_inference_interval_sec))
+
+    def performance_stats(self) -> Dict[str, Any]:
+        """Per-camera AI timing/health telemetry for the metrics endpoint."""
+        return {
+            "camera_id": self.camera_id,
+            "worker_branch_cost_ms": round(self._worker_cost_ms_ema, 2),
+            "effective_worker_interval_sec": round(max(self.ppe_inference_interval_sec, self._adaptive_worker_interval), 3),
+            "last_frame_latency_ms": round(self._last_frame_latency_ms, 2),
+            "motion_gate": self.motion_gate.stats(),
+            "roi_refiner": dict(getattr(getattr(self.ppe_detector, "_roi_refiner", None), "last_report", {}) or {}),
+        }
 
     def process_frame(
         self,
@@ -727,7 +773,8 @@ class FramePipeline:
         """
         ts = timestamp or datetime.now(timezone.utc)
         now_ts = time.time()
-        
+        pipeline_t0 = time.perf_counter()
+
         # 1. Initialize Frame Data Structure
         frame = Frame(
             camera_id=self.camera_id,
@@ -759,15 +806,40 @@ class FramePipeline:
             return frame
 
         img: np.ndarray = frame.image
-        should_run_ppe = (now_ts - self._last_ppe_inference_time) >= self.ppe_inference_interval_sec
 
-        if should_run_ppe:
+        # ------------------------------------------------------------------ #
+        # 4.0 Scheduling & motion gate
+        #
+        # The worker branch (person + PPE + ROI refinement) is the expensive part of the pipeline;
+        # fire/smoke must stay responsive regardless. Two decisions are made here:
+        #   * worker inference runs on a *measured* cadence, not a fixed one - if a frame costs
+        #     300 ms, asking for a new one every 250 ms only builds queue pressure;
+        #   * nothing in the worker branch runs when the scene has been provably static and no worker
+        #     is tracked, which is both the biggest CPU saving and the removal of the OpenCV
+        #     phantom-worker failure mode.
+        # ------------------------------------------------------------------ #
+        effective_interval = max(self.ppe_inference_interval_sec, self._adaptive_worker_interval)
+        run_worker_frame = (now_ts - self._last_ppe_inference_time) >= effective_interval
+
+        if run_worker_frame:
+            # "Persons visible" must survive a single missed detection, otherwise one dropped frame
+            # can close the gate and freeze every PPE state machine at once.
+            has_recent_workers = self.tracker.has_recent_tracks()
+            run_worker_frame = self.motion_gate.update(img, persons_visible=has_recent_workers)
+
+        if run_worker_frame:
             self._last_ppe_inference_time = now_ts
+            worker_t0 = time.perf_counter()
 
             # 4.1 Person Detector Execution (Run FIRST to provide fast YOLO worker bounding boxes)
             if self.person_enabled and self.person_detector:
                 try:
-                    p_res = self.person_detector.detect(img)
+                    import inspect
+                    sig = inspect.signature(self.person_detector.detect)
+                    if "motion_rois" in sig.parameters:
+                        p_res = self.person_detector.detect(img, motion_rois=self.motion_gate.motion_rois)
+                    else:
+                        p_res = self.person_detector.detect(img)
                     person_dets.extend(p_res)
                     all_detections.extend(p_res)
                 except Exception as e:
@@ -782,10 +854,12 @@ class FramePipeline:
                 try:
                     import inspect
                     sig = inspect.signature(self.ppe_detector.detect)
+                    call_kwargs: Dict[str, Any] = {}
                     if "person_dets" in sig.parameters:
-                        ppe_res = getattr(self.ppe_detector, "detect")(img, person_dets=person_dets)
-                    else:
-                        ppe_res = self.ppe_detector.detect(img)
+                        call_kwargs["person_dets"] = person_dets
+                    if "required_equipment" in sig.parameters:
+                        call_kwargs["required_equipment"] = self._required_equipment()
+                    ppe_res = self.ppe_detector.detect(img, **call_kwargs)
                     # Exclude helmet from detections per requirement
                     ppe_res = [d for d in ppe_res if d.label.lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
                     ppe_dets.extend(ppe_res)
@@ -798,26 +872,55 @@ class FramePipeline:
                 except Exception as e:
                     logger.error(f"Camera-{self.camera_id} PPEDetector execution error: {str(e)}")
 
-        # 4.3 Fire / Smoke Detector Execution (passes candidate ROIs from person/gear detections if supported)
+            # Adapt the cadence to the measured cost so request rate never exceeds capacity.
+            self._observe_worker_cost((time.perf_counter() - worker_t0) * 1000.0)
+
+        # 4.3 Fire / Smoke Detector Execution
+        #     Worker and PPE boxes are passed as *exclusion* ROIs: a hi-vis vest is the fire model's
+        #     strongest false positive on real footage (measured scoring the vest as flame), so
+        #     anything already identified as a person or their equipment can never be reported as fire.
         if self.fire_smoke_enabled and self.fire_smoke_detector:
             try:
-                candidate_rois = [d.bbox for d in all_detections] if all_detections else None
                 import inspect
                 sig = inspect.signature(self.fire_smoke_detector.detect)
+                call_kwargs = {}
                 if "candidate_rois" in sig.parameters:
-                    fs_res = self.fire_smoke_detector.detect(img, candidate_rois=candidate_rois)
-                else:
-                    fs_res = self.fire_smoke_detector.detect(img)
+                    call_kwargs["candidate_rois"] = None
+                if "exclusion_rois" in sig.parameters:
+                    exclusions = [
+                        d.bbox for d in all_detections
+                        if d.label.lower() in [
+                            "person", "worker", "vest", "helmet", "mask", "goggles", "gloves", "safety_shoes"
+                        ]
+                    ]
+                    call_kwargs["exclusion_rois"] = exclusions or None
+                fs_res = self.fire_smoke_detector.detect(img, **call_kwargs)
                 fire_smoke_dets.extend(fs_res)
                 all_detections.extend(fs_res)
             except Exception as e:
                 logger.error(f"Camera-{self.camera_id} FireSmokeDetector execution error: {str(e)}")
 
-        for det in all_detections:
+        # On a gated frame the worker branch produced no fresh evidence. Rather than present an
+        # empty frame to telemetry consumers, the still-fresh smoothed detections are republished
+        # and flagged, so a dashboard never flickers to "nothing detected" between AI cycles.
+        persisted: List[DetectionResult] = []
+        if not run_worker_frame:
+            fresh_labels = {(d.label, round(d.bbox.x_min, 2), round(d.bbox.y_min, 2)) for d in all_detections}
+            with self._lock:
+                for det, expiry in self._smoothed_detections.values():
+                    if expiry <= now_ts:
+                        continue
+                    key = (det.label, round(det.bbox.x_min, 2), round(det.bbox.y_min, 2))
+                    if key in fresh_labels:
+                        continue
+                    persisted.append(det)
+
+        for det in all_detections + persisted:
             det.camera_id = self.camera_id
-            det.timestamp = ts.isoformat()
+            if not det.timestamp:
+                det.timestamp = ts.isoformat()
             det.frame_info = frame_info
-        frame.detections = all_detections
+        frame.detections = all_detections + persisted
 
         now_ts = time.time()
         with self._lock:
@@ -841,44 +944,42 @@ class FramePipeline:
             
             # Apply NMS deduplication to remove duplicate person boxes for the same worker
             all_person_dets: List[DetectionResult] = []
-            for p_det in sorted(raw_person_dets, key=lambda d: (d.confidence, (d.bbox.x_max - d.bbox.x_min) * (d.bbox.y_max - d.bbox.y_min)), reverse=True):
-                is_duplicate = False
-                p_cx = (p_det.bbox.x_min + p_det.bbox.x_max) / 2.0
-                p_cy = (p_det.bbox.y_min + p_det.bbox.y_max) / 2.0
-                for k in all_person_dets:
-                    iou = p_det.bbox.iou(k.bbox)
-                    k_cx = (k.bbox.x_min + k.bbox.x_max) / 2.0
-                    k_cy = (k.bbox.y_min + k.bbox.y_max) / 2.0
-                    h_dist = abs(p_cx - k_cx)
-                    v_dist = abs(p_cy - k_cy)
-                    if iou >= 0.25 or (h_dist < 0.06 and v_dist < 0.12):
-                        is_duplicate = True
-                        p_area = (p_det.bbox.x_max - p_det.bbox.x_min) * (p_det.bbox.y_max - p_det.bbox.y_min)
-                        k_area = (k.bbox.x_max - k.bbox.x_min) * (k.bbox.y_max - k.bbox.y_min)
-                        if p_area > k_area * 1.15:
-                            k.bbox = p_det.bbox
-                        break
-                if not is_duplicate:
+            for p_det in sorted(raw_person_dets, key=lambda d: d.confidence, reverse=True):
+                if not any(p_det.bbox.iou(k.bbox) >= 0.40 for k in all_person_dets):
                     all_person_dets.append(p_det)
 
-            if should_run_ppe or not self.tracker._tracked_persons:
+            # Only advance the tracker when the worker detectors actually ran this frame; otherwise
+            # the tracker would count a gated frame as "worker disappeared" and drop live tracks.
+            if run_worker_frame:
                 tracked_persons = self.tracker.update(all_person_dets)
             else:
                 tracked_persons = self.tracker.get_active_tracks()
 
         # Enforce vest & goggles (glasses) requirement; explicitly remove helmet
-        raw_req = current_profile.get("required_equipment", ["vest", "goggles"]) if current_profile else ["vest", "goggles"]
-        required_equipment = [e for e in raw_req if e.lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
-        if not required_equipment:
-            required_equipment = ["vest", "goggles"]
+        required_equipment = self._required_equipment()
 
-        worker_analyses = self.association_engine.associate(
-            camera_id=self.camera_id,
-            tracked_persons=tracked_persons,
-            ppe_detections=ppe_dets,
-            required_equipment=required_equipment,
-            timestamp=ts.isoformat()
-        )
+        # Re-associating on a frame where the worker branch did not run would feed the engine an
+        # empty PPE list and mark every tracked worker as "missing everything" - a fabricated
+        # violation generated purely by the scheduler. Only fresh evidence may produce fresh
+        # conclusions; otherwise the previous conclusions are reused while they are still recent.
+        if run_worker_frame:
+            worker_analyses = self.association_engine.associate(
+                camera_id=self.camera_id,
+                tracked_persons=tracked_persons,
+                ppe_detections=ppe_dets,
+                required_equipment=required_equipment,
+                timestamp=ts.isoformat()
+            )
+            self._last_worker_analyses_objs = list(worker_analyses)
+            self._last_worker_analysis_time = now_ts
+        else:
+            reuse_window = float(getattr(settings, "PPE_ANALYSIS_REUSE_SECONDS", 2.0))
+            if self._last_worker_analyses_objs and (now_ts - self._last_worker_analysis_time) <= reuse_window:
+                worker_analyses = list(self._last_worker_analyses_objs)
+                for analysis in worker_analyses:
+                    analysis.metadata["reused_from_gated_frame"] = True
+            else:
+                worker_analyses = []
         frame.metadata["worker_ppe_analyses"] = [w.to_dict() for w in worker_analyses]
 
         # 6. Stage 5: Safety Zone Evaluation Engine
@@ -901,13 +1002,10 @@ class FramePipeline:
 
                 for item in w.detected_equipment:
                     l_item = item.lower()
-                    worker_gear_times[l_item] = now_ts + 0.5
-                    if l_item in ["goggles", "glasses", "safety_glasses", "safety_glass", "eyewear", "eye_protection"]:
-                        for alt in ["goggles", "glasses", "safety_glasses", "safety_glass", "eyewear", "eye_protection"]:
-                            worker_gear_times[alt] = now_ts + 0.5
-                    elif l_item in ["vest", "safety_vest", "jacket", "hivis"]:
-                        for alt in ["vest", "safety_vest", "jacket", "hivis"]:
-                            worker_gear_times[alt] = now_ts + 0.5
+                    worker_gear_times[l_item] = now_ts + 1.5
+                    if l_item in ["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection"]:
+                        for alt in ["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection"]:
+                            worker_gear_times[alt] = now_ts + 1.5
 
                 # If an item is in missing_equipment but was detected recently (within 0.75s),
                 # grace it as detected to prevent 1-frame strobe/violation
@@ -951,43 +1049,51 @@ class FramePipeline:
         frame.metadata["safety_decisions"] = [s.to_dict() for s in safety_decisions]
 
         # 8. Stage 7: Temporal Detection & PPE Verification (False-Alarm Reduction State Machines)
+        #
+        # The PPE state machine is only advanced when the worker branch actually ran. Feeding it an
+        # empty analysis list - which is what a gated frame produces - would read as "every worker's
+        # violation disappeared" and clear live violations after three frames of a still scene.
         verified_events = self.verification_engine.process_frame_detections(fire_smoke_dets, frame_info)
-        verified_ppe_events = self.ppe_verification_engine.process_worker_analyses(worker_analyses)
+        verified_ppe_events = (
+            self.ppe_verification_engine.process_worker_analyses(worker_analyses)
+            if run_worker_frame else []
+        )
         all_verified = list(verified_events) + list(verified_ppe_events)
 
-        # Convert Safety Rule Decisions (e.g. ZONE_VIOLATION) into verified alert events
-        for dec in safety_decisions:
-            if dec.incident_type in ("ZONE_VIOLATION", "SAFETY_INCIDENT"):
-                wb_box = None
-                if dec.details and "bounding_box" in dec.details:
-                    try:
-                        bbox_dict = dec.details["bounding_box"]
-                        wb_box = BoundingBox(**bbox_dict)
-                    except Exception:
-                        pass
-
-                zone_evt = VerifiedEvent(
-                    event_id=str(uuid.uuid4()),
-                    camera_id=self.camera_id,
-                    class_name="zone_violation",
-                    state=EventState.ALERT_SENT,
-                    consecutive_frames=1,
-                    duration_seconds=0.0,
-                    max_confidence=dec.confidence,
-                    latest_confidence=dec.confidence,
-                    start_time=ts,
-                    updated_time=ts,
-                    bounding_box=wb_box,
-                    metadata={
-                        "zone_id": dec.zone_id,
-                        "zone_name": dec.zone_name,
-                        "person_id": dec.person_id,
-                        "events": dec.events,
-                        "severity": dec.severity,
-                        "incident_type": dec.incident_type
-                    }
-                )
-                all_verified.append(zone_evt)
+        # Zone breaches and correlated safety incidents are decisions, not detections: the rule
+        # engine already applied per-zone policy and deduplication, so they become verified events
+        # directly and travel the same alert path as fire/smoke/PPE (ported from main).
+        for decision in safety_decisions:
+            if decision.incident_type not in ("ZONE_VIOLATION", "SAFETY_INCIDENT"):
+                continue
+            intrusion_box = None
+            raw_box = (decision.details or {}).get("bounding_box")
+            if raw_box:
+                try:
+                    intrusion_box = BoundingBox(**raw_box)
+                except Exception:
+                    intrusion_box = None
+            all_verified.append(VerifiedEvent(
+                event_id=str(uuid.uuid4()),
+                camera_id=self.camera_id,
+                class_name="zone_violation",
+                state=EventState.ALERT_SENT,
+                consecutive_frames=1,
+                duration_seconds=0.0,
+                max_confidence=float(decision.confidence or 0.0),
+                latest_confidence=float(decision.confidence or 0.0),
+                start_time=ts,
+                updated_time=ts,
+                bounding_box=intrusion_box,
+                metadata={
+                    "zone_id": decision.zone_id,
+                    "zone_name": decision.zone_name,
+                    "person_id": decision.person_id,
+                    "events": decision.events,
+                    "severity": decision.severity,
+                    "incident_type": decision.incident_type,
+                },
+            ))
 
         frame.metadata["verified_events"] = [e.to_dict() for e in all_verified]
 
@@ -996,6 +1102,9 @@ class FramePipeline:
 
         # 10. Stage 9: Event Dispatcher (WebSocket / Notifications)
         self.event_manager.dispatch_frame_events(frame)
+
+        self._last_frame_latency_ms = (time.perf_counter() - pipeline_t0) * 1000.0
+        frame.metadata["pipeline_latency_ms"] = round(self._last_frame_latency_ms, 2)
 
         return frame
 
@@ -1056,7 +1165,3 @@ class FramePipeline:
             self._latest_is_frozen = False
         self.freeze_detector.reset()
         self.verification_engine.reset_all()
-        if hasattr(self, "ppe_verification_engine"):
-            self.ppe_verification_engine.reset()
-        if hasattr(self, "tracker"):
-            self.tracker.reset()

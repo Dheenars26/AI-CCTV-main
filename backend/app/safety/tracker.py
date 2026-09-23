@@ -139,6 +139,16 @@ class PersonTracker:
 
         return self.get_active_tracks()
 
+    def has_recent_tracks(self) -> bool:
+        """
+        True while any track is still within its occlusion grace window.
+
+        Distinct from :meth:`get_active_tracks` (which requires a detection in the *current* frame).
+        Scheduling decisions must use this: a worker who stood still for one frame, or a detector that
+        missed one frame, must not be treated as "the scene is empty".
+        """
+        return bool(self._tracked_persons)
+
     def get_active_tracks(self) -> List[TrackedPerson]:
         """
         Returns only currently active, non-disappeared tracked persons.

@@ -25,6 +25,28 @@ from app.detection.onnx_engine import get_onnx_yolo_runner
 # 1. Fire Detection: True Positive vs False Positive Rejections
 # =====================================================================
 
+
+
+
+
+# ---------------------------------------------------------------------------
+# Tests below were rewritten during the merge with the main-branch detection work.
+#
+# The main branch implemented fire/smoke rejection with hard chromaticity and dispersion
+# gates and boosted the confidence of anything that passed them. That approach was measured
+# against real footage and rejected: it scored 0 fire/smoke detections on the three genuine
+# fire scenes in the sample set, and re-introduced a "safety glasses 0.96" false positive on
+# every image tested. The tests that asserted that mechanism (gate return values, +0.12
+# dual-engine consensus boost, the OpenCV high-vis worker anchor) were removed with it.
+#
+# The *intent* of those tests - painted orange is not fire, a flat surface is not a plume -
+# is preserved here against the implementation that shipped: physics now damps corroboration
+# for painted/uniform surfaces and for straight-edged structure, and can only ever boost -
+# never suppress - the neural score. Two tests (dual-engine consensus, high-vis anchor) tested
+# APIs that no longer exist and were dropped outright.
+# ---------------------------------------------------------------------------
+
+
 def test_fire_flame_chromaticity_true_positive():
     """Real flame with thermal core (hot white/yellow center) and red/orange combustion envelope."""
     crop = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -43,16 +65,17 @@ def test_fire_flame_chromaticity_true_positive():
 
 
 def test_fire_flame_rejects_plain_orange_shirt():
-    """Flat uniform orange t-shirt should be rejected as a static painted object."""
+    """Painting is flat: a uniform orange shirt must earn no physics corroboration."""
     crop = np.zeros((100, 100, 3), dtype=np.uint8)
-    # Uniform orange cotton shirt (B=30, G=110, R=220) - near zero variance, no thermal core
-    crop[:, :] = [30, 110, 220]
-    # Add slight fabric texture noise (+- 2)
+    crop[:, :] = [30, 110, 220]  # orange cotton (BGR)
     noise = np.random.randint(-2, 3, crop.shape, dtype=np.int16)
     crop = np.clip(crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    is_valid, _ = YOLODetector._verify_flame_chromaticity(crop)
-    assert is_valid is False, "Expected plain orange shirt to be rejected by flame chromaticity filter"
+    assert YOLODetector._is_painted_surface(crop) is True
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", 0.20, crop)
+    assert phys["corroboration"] == 0.0, "flat paint must not corroborate fire"
+    assert evidence == pytest.approx(0.20, abs=1e-6), "physics must not inflate a weak score here"
+
 
 
 def test_fire_flame_rejects_red_fire_extinguisher_cylinder():
@@ -83,36 +106,32 @@ def test_fire_flame_true_positive_night_scene():
 
 
 def test_fire_flame_rejects_worker_orange_shirt_overlap():
-    """Worker wearing orange shirt (is_person_torso=True) should be strictly rejected."""
+    """The same flat orange on a worker's torso earns no corroboration either."""
     crop = np.zeros((100, 100, 3), dtype=np.uint8)
-    # Orange cotton fabric: B=30, G=110, R=220
     crop[:, :] = [30, 110, 220]
     noise = np.random.randint(-3, 4, crop.shape, dtype=np.int16)
     crop = np.clip(crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    is_valid, _ = YOLODetector._verify_flame_chromaticity(crop, is_person_torso=True)
-    assert is_valid is False, "Expected worker orange shirt to be rejected when overlapping person torso"
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", 0.20, crop)
+    assert phys["painted_surface"] is True
+    assert phys["corroboration"] == 0.0
+    assert evidence < 0.35, "an orange shirt must not reach the fire alert floor"
+
 
 
 def test_fire_flicker_rejection_static_traffic_cone():
-    """Stationary painted orange traffic cone with constant contour area across frames should be rejected."""
+    """A painted cone is a flat surface - no corroboration, regardless of how long it is visible."""
     cone_crop = np.zeros((100, 100, 3), dtype=np.uint8)
-    # Fluorescent painted orange plastic
     cone_crop[:, :] = [25, 115, 235]
 
-    spatial_key = "test_cone_01"
-    # Feed 4 consecutive identical frames without thermal core
-    for _ in range(3):
-        YOLODetector._verify_flame_chromaticity(cone_crop, spatial_key=spatial_key)
+    for _ in range(4):  # stationary and unchanging across frames
+        evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", 0.20, cone_crop)
 
-    is_valid, _ = YOLODetector._verify_flame_chromaticity(cone_crop, spatial_key=spatial_key)
-    assert is_valid is False, "Expected stationary traffic cone to be rejected by flicker analysis"
-
+    assert phys["painted_surface"] is True
+    assert phys["corroboration"] == 0.0
+    assert evidence < 0.35
 
 
-# =====================================================================
-# 2. Smoke Detection: True Positive vs Architectural Rejections
-# =====================================================================
 
 def test_smoke_dispersion_true_positive():
     """Genuine diffuse smoke plume with soft texture variance and neutral achromatic balance."""
@@ -132,18 +151,19 @@ def test_smoke_dispersion_true_positive():
 
 
 def test_smoke_dispersion_rejects_architectural_door_frame():
-    """Rectangular doorway with sharp collinear straight lines should be rejected as architectural structure."""
+    """Straight-edge structure (a door frame) is the man-made cue: it damps smoke corroboration."""
     crop = np.zeros((140, 140, 3), dtype=np.uint8)
-    # Gray background wall
     crop[:, :] = [160, 160, 160]
-    # Sharp straight dark door frame lines
     cv2.line(crop, (30, 10), (30, 130), (40, 40, 40), 4)
     cv2.line(crop, (110, 10), (110, 130), (40, 40, 40), 4)
     cv2.line(crop, (30, 20), (110, 20), (40, 40, 40), 4)
     cv2.line(crop, (30, 70), (110, 70), (50, 50, 50), 3)
 
-    is_valid, _ = YOLODetector._verify_smoke_dispersion(crop)
-    assert is_valid is False, "Expected architectural door frame with straight lines to be rejected"
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("smoke", 0.20, crop)
+    assert phys["structure_edge_ratio"] > getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45)
+    assert phys["corroboration"] <= 0.15, "structured surfaces keep only a trace of colour evidence"
+    assert evidence < getattr(settings, "SMOKE_ALERT_CONFIDENCE", 0.30)
+
 
 
 def test_smoke_dispersion_rejects_flat_drywall_wall():
@@ -165,14 +185,18 @@ def test_dark_black_smoke_dispersion_true_positive():
     noise = np.random.normal(0, 6, crop.shape).astype(np.int16)
     crop = np.clip(crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    is_valid, _ = YOLODetector._verify_smoke_dispersion(crop)
-    assert is_valid is True, "Expected dark/black hydrocarbon smoke to pass smoke dispersion verification"
+    # The dispersion verifier is a booster, not a gate: what matters is that smooth black smoke is
+    # never weakened and never vetoed as structured.
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("smoke", 0.28, crop)
+    assert phys["structure_edge_ratio"] < getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45)
+    assert evidence >= 0.28, "an unstructured plume must never be weakened"
 
 
 
 # =====================================================================
 # 3. Vest Detection: True Positive vs Casual Shirt Rejection
 # =====================================================================
+
 
 def test_vest_detection_true_positive_with_retroreflective_tape():
     """Worker wearing fluorescent safety vest with retroreflective silver horizontal tape bands."""
@@ -223,6 +247,7 @@ def test_vest_detection_rejects_plain_casual_yellow_tshirt():
 # =====================================================================
 # 4. Glass / Goggles Detection: True Positive vs Bare Face Rejection
 # =====================================================================
+
 
 def test_glasses_detection_true_positive_clear_polycarbonate():
     """Worker wearing clear safety glasses with brow bar, dual orbital rims, and specular reflections."""
@@ -336,6 +361,7 @@ def test_association_rejects_plastic_bottle_at_chest_or_hands():
 # 5. Speed and Latency Benchmark
 # =====================================================================
 
+
 def test_onnx_inference_throughput_benchmark():
     """Validates that ONNX forward inference + letterbox preprocessing operates under 50ms per frame on CPU."""
     backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -363,31 +389,32 @@ def test_onnx_inference_throughput_benchmark():
 # 6. Advanced False Rejection Tests (Lightbulbs, Shadows, Dust, Glints)
 # =====================================================================
 
+
 def test_fire_flame_rejects_warm_lightbulb_stationary():
-    """Warm incandescent/halogen lightbulb (pure bright white-yellow with low red-chroma excess and low turbulence) should be rejected."""
+    """A warm bulb is bright and even has an incandescent core, but must not reach the alert floor."""
     crop = np.zeros((80, 80, 3), dtype=np.uint8)
-    # Dark room
     crop[:, :] = [25, 25, 25]
-    # Pure incandescent light bulb (B=190, G=240, R=255) -> V>=190, Y>=140, but Cr-Cb is small (<7) and std_y is low
     cv2.circle(crop, (40, 40), 20, (190, 240, 255), -1)
 
-    is_valid, _ = YOLODetector._verify_flame_chromaticity(crop)
-    assert is_valid is False, "Expected warm lightbulb with low red-chroma excess and low turbulence to be rejected"
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", 0.20, crop)
+    alert_floor = getattr(settings, "FIRE_ALERT_CONFIDENCE", 0.35)
+    assert evidence < alert_floor, f"a stationary bulb must not be alertable (evidence={evidence})"
+
 
 
 def test_smoke_dispersion_rejects_moving_floor_shadow():
-    """Floor shadow across concrete floor (darkened brightness Y=75 but sharp floor texture preserved) should be rejected."""
+    """Preserved floor texture is straight-edge structure; a shadow on it must not alert."""
     crop = np.zeros((120, 120, 3), dtype=np.uint8)
-    # Shadow darkening (mean_gray ~ 75)
     crop[:, :] = [75, 75, 75]
-    # Sharp preserved floor textures (tile lines, concrete cracks)
     for y_line in [20, 50, 80, 110]:
         cv2.line(crop, (5, y_line), (115, y_line), (20, 20, 20), 2)
     for x_line in [30, 70, 100]:
         cv2.line(crop, (x_line, 10), (x_line, 110), (25, 25, 25), 2)
 
-    is_valid, _ = YOLODetector._verify_smoke_dispersion(crop)
-    assert is_valid is False, "Expected sharp floor shadow with preserved edge texture to be rejected as smoke"
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("smoke", 0.20, crop)
+    assert phys["structure_edge_ratio"] > getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45)
+    assert evidence < getattr(settings, "SMOKE_ALERT_CONFIDENCE", 0.30)
+
 
 
 def test_smoke_dispersion_rejects_brown_dust_cloud():
@@ -451,15 +478,18 @@ def test_cv_vest_fallback_activated_for_worker_in_detect():
 
 
 def test_early_small_flame_chromaticity_true_positive():
-    """Verify that small starting flames (1.5% area) with hot incandescent cores pass chromaticity verification."""
+    """A small flame with an incandescent core must never be suppressed by the physics stage."""
     crop = np.zeros((100, 100, 3), dtype=np.uint8)
-    crop[:, :] = [30, 30, 30]  # dark background
-    # Small combustion flame at center: hot white/yellow core enveloped by orange flame
-    cv2.circle(crop, (50, 50), 7, (20, 140, 245), -1)  # outer flame
-    cv2.circle(crop, (50, 50), 3, (180, 235, 255), -1)  # incandescent thermal core
+    crop[:, :] = [30, 30, 30]
+    cv2.circle(crop, (50, 50), 7, (20, 140, 245), -1)   # flame envelope
+    cv2.circle(crop, (50, 50), 3, (180, 235, 255), -1)  # incandescent core
 
-    is_valid, ratio = YOLODetector._verify_flame_chromaticity(crop)
-    assert is_valid is True, f"Expected small flame with incandescent core to be valid, got ratio={ratio}"
+    model_confidence = 0.42
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", model_confidence, crop)
+    assert phys["thermal_core_ratio"] > 0.0, "an incandescent core must be visible to the booster"
+    assert phys["painted_surface"] is False
+    assert evidence >= model_confidence, "physics may boost a detection but never weaken it"
+
 
 
 def test_car_headlight_beam_rejection():
@@ -498,7 +528,7 @@ def test_warm_lighting_white_smoke_true_positive():
 
 
 def test_dense_black_hydrocarbon_smoke_low_luminance():
-    """Dense black hydrocarbon smoke (mean luminance Y ~ 30, std ~ 4.5) absorbs light and should pass."""
+    """Dense black smoke is smooth and unstructured: it must not be vetoed or weakened."""
     crop = np.zeros((120, 120, 3), dtype=np.uint8)
     crop[:, :] = [30, 30, 30]
     for r in range(45, 10, -5):
@@ -507,53 +537,43 @@ def test_dense_black_hydrocarbon_smoke_low_luminance():
     noise = np.random.normal(0, 4, crop.shape).astype(np.int16)
     crop = np.clip(crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    is_valid, _ = YOLODetector._verify_smoke_dispersion(crop)
-    assert is_valid is True, "Expected low-luminance dense black smoke to pass dispersion verification"
+    model_confidence = 0.28
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("smoke", model_confidence, crop)
+    assert phys["structure_edge_ratio"] < getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45)
+    assert evidence >= model_confidence, "an unstructured plume must never be weakened"
+
 
 
 def test_horizontal_spreading_fire_line_true_positive():
-    """Horizontal spreading fire front across floor/fuel (aspect_ratio = 3.2) with thermal turbulence should pass."""
+    """A spreading fire line is not a straight-edge structure, so it must not be vetoed."""
     crop = np.zeros((50, 160, 3), dtype=np.uint8)
     crop[:, :] = [20, 20, 20]
-    # Spreading flame front across the horizontal axis
     cv2.rectangle(crop, (10, 15), (150, 45), (15, 95, 245), -1)
-    # Mid golden zone
     cv2.rectangle(crop, (20, 20), (140, 40), (25, 175, 255), -1)
-    # Luminous incandescent cores
-    for cx in [40, 80, 120]:
-        cv2.circle(crop, (cx, 30), 8, (190, 235, 255), -1)
-    # Chaotic thermal turbulence
+    cv2.circle(crop, (80, 30), 8, (190, 235, 255), -1)
     noise = np.random.normal(0, 10, crop.shape).astype(np.int16)
     crop = np.clip(crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    is_valid, ratio = YOLODetector._verify_flame_chromaticity(crop, aspect_ratio=3.2)
-    assert is_valid is True, "Expected horizontal fire line with thermal core and turbulence to pass"
-    assert ratio >= 0.15
+    # A synthetic rectangle is genuinely structured (long straight edges) - the metric is doing its
+    # job. What must hold for fire is the emission policy: a decisive model score is reported even on
+    # a structured surface (real fires sit behind grilles and glazing), while physics only ever boosts.
+    model_confidence = 0.42
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", model_confidence, crop)
+    assert evidence >= model_confidence, "physics may boost a detection but never weaken it"
+    assert phys["corroboration"] <= 0.15, "structured surfaces keep only a trace of colour evidence"
+
 
 
 def test_horizontal_static_reflection_strip_rejection():
-    """Flat horizontal floor reflection strip (aspect_ratio = 3.5) lacking thermal turbulence should be rejected."""
+    """A flat floor reflection stripe is painted/uniform, so it cannot corroborate fire."""
     crop = np.zeros((40, 140, 3), dtype=np.uint8)
-    # Uniform orange reflection strip on floor (no turbulence, std_y < 5)
     crop[:, :] = [20, 110, 230]
-    is_valid, _ = YOLODetector._verify_flame_chromaticity(crop, aspect_ratio=3.5)
-    assert is_valid is False, "Expected static floor reflection strip to be rejected"
 
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", 0.20, crop)
+    assert phys["painted_surface"] is True
+    assert phys["corroboration"] == 0.0
+    assert evidence < 0.35
 
-def test_dual_engine_consensus_boost():
-    """YOLO detection and CV detection matching the same fire location should boost confidence by +0.12."""
-    bbox = BoundingBox(x_min=0.2, y_min=0.2, x_max=0.4, y_max=0.5)
-    yolo_det = DetectionResult(label="fire", confidence=0.70, bbox=bbox)
-    cv_det = DetectionResult(
-        label="fire",
-        confidence=0.72,
-        bbox=bbox,
-        metadata={"detection_engine": "OpenCV-MultiChannel-Thermal-Fire-Detector"}
-    )
-    fused = YOLODetector._fuse_detections([yolo_det], [cv_det], fire_threshold=0.50, smoke_threshold=0.50)
-    assert len(fused) == 1
-    assert fused[0].confidence == pytest.approx(0.84, abs=0.01)
-    assert fused[0].metadata.get("consensus_boost") == 0.12
 
 
 def test_fast_track_fire_temporal_verification():
@@ -615,15 +635,17 @@ def test_white_inanimate_objects_rejected_not_smoke():
 
 
 def test_fire_detection_small_flame_distant_view():
-    """Validates that small starting flame (ratio ~0.005) with hot incandescent core at CCTV distance is detected."""
+    """A distant flame occupies few pixels; it must still be boosted rather than discarded."""
     crop = np.zeros((100, 100, 3), dtype=np.uint8)
-    crop[:, :] = [25, 25, 25]  # Dark background
-    # Small starting flame at center
-    cv2.circle(crop, (50, 50), 6, (15, 120, 245), -1)  # Flame envelope
-    cv2.circle(crop, (50, 50), 3, (190, 235, 255), -1)  # Incandescent core
-    is_valid, ratio = YOLODetector._verify_flame_chromaticity(crop)
-    assert is_valid is True, f"Expected small starting flame to be valid, got ratio={ratio}"
-    assert ratio >= 0.002
+    crop[:, :] = [25, 25, 25]
+    cv2.circle(crop, (50, 50), 6, (15, 120, 245), -1)
+    cv2.circle(crop, (50, 50), 3, (190, 235, 255), -1)
+
+    model_confidence = 0.33
+    evidence, phys = YOLODetector._fuse_fire_smoke_evidence("fire", model_confidence, crop)
+    assert phys["thermal_core_ratio"] > 0.0
+    assert evidence >= model_confidence
+
 
 
 def test_smoke_detection_warm_lighting_ambient():
@@ -753,28 +775,3 @@ def test_door_window_grill_rejected_from_glasses_detection():
 
     glasses_dets = ppe_detector._detect_glasses_cv(img, [person_det])
     assert len(glasses_dets) == 0, "Expected architectural door structure to be rejected from glasses detection"
-
-
-def test_highvis_safety_vest_worker_anchor_detects_seated_worker():
-    """Validates that a seated worker wearing a high-vis safety vest is detected via worker anchor."""
-    from app.detection.person_detector import PersonDetector
-    detector = PersonDetector(device="cpu")
-    img = np.zeros((480, 640, 3), dtype=np.uint8)
-
-    # High-vis fluorescent lime green vest with reflective stripe on seated worker
-    # H~40, S~180, V~220 -> Neon lime BGR
-    cv2.rectangle(img, (280, 180), (360, 290), (40, 230, 180), -1)
-    # Retroreflective silver stripe
-    cv2.line(img, (285, 230), (355, 230), (240, 240, 240), 3)
-
-    anchors = detector._detect_highvis_vest_worker_anchor(img)
-    assert len(anchors) >= 1, "Expected high-vis vest worker anchor to detect seated worker"
-    anchor = anchors[0]
-    assert anchor.label == "person"
-    assert anchor.bbox.x_min <= 280 / 640.0
-    assert anchor.bbox.x_max >= 360 / 640.0
-
-
-
-
-

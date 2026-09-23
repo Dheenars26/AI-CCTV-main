@@ -87,29 +87,49 @@ class ClassVerificationTracker:
         self.camera_id = camera_id
         self.class_name = class_name
         cls_lower = class_name.lower()
+        # Per-frame floor: a *candidate* floor, not an alert gate. Confirming an alert additionally
+        # requires ``alert_min_confidence`` plus the persistence window below, so detection stays
+        # sensitive while the alert channel stays trustworthy.
         if cls_lower == "fire":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.40)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 3)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 0.6)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(
+                settings, "FIRE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
+            )
+            self.alert_min_confidence = max(
+                self.min_confidence,
+                getattr(settings, "FIRE_ALERT_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)),
+            )
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 6)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.2)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "VERIFICATION_COOLDOWN_SECONDS", 30.0)
         elif cls_lower == "smoke":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.35)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 4)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 0.8)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(
+                settings, "SMOKE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
+            )
+            self.alert_min_confidence = max(
+                self.min_confidence,
+                getattr(settings, "SMOKE_ALERT_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)),
+            )
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 8)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.0)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "SMOKE_ALERT_COOLDOWN_SECONDS", 30.0)
         else:
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.40)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 3
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 0.6
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
+            self.alert_min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 7
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 1.4
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else 30.0
-        self.cleared_miss_tolerance = max(1, cleared_miss_tolerance)
+        self.cleared_miss_tolerance = max(2, cleared_miss_tolerance)
 
         # Internal state metrics
+        # Confirmation credit: accrues faster while corroborated evidence keeps arriving and decays
+        # when it stops, so a flickering-but-real event confirms on fewer clean frames while a
+        # one-off blip never accumulates enough to alert.
+        self.detection_credit: float = 0.0
+
         self.state: EventState = EventState.NORMAL
         self.event_id: Optional[str] = None
         self.consecutive_frames: int = 0
         self.missed_frames: int = 0
-        self.detection_credit: float = 0.0
         self.start_time: Optional[datetime] = None
         self.start_timestamp: float = 0.0
         self.last_alert_timestamp: float = 0.0
@@ -137,8 +157,7 @@ class ClassVerificationTracker:
 
         if class_dets:
             if self.latest_bbox and self.state in [EventState.POSSIBLE, EventState.ALERT_SENT, EventState.ACTIVE]:
-                is_smoke = self.class_name.lower() == "smoke"
-                max_dist = 0.45 if is_smoke else 0.35
+                # Spatial tracking: match boxes that overlap (IoU >= threshold) OR have close centroids (< 0.35 normalized dist)
                 matching_dets = []
                 for d in class_dets:
                     iou = d.bbox.iou(self.latest_bbox)
@@ -147,11 +166,7 @@ class ClassVerificationTracker:
                     c_curr_x = (d.bbox.x_min + d.bbox.x_max) / 2.0
                     c_curr_y = (d.bbox.y_min + d.bbox.y_max) / 2.0
                     dist = ((c_prev_x - c_curr_x) ** 2 + (c_prev_y - c_curr_y) ** 2) ** 0.5
-
-                    # Upward plume drift and volumetric expansion for smoke
-                    if is_smoke and (c_curr_y <= c_prev_y + 0.10) and dist <= max_dist:
-                        matching_dets.append((d, max(iou, 1.0 - dist)))
-                    elif iou >= spatial_iou_threshold or dist <= max_dist:
+                    if iou >= spatial_iou_threshold or dist <= 0.35:
                         matching_dets.append((d, max(iou, 1.0 - dist)))
 
                 if matching_dets:
@@ -167,16 +182,17 @@ class ClassVerificationTracker:
         if best_det:
             self.missed_frames = 0
             self.consecutive_frames += 1
-            is_verified_fire = (
-                self.class_name.lower() == "fire"
-                and (best_det.metadata.get("has_thermal_core", False) if best_det.metadata else False)
+            _evidence = best_det.metadata or {}
+            # Strong, corroborated evidence earns credit faster than a lone weak box.
+            _corroborated = (
+                float(best_det.confidence) >= 0.60
+                or int(_evidence.get("box_agreement", 1) or 1) >= 4
+                or bool(_evidence.get("physics_valid"))
             )
-            is_verified_smoke = (
-                self.class_name.lower() == "smoke"
-                and ((best_det.metadata.get("smoke_metric", 0) > 0.20 or best_det.metadata.get("is_valid_smoke", False)) if best_det.metadata else False)
+            self.detection_credit = min(
+                float(self.min_consecutive_frames) + 2.0,
+                self.detection_credit + (1.8 if _corroborated else 1.0),
             )
-            credit_increment = 1.8 if (is_verified_fire or is_verified_smoke) else 1.0
-            self.detection_credit = min(float(self.min_consecutive_frames) + 2.0, self.detection_credit + credit_increment)
             self.latest_confidence = best_det.confidence
             self.max_confidence = max(self.max_confidence, best_det.confidence)
             self.latest_bbox = best_det.bbox
@@ -197,30 +213,51 @@ class ClassVerificationTracker:
 
             # Transition 2: POSSIBLE -> CONFIRMED -> ALERT_SENT
             if self.state == EventState.POSSIBLE:
-                # Fast-track temporal verification for high-certainty combustion events (verified thermal core + high confidence or dual-engine consensus)
-                is_high_certainty_fire = (
-                    self.class_name.lower() == "fire"
-                    and (self.latest_confidence >= 0.60 or (best_det.metadata and best_det.metadata.get("consensus_boost", 0) > 0))
-                    and (best_det.metadata.get("has_thermal_core", True) if best_det.metadata else True)
+                # Fast-track is earned by measurable evidence, never by an inflated score: either
+                # the model is genuinely confident, or several overlapping candidate boxes agreed on
+                # the same object (the fusion step counts them). Everything else waits for sustained
+                # proof.
+                _meta = best_det.metadata or {}
+                strong_evidence = (
+                    float(best_det.confidence) >= 0.60
+                    or int(_meta.get("box_agreement", 1) or 1) >= 4
                 )
-                is_high_certainty_smoke = (
-                    self.class_name.lower() == "smoke"
-                    and (self.latest_confidence >= 0.55 or (best_det.metadata and best_det.metadata.get("smoke_metric", 0) > 0.30))
-                )
-                is_fast_track = is_high_certainty_fire or is_high_certainty_smoke
-                if self.min_consecutive_frames > 4:
-                    req_frames = max(3, self.min_consecutive_frames - 3) if is_fast_track else self.min_consecutive_frames
+                is_fast_track = bool(strong_evidence)
+
+                if is_fast_track:
+                    if self.min_consecutive_frames > 4:
+                        req_frames = max(3, int(self.min_consecutive_frames) - 3)
+                    else:
+                        req_frames = max(2, int(self.min_consecutive_frames) - 1)
                 else:
-                    req_frames = max(2, self.min_consecutive_frames - 1) if is_fast_track else self.min_consecutive_frames
+                    req_frames = int(self.min_consecutive_frames)
 
-                req_duration = max(0.5, self.min_duration_seconds * 0.5) if (is_fast_track and self.min_duration_seconds > 0.5) else self.min_duration_seconds
+                req_duration = (
+                    max(0.5, self.min_duration_seconds * 0.5)
+                    if (is_fast_track and self.min_duration_seconds > 0.5)
+                    else self.min_duration_seconds
+                )
+                credit_threshold_met = (
+                    self.consecutive_frames >= req_frames or self.detection_credit >= float(req_frames)
+                )
+                sustained = credit_threshold_met and (duration >= req_duration)
 
-                credit_threshold_met = self.consecutive_frames >= req_frames or self.detection_credit >= float(req_frames)
-                if credit_threshold_met and (duration >= req_duration):
+                # Two-tier policy: sustained evidence below the alert floor stays a *visible
+                # detection* (drawn, logged, streamed) without dispatching an alert.
+                if sustained and self.max_confidence < self.alert_min_confidence:
+                    # Persistent but weak: keep tracking as a visible detection without raising an
+                    # alert. Logged once per streak at debug level to avoid log spam.
+                    if self.consecutive_frames == self.min_consecutive_frames:
+                        logger.debug(
+                            f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "
+                            f"sustained low-confidence signal (max {round(self.max_confidence, 2)} < "
+                            f"alert floor {round(self.alert_min_confidence, 2)}); detection only."
+                        )
+                elif sustained:
                     self.state = EventState.CONFIRMED
                     logger.warning(
                         f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "
-                        f"State POSSIBLE -> CONFIRMED! (Frames: {self.consecutive_frames}/{req_frames}, Credit: {round(self.detection_credit, 1)}, Duration: {round(duration, 1)}s, FastTrack: {is_fast_track})"
+                        f"State POSSIBLE -> CONFIRMED! (Frames: {self.consecutive_frames}, Duration: {round(duration, 1)}s)"
                     )
                     # Transition immediately to ALERT_SENT
                     self.state = EventState.ALERT_SENT
@@ -278,9 +315,7 @@ class ClassVerificationTracker:
             if self.state == EventState.POSSIBLE:
                 self.missed_frames += 1
                 self.detection_credit = max(0.0, self.detection_credit - 1.0)
-
-                # Single-frame spurious flash (credit <= 0.0) clears immediately; sustained verified events tolerate 1-frame drop
-                if self.detection_credit <= 0.0 or self.missed_frames >= self.cleared_miss_tolerance:
+                if self.consecutive_frames <= 1 or self.missed_frames >= self.cleared_miss_tolerance:
                     logger.info(
                         f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "
                         f"Transient detection cleared before confirmation. Resetting POSSIBLE -> NORMAL."
@@ -291,6 +326,7 @@ class ClassVerificationTracker:
             # Sub-case B2: Active Event Clearing (ALERT_SENT / ACTIVE -> CLEARED -> NORMAL)
             if self.state in [EventState.ALERT_SENT, EventState.ACTIVE]:
                 self.missed_frames += 1
+                self.detection_credit = max(0.0, self.detection_credit - 1.0)
                 if self.missed_frames >= self.cleared_miss_tolerance:
                     duration = now_ts - self.start_timestamp
                     evt_id = self.event_id or f"evt_{uuid.uuid4().hex[:10]}"

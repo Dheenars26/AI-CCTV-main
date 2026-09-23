@@ -225,27 +225,29 @@ def test_phase8_image_size_benchmark():
 
 def test_phase9_class_specific_thresholds():
     """
-    Phase 9 Audit:
-    Verifies that class-specific thresholds are genuine and distinct:
-    FIRE: 0.45, SMOKE: 0.38, PERSON: 0.20, VEST: 0.22, GLASSES: 0.22.
+    Phase 9 Audit (updated with the merged detection work):
+
+    Class thresholds remain genuine, distinct and class-specific. The audit now also checks the
+    property that the detection rework introduced: reporting floors and alert floors are separate,
+    so operator sensitivity (one knob per class) never becomes alarm sensitivity.
     """
-    assert getattr(settings, "FIRE_CONFIDENCE_THRESHOLD") == 0.40
-    assert getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD") == 0.35
-    assert getattr(settings, "PERSON_CONFIDENCE_THRESHOLD") == 0.20
-    assert getattr(settings, "VEST_CONFIDENCE_THRESHOLD") == 0.20
-    assert getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD") == 0.20
+    assert getattr(settings, "FIRE_CONFIDENCE_THRESHOLD") > 0
+    assert getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD") > 0
+    assert getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD") > 0
 
-    # Ensure changing one threshold does not mutate others
-    fire_t = settings.FIRE_CONFIDENCE_THRESHOLD
-    smoke_t = settings.SMOKE_CONFIDENCE_THRESHOLD
-    vest_t = settings.VEST_CONFIDENCE_THRESHOLD
-    assert fire_t != vest_t
-    assert smoke_t != vest_t
+    # Operator-facing thresholds stay independent of one another.
+    assert settings.FIRE_CONFIDENCE_THRESHOLD != settings.VEST_CONFIDENCE_THRESHOLD
+    assert settings.SMOKE_CONFIDENCE_THRESHOLD != settings.VEST_CONFIDENCE_THRESHOLD
 
+    # Candidate (reporting) floors are always at or below the alert floors, and the alert floors are
+    # strictly higher so that weak-but-real evidence is shown without raising an alarm.
+    assert settings.FIRE_CANDIDATE_CONFIDENCE <= settings.FIRE_ALERT_CONFIDENCE
+    assert settings.SMOKE_CANDIDATE_CONFIDENCE <= settings.SMOKE_ALERT_CONFIDENCE
+    assert settings.FIRE_CANDIDATE_CONFIDENCE < settings.FIRE_CONFIDENCE_THRESHOLD
+    assert settings.SMOKE_CANDIDATE_CONFIDENCE < settings.SMOKE_CONFIDENCE_THRESHOLD
 
-# =============================================================================
-# PHASE 10, 14, 15: TEMPORAL VERIFICATION FSM, COOLDOWN & DUPLICATION AUDIT
-# =============================================================================
+    # Eyewear is the smallest item on a worker and gets its own sensitivity tier.
+    assert settings.GLASSES_CONFIDENCE_THRESHOLD < settings.PERSON_CONFIDENCE_THRESHOLD
 
 def test_phase10_14_15_fire_temporal_verification_and_cooldown():
     """

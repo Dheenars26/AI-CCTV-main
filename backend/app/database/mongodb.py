@@ -3,10 +3,24 @@ MongoDB Async Database Manager (Motor / PyMongo).
 Provides resilient, connection-pooled async client access with graceful offline fallback.
 """
 
-from typing import Optional, Dict, Any, List
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from typing import Optional, Dict, Any, List, TYPE_CHECKING
+
 from app.config.settings import settings
 from app.utils.logger import logger
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+
+# Motor is an optional dependency: MongoDB is an add-on telemetry store, and the detection path
+# must import cleanly on installations that only run the relational database. Importing it lazily
+# also means a missing/broken driver degrades to "MongoDB unavailable" instead of breaking the API.
+try:  # pragma: no cover - environment dependent
+    from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+    MOTOR_AVAILABLE = True
+except Exception:  # pragma: no cover
+    AsyncIOMotorClient = None  # type: ignore[assignment]
+    AsyncIOMotorDatabase = None  # type: ignore[assignment]
+    MOTOR_AVAILABLE = False
 
 
 class MongoDBManager:
@@ -14,8 +28,8 @@ class MongoDBManager:
     Singleton Manager for Asynchronous MongoDB connection pooling.
     Handles connection lifecycle, health diagnostics, and graceful degradation.
     """
-    client: Optional[AsyncIOMotorClient] = None
-    db: Optional[AsyncIOMotorDatabase] = None
+    client: Optional[Any] = None
+    db: Optional[Any] = None
     is_connected: bool = False
     last_error: Optional[str] = None
 
@@ -27,6 +41,15 @@ class MongoDBManager:
         if not getattr(settings, "MONGODB_ENABLED", True):
             logger.info("MongoDB is disabled via MONGODB_ENABLED=False setting.")
             self.is_connected = False
+            return False
+
+        if not MOTOR_AVAILABLE:
+            self.is_connected = False
+            self.last_error = "motor driver not installed"
+            logger.warning(
+                "MongoDB is enabled but the 'motor' driver is not installed; "
+                "detection logging falls back to the relational database only."
+            )
             return False
 
         url = getattr(settings, "MONGODB_URL", "mongodb://localhost:27017")
