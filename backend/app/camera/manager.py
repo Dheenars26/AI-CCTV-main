@@ -85,7 +85,7 @@ class CameraManager:
             except Exception as e:
                 logger.warning(f"Error executing camera lifecycle callback: {str(e)}")
 
-    def add_camera(self, camera: Camera) -> None:
+    def add_camera(self, camera: Camera, zones: Optional[List[Dict[str, Any]]] = None) -> None:
         """
         Registers camera configuration, bounded ingestion queue, and pipeline.
         """
@@ -115,7 +115,7 @@ class CameraManager:
             source = CameraFactory.create_source(camera, camera_id=cid)
             self._sources[cid] = source
             self._buffers[cid] = LatestFrameBuffer(camera_id=cid)
-            self._bounded_queues[cid] = BoundedFrameQueue(camera_id=cid, maxsize=2)
+            self._bounded_queues[cid] = BoundedFrameQueue(camera_id=cid, maxsize=1)
             self._ring_buffers[cid] = RollingFrameRingBuffer(
                 max_seconds=getattr(settings, "PRE_EVENT_BUFFER_SECONDS", 5.0),
                 default_fps=c_fps
@@ -156,6 +156,11 @@ class CameraManager:
                 ppe_inference_interval_sec=ppe_interval
             )
             logger.info(f"CameraManager: Configured pipeline & detectors for Camera ID {cid} on device '{target_device}'")
+
+            # Apply any provided safety zones
+            if zones:
+                self._pipelines[cid].set_safety_zones(zones)
+
             self._reconnect_intervals[cid] = getattr(camera, "reconnect_interval", 5)
             self._camera_priorities[cid] = getattr(camera, "priority", "HIGH")
             self._camera_dvrs[cid] = getattr(camera, "dvr_id", None)
@@ -165,6 +170,19 @@ class CameraManager:
             self._current_ai_fps[cid] = 0.0
 
             logger.info(f"CameraManager: Added Camera ID {cid} ('{camera.name}') with device '{target_device}' & priority '{camera.priority}'.")
+
+    def update_camera_safety_zones(self, camera_id: int, zones: Optional[List[Dict[str, Any]]] = None) -> None:
+        """
+        Hot-reloads safety zones for an active camera pipeline in real time.
+        """
+        with self._lock:
+            pipeline = self._pipelines.get(camera_id)
+            if not pipeline:
+                return
+
+            active_zones = zones if zones is not None else []
+            pipeline.set_safety_zones(active_zones)
+            logger.info(f"CameraManager: Hot-reloaded {len(active_zones)} safety zones for Camera ID {camera_id}")
 
     def is_camera_enabled(self, camera_id: int) -> bool:
         """
@@ -359,6 +377,30 @@ class CameraManager:
         fps_window_start = time.time()
         window_frame_count: int = 0
 
+        # Ensure active safety zones are loaded from DB if not already populated
+        if pipeline and not pipeline.active_safety_zones:
+            try:
+                from app.database.session import SessionLocal as _SL
+                from app.models.zone import SafetyZone as _SZ
+                with _SL() as _db:
+                    db_zones = _db.query(_SZ).filter(_SZ.camera_id == camera_id, _SZ.enabled == True).all()
+                    if db_zones:
+                        z_dicts = [
+                            {
+                                "id": z.id,
+                                "name": z.name,
+                                "zone_type": z.zone_type,
+                                "polygon_coordinates": z.polygon_coordinates,
+                                "ppe_profile_id": z.ppe_profile_id,
+                                "enabled": z.enabled
+                            }
+                            for z in db_zones
+                        ]
+                        pipeline.set_safety_zones(z_dicts)
+                        logger.info(f"CameraIngestionWorker-{camera_id}: Auto-loaded {len(z_dicts)} safety zones from DB.")
+            except Exception as ze:
+                logger.warning(f"CameraIngestionWorker-{camera_id}: Could not auto-load safety zones from DB: {ze}")
+
         while not stop_event.is_set():
             try:
                 # Check DVR status if attached to physical DVR
@@ -472,17 +514,29 @@ class CameraManager:
         Pulls latest frame from BoundedFrameQueue and executes YOLO AI detection & verification.
         Controlled CUDA OOM Recovery handling included.
         """
+        source: Optional[CameraSource] = self._sources.get(camera_id)
+        pipeline: Optional[FramePipeline] = self._pipelines.get(camera_id)
+        bqueue: Optional[BoundedFrameQueue] = self._bounded_queues.get(camera_id)
+
+        if not bqueue or not pipeline or not source:
+            with self._lock:
+                self._ai_jobs_in_progress[camera_id] = False
+            return
+
         try:
-            bqueue = self._bounded_queues.get(camera_id)
-            pipeline = self._pipelines.get(camera_id)
-            source = self._sources.get(camera_id)
-
-            if not bqueue or not pipeline or not source:
-                return
-
             raw_frame, ts, fid = bqueue.get_frame(timeout=0.1)
             if raw_frame is None:
                 return
+
+            cam_name = getattr(source, "name", f"Camera-{camera_id}")
+            try:
+                from app.utils.metrics import metrics_collector
+                metrics_collector.record_queue_depth(cam_name, bqueue.current_size)
+                if ts:
+                    frame_age = (datetime.now(timezone.utc) - ts).total_seconds() * 1000.0
+                    metrics_collector.record_frame_age(cam_name, frame_age)
+            except Exception:
+                pass
 
             current_fps = source.state.current_fps or 15.0
             processed_frame = pipeline.process_frame(
@@ -607,6 +661,24 @@ class CameraManager:
                                             )
                                         except Exception as ppe_db_err:
                                             logger.warning(f"CameraManager: PPE DB persistence error: {str(ppe_db_err)}")
+                                    elif evt_obj.class_name == "zone_violation":
+                                        try:
+                                            from app.models.incident import Incident
+                                            meta_evt = evt_data.get("metadata", {})
+                                            inc = Incident(
+                                                camera_id=cid,
+                                                zone_id=meta_evt.get("zone_id"),
+                                                incident_type="ZONE_VIOLATION",
+                                                events=meta_evt.get("events", ["UNAUTHORIZED_AREA_ENTRY"]),
+                                                severity=meta_evt.get("severity", "HIGH"),
+                                                status="ACTIVE",
+                                                person_id=meta_evt.get("person_id"),
+                                                start_time=evt_obj.start_time
+                                            )
+                                            db.add(inc)
+                                            db.commit()
+                                        except Exception as z_db_err:
+                                            logger.warning(f"CameraManager: Zone violation incident persistence error: {str(z_db_err)}")
                                 finally:
                                     try:
                                         db.close()
@@ -677,10 +749,11 @@ class CameraManager:
                             _async_process_verified_alert()
         except RuntimeError as cuda_err:
             if "out of memory" in str(cuda_err).lower():
-                target_gpu = getattr(source, "gpu_device_id", 0)
+                target_gpu = getattr(source, "gpu_device_id", 0) if source else 0
                 new_device = self.resource_manager.handle_cuda_oom(target_gpu)
                 logger.warning(f"Camera-{camera_id}: Controlled CUDA OOM recovery triggered. Switched device to '{new_device}'.")
-                pipeline.detector = YOLODetector(device=new_device)
+                if pipeline:
+                    pipeline.detector = YOLODetector(device=new_device)
             else:
                 logger.error(f"Camera-{camera_id}: AI task error: {str(cuda_err)}")
         except Exception as e:

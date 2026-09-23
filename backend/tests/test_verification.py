@@ -216,3 +216,46 @@ def test_camera_disconnection_resets_state():
     engine.reset_all()
     assert engine.trackers["smoke"].state == EventState.NORMAL
     assert engine.trackers["fire"].state == EventState.NORMAL
+
+
+def test_flame_flicker_single_frame_dip_does_not_abort_verification():
+    """
+    Test 7: A genuine flickering flame that has a 1-frame confidence drop or missing detection
+    does NOT reset to NORMAL if multi-frame credit has been accumulated, successfully confirming
+    when the detection resumes.
+    """
+    tracker = ClassVerificationTracker(
+        camera_id=1,
+        class_name="fire",
+        min_confidence=0.50,
+        min_consecutive_frames=3,
+        min_duration_seconds=0.1,
+        cooldown_seconds=10.0
+    )
+
+    det = make_detection(label="fire", confidence=0.88)
+
+    # Frame 1: Detection -> POSSIBLE (credit=1.0)
+    tracker.update([det], {"frame_id": 1})
+    assert tracker.state == EventState.POSSIBLE
+
+    # Frame 2: Detection -> POSSIBLE (credit=2.0)
+    time.sleep(0.04)
+    tracker.update([det], {"frame_id": 2})
+    assert tracker.state == EventState.POSSIBLE
+
+    # Frame 3: Flame flickers down or packet dropped -> missed 1 frame (credit=1.4)
+    # The tracker should STAY in POSSIBLE rather than immediately clearing!
+    time.sleep(0.04)
+    evt_dip = tracker.update([], {"frame_id": 3})
+    assert evt_dip is None
+    assert tracker.state == EventState.POSSIBLE
+    assert tracker.missed_frames == 1
+
+    # Frame 4: Flame flares back up -> reaches threshold and confirms!
+    time.sleep(0.05)
+    evt_confirm = tracker.update([det], {"frame_id": 4})
+    assert evt_confirm is not None
+    assert evt_confirm.state == EventState.ALERT_SENT
+    assert tracker.state in [EventState.ALERT_SENT, EventState.ACTIVE]
+

@@ -41,8 +41,10 @@ env/
 **/logs/*.log*
 **/logs/*.log
 logs/*.log*
-evidence/*
-recordings/*
+**/evidence/*
+!**/evidence/.gitkeep
+**/recordings/*
+!**/recordings/.gitkeep
 *.db
 *.db-shm
 *.db-wal

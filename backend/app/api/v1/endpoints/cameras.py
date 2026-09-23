@@ -5,6 +5,7 @@ Full CRUD, Start/Stop stream controls, live status probes, and JPEG verification
 
 import asyncio
 import time
+from datetime import datetime, timezone
 import cv2
 import numpy as np
 from typing import List, Optional
@@ -349,8 +350,6 @@ async def mjpeg_frame_generator(
                 is_enabled = camera_manager.is_camera_enabled(camera_id)
 
             if not is_enabled:
-                if camera_manager.is_running(camera_id):
-                    camera_manager.stop_camera(camera_id)
                 now_t = time.time()
                 if (now_t - last_placeholder_sent_time) >= 2.0:
                     last_placeholder_sent_time = now_t

@@ -64,6 +64,38 @@ async def list_detections(
 
 
 @router.get(
+    "/mongo",
+    summary="Query High-Volume Detection Logs from MongoDB",
+    description="Lists indexed detection event documents stored in MongoDB with filtering and pagination."
+)
+async def list_mongo_detections(
+    camera_id: Optional[int] = Query(None, description="Filter by Camera ID"),
+    class_name: Optional[str] = Query(None, description="Filter by class (fire, smoke, person, etc.)"),
+    module: Optional[str] = Query(None, description="Filter by module (FIRE_SMOKE, PPE, RESTRICTED_ZONE)"),
+    date_from: Optional[datetime] = Query(None, description="Filter start date ISO 8601"),
+    date_to: Optional[datetime] = Query(None, description="Filter end date ISO 8601"),
+    limit: int = Query(50, ge=1, le=1000, description="Items per page"),
+    skip: int = Query(0, ge=0, description="Pagination skip offset"),
+    current_user: User = Depends(RequirePermission("detections:read"))
+):
+    from app.services.mongo_service import mongo_detection_service
+    from app.schemas.mongo_docs import MongoQueryFilter
+    from app.schemas.common import ResponseModel
+
+    filter_params = MongoQueryFilter(
+        camera_id=camera_id,
+        class_name=class_name,
+        module=module,
+        start_time=date_from,
+        end_time=date_to,
+        limit=limit,
+        skip=skip
+    )
+    result = await mongo_detection_service.query_detection_history(filter_params)
+    return ResponseModel(data=result)
+
+
+@router.get(
     "/{id}",
     response_model=DetectionResponse,
     summary="Get Single Detection Frame Prediction",

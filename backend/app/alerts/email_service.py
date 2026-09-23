@@ -119,13 +119,17 @@ class EmailService:
         GPS coordinates (Latitude/Longitude), Google Maps link, missing equipment breakdown, and inline evidence snapshot.
         """
         class_name = str(alert_data.get("class_name", "")).lower()
+        incident_type = str(alert_data.get("incident_type", "")).upper()
+        zone_name = str(alert_data.get("zone_name") or "Restricted Area")
+        zone_id = alert_data.get("zone_id")
         missing_items = alert_data.get("missing_items", []) or alert_data.get("missing_equipment", []) or []
         if isinstance(missing_items, str):
             missing_items = [missing_items]
 
         is_fire = "fire" in class_name
         is_smoke = "smoke" in class_name
-        is_ppe = "ppe" in class_name or "helmet" in class_name or "vest" in class_name or len(missing_items) > 0
+        is_zone = "zone" in class_name or "restricted" in class_name or incident_type == "ZONE_VIOLATION" or "unauthorized" in class_name
+        is_ppe = ("ppe" in class_name or "helmet" in class_name or "vest" in class_name or len(missing_items) > 0) and not is_zone
 
         if is_fire:
             banner_color = "#dc2626"  # Red for Fire
@@ -135,6 +139,11 @@ class EmailService:
             banner_color = "#d97706"  # Amber for Smoke
             alert_title = "WARNING SMOKE ALERT DETECTED"
             badge_text = "SMOKE DETECTED"
+        elif is_zone:
+            banner_color = "#b91c1c"  # Bold Crimson Red for Security Intrusion
+            zone_display = zone_name.upper() if zone_name else "RESTRICTED AREA"
+            alert_title = f"SECURITY ALERT: RESTRICTED AREA INTRUSION ({zone_display})"
+            badge_text = f"UNAUTHORIZED ENTRY: {zone_display}"
         elif is_ppe or missing_items:
             banner_color = "#e11d48"  # Rose Red for PPE Violation
             items_str = ", ".join([str(item).upper() if str(item).upper().startswith("NO ") else f"NO {str(item).upper()}" for item in missing_items]) if missing_items else "PPE VIOLATION"
@@ -148,6 +157,20 @@ class EmailService:
         lat = alert_data.get("latitude", 13.0827)
         lon = alert_data.get("longitude", 80.2707)
         maps_url = alert_data.get("google_maps_link") or f"https://www.google.com/maps?q={lat},{lon}"
+
+        zone_row = ""
+        if is_zone:
+            zone_info = f"{zone_name} (Zone ID: #{zone_id})" if zone_id else zone_name
+            zone_row = f"""
+                        <tr>
+                            <td class="label">Restricted Zone</td>
+                            <td><strong style="color: #b91c1c; font-size: 15px;">🚫 {zone_info}</strong></td>
+                        </tr>
+                        <tr>
+                            <td class="label">Security Violation</td>
+                            <td><strong style="color: #dc2626;">Unauthorized Person Detected Inside Restricted Boundary</strong></td>
+                        </tr>
+            """
 
         missing_row = ""
         if missing_items:
@@ -195,6 +218,7 @@ class EmailService:
                             <td class="label">Incident Type</td>
                             <td><span class="badge">{badge_text}</span></td>
                         </tr>
+                        {zone_row}
                         {missing_row}
                         {person_row}
                         <tr>
@@ -260,8 +284,18 @@ class EmailService:
         Plain-text fallback email template including missing equipment details and evidence reference.
         """
         class_name = str(alert_data.get("class_name", "")).upper()
+        incident_type = str(alert_data.get("incident_type", "")).upper()
+        zone_name = str(alert_data.get("zone_name") or "")
+        zone_id = alert_data.get("zone_id")
+        is_zone = "zone" in class_name.lower() or "restricted" in class_name.lower() or incident_type == "ZONE_VIOLATION"
+
         missing_items = alert_data.get("missing_items", []) or alert_data.get("missing_equipment", []) or []
         missing_str = f" (MISSING: {', '.join([i.upper() for i in missing_items])})" if missing_items else ""
+
+        zone_str = ""
+        if is_zone:
+            zone_info = f"{zone_name} (Zone ID: #{zone_id})" if zone_id else zone_name
+            zone_str = f"\n        - Restricted Zone: {zone_info}\n        - Security Violation: Unauthorized Person Entry Detected Inside Restricted Perimeter"
 
         lat = alert_data.get("latitude", 13.0827)
         lon = alert_data.get("longitude", 80.2707)
@@ -272,7 +306,7 @@ class EmailService:
         AI CCTV Surveillance Platform
 
         Incident Details:
-        - Incident Type: {class_name}{missing_str}
+        - Incident Type: {class_name}{missing_str}{zone_str}
         - Camera ID: CAM-{alert_data.get('camera_id', 0):02d}
         - Camera Name: {alert_data.get('camera_name', 'Unknown Camera')}
         - Location: {alert_data.get('location', 'N/A')}

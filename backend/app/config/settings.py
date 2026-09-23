@@ -35,10 +35,16 @@ class Settings(BaseSettings):
     CORS_ORIGINS: Union[List[str], str] = ["*"]
     SECRET_KEY: str = "development-secret-key-change-in-production"
 
-    # Database Settings
+    # Database Settings (SQLAlchemy / Relational)
     DATABASE_URL: str = "sqlite:///./cctv.db"
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
+
+    # MongoDB Settings (Hybrid Architecture for Detection Logs & Telemetry)
+    MONGODB_ENABLED: bool = True
+    MONGODB_URL: str = "mongodb://localhost:27017"
+    MONGODB_DB_NAME: str = "cctv_ai_surveillance"
+    MONGODB_SERVER_TIMEOUT_MS: int = 2500
 
     # Logging Config
     LOG_LEVEL: str = "INFO"
@@ -59,23 +65,25 @@ class Settings(BaseSettings):
     ENABLE_PPE_ROI: bool = False  # Disabled by default; enable only if ROI benchmarking justifies extra cost
 
     # Class-Specific Confidence Thresholds (Tuned for High Precision & Zero False Alarms)
-    FIRE_CONFIDENCE_THRESHOLD: float = 0.50
-    SMOKE_CONFIDENCE_THRESHOLD: float = 0.48
-    PERSON_CONFIDENCE_THRESHOLD: float = 0.40
-    VEST_CONFIDENCE_THRESHOLD: float = 0.35
-    GLASSES_CONFIDENCE_THRESHOLD: float = 0.22
+    FIRE_CONFIDENCE_THRESHOLD: float = 0.40
+    SMOKE_CONFIDENCE_THRESHOLD: float = 0.35
+    PERSON_CONFIDENCE_THRESHOLD: float = 0.20
+    VEST_CONFIDENCE_THRESHOLD: float = 0.20
+    GLASSES_CONFIDENCE_THRESHOLD: float = 0.20
     ENABLE_CV_VEST_DETECTION: bool = True
     ENABLE_CV_HELMET_DETECTION: bool = False
     ENABLE_CV_GLASSES_DETECTION: bool = True
+    ENABLE_STANDALONE_VEST_FALLBACK: bool = True
+    ENABLE_HIGHVIS_WORKER_ANCHOR: bool = True
 
     # YOLO Model File Paths & Backward Compatibility Aliases
     YOLO_MODEL_PATH: str = "models/fire_smoke.onnx"
-    YOLO_CONF_THRESHOLD: float = 0.48
+    YOLO_CONF_THRESHOLD: float = 0.35
     YOLO_IOU_THRESHOLD: float = 0.45
     YOLO_IMGSZ: int = 416
     YOLO_AUGMENT: bool = False
     YOLO_DEVICE: str = "cpu"
-    YOLO_ENABLE_HSV_FALLBACK: bool = False
+    YOLO_ENABLE_HSV_FALLBACK: bool = True
     AI_DETECTION_ENABLED: bool = True
     AI_FIRE_SMOKE_ENABLED: bool = True
 
@@ -84,20 +92,20 @@ class Settings(BaseSettings):
     AI_PERSON_ENABLED: bool = True
     AI_ZONE_ENABLED: bool = True
     PPE_MODEL_PATH: str = "models/ppe.onnx"
-    PPE_CONFIDENCE_THRESHOLD: float = 0.38
+    PPE_CONFIDENCE_THRESHOLD: float = 0.30
     PPE_IOU_THRESHOLD: float = 0.45
     PPE_DEVICE: str = "cpu"
-    PPE_VERIFICATION_FRAMES: int = 6
-    PPE_VERIFICATION_DURATION_SECONDS: float = 1.2
-    PPE_INFERENCE_INTERVAL_SEC: float = 0.25
+    PPE_VERIFICATION_FRAMES: int = 3
+    PPE_VERIFICATION_DURATION_SECONDS: float = 0.6
+    PPE_INFERENCE_INTERVAL_SEC: float = 0.10
     PPE_ALERT_COOLDOWN_SECONDS: float = 60.0
     PERSON_MODEL_PATH: str = "models/yolov8n.onnx"
 
     # Fire & Smoke Temporal Verification (Requires persistent spatial detection before confirming)
-    FIRE_MIN_CONSECUTIVE_FRAMES: int = 7
-    FIRE_MIN_DURATION_SECONDS: float = 1.4
-    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 9
-    SMOKE_MIN_DURATION_SECONDS: float = 2.2
+    FIRE_MIN_CONSECUTIVE_FRAMES: int = 5
+    FIRE_MIN_DURATION_SECONDS: float = 1.0
+    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 6
+    SMOKE_MIN_DURATION_SECONDS: float = 1.2
     SMOKE_ALERT_COOLDOWN_SECONDS: float = 30.0
 
     # Feature Toggles for Safety Engine

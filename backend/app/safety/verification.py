@@ -104,7 +104,7 @@ class WorkerPPETrackerFSM:
         else:
             if self.state == EventState.POSSIBLE:
                 self.missed_frames += 1
-                if self.missed_frames >= self.cleared_miss_tolerance or self.consecutive_frames <= 1:
+                if self.missed_frames >= self.cleared_miss_tolerance:
                     logger.info(f"PPETrackerFSM: Cam {self.camera_id} Person #{self.person_id} Transient violation cleared. Resetting to NORMAL.")
                     self.reset()
                 return None

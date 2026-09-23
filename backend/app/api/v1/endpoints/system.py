@@ -19,6 +19,7 @@ from app.schemas.system import SystemStatusResponse, SystemStatsResponse, Verifi
 
 from app.api.v1.dependencies.permissions import RequirePermission, RequireRole
 from app.models.user import User
+from app.utils.logger import logger
 
 router = APIRouter(prefix="/system", tags=["System Status & Analytics"])
 _START_TIME = time.time()
@@ -302,3 +303,14 @@ async def update_verification_settings(
         verification_cooldown_seconds=settings.VERIFICATION_COOLDOWN_SECONDS,
     )
     return ResponseModel(data=data)
+
+
+@router.get(
+    "/mongodb-status",
+    summary="Get MongoDB Hybrid Integration Status",
+    description="Returns real-time connection status, database name, collections, and document counts for MongoDB."
+)
+async def get_mongodb_status():
+    from app.database.mongodb import mongodb_manager
+    health = await mongodb_manager.health_check()
+    return ResponseModel(data=health)
