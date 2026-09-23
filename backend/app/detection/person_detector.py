@@ -15,6 +15,8 @@ import cv2.data
 
 from app.config.settings import settings
 from app.detection.base import BaseDetector, DetectionResult, BoundingBox, DetectorStatus
+from app.detection.nms import nms as _nms
+from app.detection.preprocess import upscale_if_small
 from app.utils.logger import logger
 
 _PERSON_MODEL_CACHE: Dict[str, Any] = {}
@@ -54,6 +56,7 @@ class PersonDetector(BaseDetector):
         self._model: Any = None
         self._onnx_runner: Any = None
         self._is_mock_fallback: bool = False
+        self._last_full_frame_detections: List[DetectionResult] = []
 
         self.initialize()
 
@@ -157,12 +160,26 @@ class PersonDetector(BaseDetector):
                 _PERSON_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True, "loaded_at": self.loaded_at}
                 return True
 
-    def detect(self, image_bgr: Any, candidate_rois: Optional[List[BoundingBox]] = None, **kwargs: Any) -> List[DetectionResult]:
+    def detect(
+        self,
+        image_bgr: Any,
+        candidate_rois: Optional[List[BoundingBox]] = None,
+        motion_rois: Optional[List[Any]] = None,
+        **kwargs: Any
+    ) -> List[DetectionResult]:
+        """
+        Detects workers in a frame.
+
+        :param motion_rois: optional normalised ``(x_min, y_min, x_max, y_max)`` boxes from the
+               motion gate. Each is re-examined at higher effective resolution, which recovers
+               distant workers the full-frame pass misses for a fraction of a second pass.
+        """
         if not getattr(settings, "AI_PERSON_ENABLED", True) or image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
 
         h, w = image_bgr.shape[:2]
         detections: List[DetectionResult] = []
+        self._last_full_frame_detections: List[DetectionResult] = []
 
         # High-Performance ONNX Runner
         if self._onnx_runner is not None:
@@ -174,23 +191,37 @@ class PersonDetector(BaseDetector):
                     target_classes=None
                 )
                 for d in raw_dets:
-                    label = d["label"].lower().strip()
-                    cid = d.get("class_id", -1)
-                    # COCO class 0 is 'person', or name is 'person' / 'worker'
-                    if cid == 0 or label in ["person", "worker", "human"]:
-                        detections.append(DetectionResult(
-                            label="person",
-                            confidence=d["confidence"],
-                            bbox=d["bbox"],
-                            metadata={
-                                "detector_module": "PersonDetector",
-                                "engine": "ONNXYOLORunner",
-                                "device": self.device,
-                                "inference_time_ms": inf_time_ms
-                            }
-                        ))
-                if detections:
-                    return detections
+                    if not self._is_person(d):
+                        continue
+                    detections.append(DetectionResult(
+                        label="person",
+                        confidence=float(d["confidence"]),
+                        bbox=d["bbox"],
+                        metadata={
+                            "detector_module": "PersonDetector",
+                            "engine": "ONNXYOLORunner",
+                            "device": self.device,
+                            "inference_time_ms": inf_time_ms,
+                            "raw_class": d["label"],
+                            "box_agreement": d.get("box_agreement", 1),
+                        }
+                    ))
+
+                self._last_full_frame_detections = list(detections)
+
+                # Refine on motion regions before giving up: a worker 40 m away may be a 20-pixel
+                # blob in a 1080p frame, well under the 640-px network's reliable size.
+                if motion_rois and getattr(settings, "ENABLE_PERSON_ROI_REFINE", True):
+                    detections.extend(self._refine_on_motion_rois(image_bgr, motion_rois, h, w))
+
+                # Only fall back to the classical detector when no neural backend exists at all.
+                # Previously this ran whenever the network returned zero persons, which is precisely
+                # what happens on an empty scene - the Haar/skin path then fabricated workers at a
+                # fixed 0.86-0.88 confidence and every one of them became a phantom PPE violation.
+                if not detections and not self._neural_backend_available():
+                    detections.extend(self._detect_opencv_person_fallback(image_bgr))
+
+                return self._dedupe(detections)
             except Exception as oe:
                 logger.error(f"PersonDetector: Error during ONNX inference: {oe}")
 
@@ -403,6 +434,132 @@ class PersonDetector(BaseDetector):
             logger.warning(f"PersonDetector: Multi-stage cascade exception: {str(e)}")
 
         return results
+
+    def _neural_backend_available(self) -> bool:
+        """True when weights are loaded and inference is trustworthy enough to skip CV fallbacks."""
+        if getattr(self, "_onnx_runner", None) is not None:
+            return True
+        return self._model is not None and not self._is_mock_fallback
+
+    def _is_person(self, detection: Dict[str, Any]) -> bool:
+        """
+        Decides whether a raw detection is a worker.
+
+        The previous implementation accepted ``class_id == 0`` as "person". That is only true for
+        COCO-ordered weights; the bundled ``yolov8n.onnx`` export carries no class-name metadata, so
+        the id-0 shortcut was the sole test and the model's *label names* were ignored entirely.
+        Resolution order is now: model metadata name -> COCO fallback for a genuine 80-class model ->
+        explicit name list.
+        """
+        label = str(detection.get("label", "")).lower().strip()
+        if label in ("person", "worker", "human", "people"):
+            return True
+        cid = int(detection.get("class_id", -1))
+        name_from_model = ""
+        runner = getattr(self, "_onnx_runner", None)
+        if runner is not None:
+            try:
+                name_from_model = runner.name_for(cid)
+            except Exception:
+                name_from_model = ""
+        if name_from_model in ("person", "worker", "human", "people"):
+            return True
+        if not name_from_model or name_from_model.isdigit():
+            # Anonymous export: a standard COCO model has exactly 80 classes and person is index 0.
+            num_classes = getattr(runner, "names", {}) or {}
+            if cid == 0 and len(num_classes) in (0, 80):
+                return True
+        return False
+
+    def _refine_on_motion_rois(
+        self,
+        image_bgr: np.ndarray,
+        motion_rois: List[Any],
+        h: int,
+        w: int,
+    ) -> List[DetectionResult]:
+        """
+        Second-pass worker search on upscaled motion crops.
+
+        The pass costs one extra inference, so it is spent only where it can pay off: a region that
+        is small in the frame (a distant worker, where upscaling genuinely adds pixels) and that no
+        existing detection already covers.
+        """
+        extra: List[DetectionResult] = []
+        max_rois = int(getattr(settings, "PERSON_ROI_REFINE_MAX_ROIS", 1))
+        max_roi_fraction = float(getattr(settings, "PERSON_ROI_REFINE_MAX_AREA", 0.35))
+        for roi in list(motion_rois)[:max_rois]:
+            try:
+                x_min, y_min, x_max, y_max = [float(v) for v in roi]
+            except Exception:
+                continue
+            x1 = max(0, int(x_min * w))
+            y1 = max(0, int(y_min * h))
+            x2 = min(w, int(x_max * w))
+            y2 = min(h, int(y_max * h))
+            if x2 - x1 < 32 or y2 - y1 < 32:
+                continue
+            # Large regions are already well sampled at full-frame resolution - upscaling them
+            # cannot reveal anything new.
+            if ((x2 - x1) * (y2 - y1)) / float(max(1, w * h)) > max_roi_fraction:
+                continue
+            # Already covered by a full-frame detection: nothing to recover.
+            if any(
+                d.bbox.x_max > x_min and d.bbox.x_min < x_max and d.bbox.y_max > y_min and d.bbox.y_min < y_max
+                for d in self._last_full_frame_detections
+            ):
+                continue
+            crop = image_bgr[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            prepared, upscale = upscale_if_small(crop, min_side=480)
+            try:
+                roi_dets, _ = self._onnx_runner.predict(
+                    prepared,
+                    conf_threshold=max(0.25, self.conf_threshold * 0.75),
+                    iou_threshold=0.45,
+                    target_classes=None,
+                )
+            except Exception:
+                continue
+            back = 1.0 / (upscale if upscale > 0 else 1.0)
+            for d in roi_dets:
+                if not self._is_person(d):
+                    continue
+                bx1, by1, bx2, by2 = d["pixel_coords"]
+                gx1 = max(0.0, x1 + bx1 * back)
+                gy1 = max(0.0, y1 + by1 * back)
+                gx2 = min(float(w), x1 + bx2 * back)
+                gy2 = min(float(h), y1 + by2 * back)
+                if gx2 - gx1 < 2 or gy2 - gy1 < 2:
+                    continue
+                extra.append(DetectionResult(
+                    label="person",
+                    confidence=float(d["confidence"]),
+                    bbox=BoundingBox(x_min=gx1 / w, y_min=gy1 / h, x_max=gx2 / w, y_max=gy2 / h),
+                    metadata={
+                        "detector_module": "PersonDetector",
+                        "engine": "ONNXYOLORunner-MotionROI",
+                        "roi_upscale": round(upscale, 2),
+                        "evidence": "motion_roi",
+                    },
+                ))
+        return extra
+
+    @staticmethod
+    def _dedupe(detections: List[DetectionResult], iou_threshold: float = 0.55) -> List[DetectionResult]:
+        """Suppresses duplicate person boxes (full-frame and ROI passes can both fire)."""
+        if len(detections) <= 1:
+            return detections
+        import numpy as np
+
+        boxes = np.array([
+            [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max] for d in detections
+        ], dtype=np.float32)
+        scores = np.array([d.confidence for d in detections], dtype=np.float32)
+        classes = np.zeros(len(detections), dtype=np.int64)
+        keep = _nms(boxes, scores, iou_threshold, classes, class_aware=True)
+        return [detections[i] for i in keep]
 
     def get_model_name(self) -> str:
         return f"PersonDetector (Device: {self.device})"

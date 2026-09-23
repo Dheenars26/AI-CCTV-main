@@ -185,9 +185,19 @@ class YOLODetector(BaseDetector):
                 self._is_mock_fallback = True
                 _YOLO_MODEL_CACHE[cache_key] = {"model": None, "onnx_runner": None, "is_mock": True}
 
-    def detect(self, image_bgr: Any, candidate_rois: Optional[List[BoundingBox]] = None, **kwargs: Any) -> List[DetectionResult]:
+    def detect(
+        self,
+        image_bgr: Any,
+        candidate_rois: Optional[List[BoundingBox]] = None,
+        exclusion_rois: Optional[List[BoundingBox]] = None,
+        **kwargs: Any
+    ) -> List[DetectionResult]:
         """
-        Executes YOLO object detection on frame matrix with candidate ROI-restricted computer-vision fallback.
+        Executes fire/smoke detection on a frame.
+
+        :param candidate_rois: retained for interface compatibility (optional search ROIs).
+        :param exclusion_rois: person / PPE / equipment boxes that must NOT be reported as fire
+               (for example a high-vis vest, which the fire model scores as flame).
         """
         if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
@@ -196,7 +206,20 @@ class YOLODetector(BaseDetector):
         if self._onnx_runner is not None:
             fire_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
             smoke_conf = getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
-            predict_conf = min(self.conf_threshold, fire_conf, smoke_conf, 0.40)
+            # The operator-facing thresholds (FIRE/SMOKE_CONFIDENCE_THRESHOLD, also writable through
+            # PUT /system/verification) express desired sensitivity. The candidate and alert floors
+            # are derived from them so a single knob stays authoritative:
+            #   candidate floor  = min(configured noise floor, half the sensitivity threshold)
+            #   alert floor      = at least the sensitivity threshold
+            fire_candidate = min(
+                float(getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.14)), fire_conf * 0.5
+            )
+            smoke_candidate = min(
+                float(getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.13)), smoke_conf * 0.5
+            )
+            require_agreement = int(getattr(settings, "FIRE_REQUIRE_AGREEMENT", 3))
+            structure_limit = float(getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45))
+            predict_conf = min(self.conf_threshold, fire_candidate, smoke_candidate)
 
             raw_dets, inf_time_ms = self._onnx_runner.predict(
                 image_bgr,
@@ -212,51 +235,80 @@ class YOLODetector(BaseDetector):
                 conf = item["confidence"]
                 bbox = item["bbox"]
                 x1, y1, x2, y2 = item["pixel_coords"]
+                agreement = int(item.get("box_agreement", 1))
                 class_threshold = fire_conf if label == "fire" else smoke_conf
+                candidate_floor = fire_candidate if label == "fire" else smoke_candidate
 
                 bw = x2 - x1
                 bh = y2 - y1
                 if bw <= 4 or bh <= 4 or w <= 0 or h <= 0:
                     continue
 
-                # 1. Area filtering: Discard tiny noise (< 0.15% frame) and excessive smoke (> 85% frame)
+                # 1. Area filtering: discard tiny noise (<0.15% of frame) and over-large smoke boxes
                 norm_area = (float(bw) * float(bh)) / float(w * h)
                 if norm_area < 0.0015:
                     continue
                 if label == "smoke" and (norm_area > 0.85 or (bw / float(w) > 0.94 and bh / float(h) > 0.94)):
                     continue
 
-                # 2. Aspect ratio filtering: Discard extreme slivers (overhead lights or frame edges)
+                # 2. Aspect ratio filtering: discard extreme slivers (overhead lights, frame edges)
                 aspect_ratio = float(bw) / float(bh)
                 if aspect_ratio > 5.5 or aspect_ratio < 0.18:
                     continue
 
-                # 3. Chromaticity and physics verification filter
-                if label == "fire" and x2 > x1 and y2 > y1:
-                    crop = image_bgr[y1:y2, x1:x2]
-                    is_valid_flame, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
-                    if not is_valid_flame and conf < 0.92:
-                        continue
-                    if flame_ratio > 0.10:
-                        conf = min(0.99, conf + 0.06)
-                elif label == "smoke" and x2 > x1 and y2 > y1:
-                    crop = image_bgr[y1:y2, x1:x2]
-                    is_valid_smoke, _ = YOLODetector._verify_smoke_dispersion(crop)
-                    if not is_valid_smoke and conf < 0.90:
-                        continue
-
-                if conf < class_threshold:
+                # 3. Exclusion: a detected vest/helmet/worker is never fire. Without this, the
+                #    fire model's strongest false positives on real footage are hi-vis clothing.
+                if exclusion_rois and YOLODetector._overlaps_any(bbox, exclusion_rois):
                     continue
+
+                # 4. Physical corroboration -> fused evidence score (booster, never a gate)
+                evidence, phys = YOLODetector._fuse_fire_smoke_evidence(
+                    label, conf, image_bgr[max(0, y1):y2, max(0, x1):x2]
+                )
+
+                # 5. Emission policy: strong model score OR multi-box agreement OR strong physics.
+                strong_model = conf >= class_threshold
+                corroborated = agreement >= require_agreement
+                physics_strong = phys.get("corroboration", 0.0) >= 0.25
+                if evidence < candidate_floor:
+                    continue
+                if not (strong_model or corroborated or physics_strong):
+                    continue
+
+                # 6. Structure veto: a surface dominated by long straight edges is man-made.
+                #    Measured separation on real imagery - false positives (brick wall, concrete,
+                #    reflective webbing) score 0.63-0.74, genuine flame/smoke regions 0.09-0.32.
+                #    Smoke is amorphous by physics, so the veto is unconditional for it; flame can sit
+                #    behind grilles, glazing or beams, so fire is only vetoed below its alert floor
+                #    (a decisive reading is never thrown away).
+                alert_floor = max(
+                    float(getattr(
+                        settings,
+                        "FIRE_ALERT_CONFIDENCE" if label == "fire" else "SMOKE_ALERT_CONFIDENCE",
+                        0.35,
+                    )),
+                    class_threshold,
+                )
+                edge_ratio = float(phys.get("structure_edge_ratio") or 0.0)
+                if edge_ratio > structure_limit:
+                    if label == "smoke" or evidence < alert_floor:
+                        continue
 
                 detections.append(DetectionResult(
                     label=label,
-                    confidence=conf,
+                    confidence=round(min(0.99, evidence), 4),
                     bbox=bbox,
                     metadata={
                         "inference_time_ms": inf_time_ms,
                         "device": self.device,
                         "engine": "ONNXYOLORunner",
-                        "raw_pixel_coords": [x1, y1, x2, y2]
+                        "raw_pixel_coords": [x1, y1, x2, y2],
+                        "model_confidence": round(conf, 4),
+                        "box_agreement": agreement,
+                        "physics_valid": phys.get("valid"),
+                        "physics_corroboration": round(float(phys.get("corroboration", 0.0)), 4),
+                        "structure_edge_ratio": phys.get("structure_edge_ratio"),
+                        "evidence": "model+agreement" if corroborated else ("model" if strong_model else "physics"),
                     }
                 ))
 
@@ -366,32 +418,36 @@ class YOLODetector(BaseDetector):
                     if aspect_ratio > 5.5 or aspect_ratio < 0.18:
                         continue
 
-                    # -------------------------------------------------------------
-                    # Accuracy Enhancement: Chromaticity & Physics Verification Filter
-                    # -------------------------------------------------------------
-                    if matched_label == "fire" and rx2 > rx1 and ry2 > ry1:
-                        crop = image_bgr[ry1:ry2, rx1:rx2]
-                        is_valid_flame, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
-                        if not is_valid_flame and confidence < 0.92:
-                            continue
-                        if flame_ratio > 0.10:
-                            confidence = min(0.99, confidence + 0.06)
-
-                    elif matched_label == "smoke" and rx2 > rx1 and ry2 > ry1:
-                        crop = image_bgr[ry1:ry2, rx1:rx2]
-                        is_valid_smoke, _ = YOLODetector._verify_smoke_dispersion(crop)
-                        if not is_valid_smoke and confidence < 0.90:
-                            continue
-
-                    if confidence < class_threshold:
-                        continue
-
                     norm_bbox = BoundingBox(
                         x_min=max(0.0, min(1.0, x1 / w)),
                         y_min=max(0.0, min(1.0, y1 / h)),
                         x_max=max(0.0, min(1.0, x2 / w)),
                         y_max=max(0.0, min(1.0, y2 / h))
                     )
+
+                    # -------------------------------------------------------------
+                    # Exclusion: detected workers / PPE are never fire or smoke
+                    # -------------------------------------------------------------
+                    if exclusion_rois and YOLODetector._overlaps_any(norm_bbox, exclusion_rois):
+                        continue
+
+                    # -------------------------------------------------------------
+                    # Evidence fusion: physics corroboration boosts, structure damps.
+                    # Hard colour gates were removed - they discarded genuine fires scored
+                    # below 0.90 (measured: a real blaze the network scored 0.61).
+                    # -------------------------------------------------------------
+                    crop = image_bgr[ry1:ry2, rx1:rx2]
+                    evidence, phys = YOLODetector._fuse_fire_smoke_evidence(matched_label, confidence, crop)
+                    candidate_floor = (
+                        getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.18)
+                        if matched_label == "fire"
+                        else getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.16)
+                    )
+                    if evidence < candidate_floor:
+                        continue
+                    if confidence < class_threshold and phys.get("corroboration", 0.0) < 0.25:
+                        continue
+                    confidence = evidence
 
                     det_res = DetectionResult(
                         label=matched_label,
@@ -401,7 +457,10 @@ class YOLODetector(BaseDetector):
                             "inference_time_ms": inference_time_ms,
                             "device": self.device,
                             "half_fp16": self.half,
-                            "raw_pixel_coords": [int(x1), int(y1), int(x2), int(y2)]
+                            "raw_pixel_coords": [int(x1), int(y1), int(x2), int(y2)],
+                            "physics_valid": phys.get("valid"),
+                            "physics_corroboration": round(float(phys.get("corroboration", 0.0)), 4),
+                            "structure_edge_ratio": phys.get("structure_edge_ratio"),
                         }
                     )
                     detections.append(det_res)
@@ -420,6 +479,94 @@ class YOLODetector(BaseDetector):
         except Exception as e:
             logger.error(f"YOLODetector: Inference error on frame: {str(e)}")
             return self._detect_color_hsv(image_bgr, candidate_rois=None) if self._is_mock_fallback else []
+
+    @staticmethod
+    def _structure_edge_ratio(crop_bgr: np.ndarray) -> float:
+        """
+        Fraction of edge pixels explained by long straight segments.
+
+        Fire and smoke are amorphous: their silhouettes and internal texture contain no long
+        straight lines. Man-made surfaces that the model confuses with fire do - measured on real
+        footage, a white brick wall produced 0.64 and a high-vis vest with reflective webbing 0.67,
+        while genuine smoke/fire regions produced 0.21-0.28. The metric therefore discriminates
+        without relying on colour (which fails for orange-lit smoke).
+        """
+        import cv2
+        if crop_bgr is None or crop_bgr.size < 64:
+            return 0.0
+        try:
+            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 30, 100)
+            total = int(np.count_nonzero(edges))
+            if total < 24:
+                return 0.0
+            h, w = gray.shape[:2]
+            lines = cv2.HoughLinesP(
+                edges, 1, np.pi / 180.0, threshold=28,
+                minLineLength=max(12, int(0.22 * min(h, w))), maxLineGap=6
+            )
+            if lines is None:
+                return 0.0
+            segments = np.asarray(lines).reshape(-1, 4)
+            canvas = np.zeros_like(edges)
+            for sx1, sy1, sx2, sy2 in segments[:60]:
+                cv2.line(canvas, (int(sx1), int(sy1)), (int(sx2), int(sy2)), 255, 2)
+            straight = int(np.count_nonzero(cv2.bitwise_and(canvas, edges)))
+            return min(1.0, straight / float(total))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _fuse_fire_smoke_evidence(
+        label: str, model_confidence: float, crop_bgr: np.ndarray
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Combines the neural score with physical corroboration into a single evidence score.
+
+        Previously the physics verifiers acted as **hard gates** with a 0.90/0.92 escape hatch, so a
+        genuine fire the network scored at 0.61 was silently discarded for failing a colour test.
+        Corroboration is now a booster: strong colour/structure evidence lifts a weak score into
+        alertable range, and weak colour evidence cannot erase a confident detection. Structural
+        (straight-edge) evidence acts as a damper, because it is the cue that separates real flames
+        from brickwork, windows and reflective clothing.
+        """
+        phys: Dict[str, Any] = {"valid": None, "corroboration": 0.0, "structure_edge_ratio": None}
+        if crop_bgr is None or getattr(crop_bgr, "size", 0) < 16:
+            return float(model_confidence), phys
+
+        try:
+            if label == "fire":
+                is_valid, ratio = YOLODetector._verify_flame_chromaticity(crop_bgr)
+            else:
+                is_valid, ratio = YOLODetector._verify_smoke_dispersion(crop_bgr)
+        except Exception:
+            is_valid, ratio = False, 0.0
+
+        structure = YOLODetector._structure_edge_ratio(crop_bgr)
+        structure_limit = float(getattr(settings, "FIRE_STRUCTURE_EDGE_RATIO", 0.45))
+        corroboration = max(0.0, float(ratio))
+        if structure > structure_limit:
+            # Structured surface: keep a little of the colour evidence, discard the rest.
+            corroboration *= 0.15
+
+        weight = float(getattr(settings, "FIRE_PHYSICS_WEIGHT", 0.35))
+        evidence = float(model_confidence) + (1.0 - float(model_confidence)) * weight * corroboration
+
+        phys["valid"] = bool(is_valid)
+        phys["corroboration"] = corroboration
+        phys["structure_edge_ratio"] = round(structure, 3)
+        return min(0.99, evidence), phys
+
+    @staticmethod
+    def _overlaps_any(box: BoundingBox, others: List[BoundingBox], min_ioa: float = 0.55) -> bool:
+        """True when ``box`` is substantially covered by any of ``others`` (IoA test)."""
+        area = max(1e-9, (box.x_max - box.x_min) * (box.y_max - box.y_min))
+        for other in others:
+            inter_w = max(0.0, min(box.x_max, other.x_max) - max(box.x_min, other.x_min))
+            inter_h = max(0.0, min(box.y_max, other.y_max) - max(box.y_min, other.y_min))
+            if (inter_w * inter_h) / area >= min_ioa:
+                return True
+        return False
 
     @staticmethod
     def _verify_flame_chromaticity(crop_bgr: np.ndarray) -> Tuple[bool, float]:

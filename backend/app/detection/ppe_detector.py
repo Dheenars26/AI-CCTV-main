@@ -9,11 +9,14 @@ import time
 import hashlib
 import threading
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Set
+import cv2
+from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from app.config.settings import settings
 from app.detection.base import BaseDetector, DetectionResult, BoundingBox, DetectorStatus
+from app.detection.preprocess import prepare_worker_roi
+from app.detection.roi_refine import PPERoiRefiner, normalise_ppe_label, person_key
 from app.utils.logger import logger
 
 # Global model cache to avoid re-loading heavy weights across pipeline instances
@@ -75,6 +78,13 @@ class PPEDetector(BaseDetector):
         self._model: Any = None
         self._onnx_runner: Any = None
         self._is_mock_fallback: bool = False
+
+        # Worker-crop refinement state (per detector instance == per camera pipeline).
+        self._roi_refiner = PPERoiRefiner(
+            enabled=bool(getattr(settings, "ENABLE_PPE_ROI", True)),
+            max_persons=int(getattr(settings, "PPE_CROP_REFINE_MAX_PERSONS", 4)),
+        )
+        self._association_engine: Any = None
 
         self.initialize()
 
@@ -222,11 +232,17 @@ class PPEDetector(BaseDetector):
         image_bgr: Any,
         candidate_rois: Optional[List[BoundingBox]] = None,
         person_dets: Optional[List[DetectionResult]] = None,
+        required_equipment: Optional[List[str]] = None,
         **kwargs: Any
     ) -> List[DetectionResult]:
         """
         Executes PPE object detection on image frame.
-        Supports passing pre-detected person bounding boxes to bypass redundant Haar cascades.
+
+        :param person_dets: worker boxes from the dedicated person detector. Passing these is what
+               enables ROI refinement and removes the need for any OpenCV person fallback.
+        :param required_equipment: items the active PPE profile requires (default vest + goggles).
+               Only *missing* items are ever re-examined at high resolution, so compliance costs
+               nothing extra per frame.
         """
         if not getattr(settings, "AI_PPE_ENABLED", True) or image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
@@ -235,106 +251,13 @@ class PPEDetector(BaseDetector):
 
         # Route to ONNX Inference Engine if active
         if self._onnx_runner is not None:
-            predict_conf = min(
-                self.conf_threshold,
-                getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35),
-                getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22),
-                getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38)
+            return self._detect_onnx(
+                image_bgr=image_bgr,
+                person_dets=person_dets,
+                required_equipment=required_equipment,
+                h=h,
+                w=w,
             )
-            raw_dets, inference_time_ms = self._onnx_runner.predict(
-                image_bgr,
-                conf_threshold=predict_conf,
-                iou_threshold=self.iou_threshold,
-                target_classes=None
-            )
-            detections: List[DetectionResult] = []
-            for item in raw_dets:
-                raw_class_name = item["label"].lower().strip()
-                confidence = item["confidence"]
-                bbox = item["bbox"]
-                x1, y1, x2, y2 = item["pixel_coords"]
-
-                matched_label = None
-                if raw_class_name in ["person", "worker", "human"]:
-                    matched_label = "person"
-                elif raw_class_name in ["helmet", "hard_hat", "hardhat", "cap", "headgear"]:
-                    matched_label = "helmet"
-                elif raw_class_name in ["vest", "safety_vest", "safety vest", "jacket", "hivis", "waistcoat", "high_vis_vest", "reflective_vest"]:
-                    matched_label = "vest"
-                elif raw_class_name in ["mask", "face_mask", "n95", "respirator"]:
-                    matched_label = "mask"
-                elif raw_class_name in ["goggles", "glasses", "safety_glasses", "safety_glass", "safety glass", "eyewear", "eye_protection", "eye protection", "protective_glasses", "protective glasses", "spec", "specs", "spectacles", "safety_goggles", "safety goggles"]:
-                    matched_label = "goggles"
-                elif raw_class_name in ["gloves", "glove", "hand_protection"]:
-                    matched_label = "gloves"
-                elif raw_class_name in ["safety_shoes", "safety_shoe", "shoes", "shoe", "boots", "boot"]:
-                    matched_label = "safety_shoes"
-                elif self.target_classes and raw_class_name in self.target_classes:
-                    matched_label = raw_class_name
-
-                if not matched_label or (self.target_classes and matched_label not in self.target_classes and matched_label != "person"):
-                    continue
-
-                class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35) if matched_label == "vest" else (
-                    getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22) if matched_label == "goggles" else (
-                        getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40) if matched_label == "person" else getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38)
-                    )
-                )
-                if confidence < class_threshold:
-                    continue
-
-                detections.append(DetectionResult(
-                    label=matched_label,
-                    confidence=confidence,
-                    bbox=bbox,
-                    metadata={
-                        "detector_module": "PPEDetector",
-                        "engine": "ONNXYOLORunner",
-                        "inference_time_ms": inference_time_ms,
-                        "device": self.device,
-                        "raw_pixel_coords": [x1, y1, x2, y2]
-                    }
-                ))
-
-            # Active person detections from pipeline or ONNX output
-            if person_dets is not None and len(person_dets) > 0:
-                active_person_dets = list(person_dets)
-            else:
-                active_person_dets = [d for d in detections if d.label.lower() in ["person", "worker"]]
-                if not active_person_dets and (self._is_mock_fallback or self._model is None):
-                    from app.detection.person_detector import PersonDetector
-                    active_person_dets = PersonDetector._detect_opencv_person_fallback_static(image_bgr)
-                    detections.extend(active_person_dets)
-
-            # Optical Eye-Crop Verification for active workers lacking goggles
-            if active_person_dets and getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
-                existing_goggles = [d for d in detections if d.label.lower() == "goggles"]
-                workers_needing_glasses_check = []
-                for p_det in active_person_dets:
-                    has_goggles = False
-                    p_xmin, p_ymin, p_xmax, p_ymax = p_det.bbox.x_min, p_det.bbox.y_min, p_det.bbox.x_max, p_det.bbox.y_max
-                    p_h = max(0.01, p_ymax - p_ymin)
-                    for g in existing_goggles:
-                        g_cy = (g.bbox.y_min + g.bbox.y_max) / 2.0
-                        g_cx = (g.bbox.x_min + g.bbox.x_max) / 2.0
-                        if (p_xmin - 0.10) <= g_cx <= (p_xmax + 0.10) and (p_ymin - 0.15) <= g_cy <= (p_ymin + 0.55 * p_h):
-                            has_goggles = True
-                            break
-                    if not has_goggles:
-                        workers_needing_glasses_check.append(p_det)
-
-                if workers_needing_glasses_check:
-                    cv_glasses = self._detect_glasses_cv(image_bgr, workers_needing_glasses_check)
-                    if cv_glasses:
-                        detections.extend(cv_glasses)
-
-            # Standalone vest detection fallback if enabled
-            if "vest" not in {d.label.lower() for d in detections} and getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", False):
-                standalone_vests = self._detect_standalone_vest_hsv(image_bgr)
-                if standalone_vests:
-                    detections.extend(standalone_vests)
-
-            return self._apply_nms(detections, iou_threshold=0.50)
 
         if self._is_mock_fallback or self._model is None:
             if person_dets:
@@ -533,6 +456,351 @@ class PPEDetector(BaseDetector):
             logger.error(f"PPEDetector: Error during inference: {str(e)}")
             self.status = DetectorStatus.DEGRADED
             return []
+
+    # ------------------------------------------------------------------ #
+    # ONNX inference path (production path for the bundled weights)
+    # ------------------------------------------------------------------ #
+    def _class_thresholds(self, class_names: List[str]) -> Dict[Any, float]:
+        """
+        Builds per-class confidence floors from configuration.
+
+        A single global floor cannot serve both a 400-pixel torso vest and 4-pixel safety glasses:
+        measured on a real worker photo the model scores ``Goggles`` at 0.116 full-frame versus
+        0.25-0.31 on the head crop, so glasses legitimately live far below the vest's floor.
+        """
+        vest = float(getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35))
+        glasses = float(getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22))
+        person = float(getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40))
+        generic = float(getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38))
+        mapping: Dict[Any, float] = {}
+        for name in class_names:
+            canonical = normalise_ppe_label(name)
+            if canonical == "vest":
+                mapping[name] = vest
+            elif canonical == "goggles":
+                mapping[name] = glasses
+            elif canonical == "person":
+                mapping[name] = person
+            elif canonical is not None:
+                mapping[name] = generic
+        return mapping
+
+    def _detect_onnx(
+        self,
+        image_bgr: np.ndarray,
+        person_dets: Optional[List[DetectionResult]],
+        required_equipment: Optional[List[str]],
+        h: int,
+        w: int,
+    ) -> List[DetectionResult]:
+        """
+        Full-frame inference -> worker resolution -> ROI refinement of missing items.
+        """
+        class_names = self._onnx_runner.class_names  # type: ignore[union-attr]
+        thresholds = self._class_thresholds(class_names) if class_names else None
+        predict_conf = min(
+            self.conf_threshold,
+            float(getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35)),
+            float(getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22)),
+        )
+
+        raw_dets, inference_time_ms = self._onnx_runner.predict(  # type: ignore[union-attr]
+            image_bgr,
+            conf_threshold=predict_conf,
+            iou_threshold=self.iou_threshold,
+            target_classes=None,
+            class_thresholds=thresholds,
+            adaptive_small_classes=True,
+        )
+
+        detections: List[DetectionResult] = []
+        for item in raw_dets:
+            canonical = normalise_ppe_label(item["label"])
+            if canonical is None:
+                # Negative heads (NO-Safety Vest / NO-Goggles / Fall-Detected ...) are rejected here
+                # on purpose: they describe absent equipment, so admitting them would fabricate PPE.
+                continue
+            if self.target_classes and canonical not in self.target_classes and canonical != "person":
+                continue
+            if canonical == "person":
+                label = "person"
+                threshold = float(getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40))
+            else:
+                label = canonical
+                threshold = thresholds.get(item["label"], item.get("confidence", 0.0)) if thresholds else 0.0
+            if float(item["confidence"]) < threshold:
+                continue
+
+            x1, y1, x2, y2 = item["pixel_coords"]
+            detections.append(DetectionResult(
+                label=label,
+                confidence=float(item["confidence"]),
+                bbox=item["bbox"],
+                metadata={
+                    "detector_module": "PPEDetector",
+                    "engine": "ONNXYOLORunner",
+                    "inference_time_ms": inference_time_ms,
+                    "device": self.device,
+                    "raw_pixel_coords": [x1, y1, x2, y2],
+                    "raw_class": item["label"],
+                    "box_agreement": item.get("box_agreement", 1),
+                },
+            ))
+
+        model_persons = [d for d in detections if d.label == "person"]
+
+        # -------------------------------------------------------------- #
+        # Worker resolution. The pipeline supplies worker boxes from the dedicated person
+        # detector (yolov8n) and those are authoritative.
+        #
+        # NOTE: the OpenCV Haar/skin fallback used to run here whenever ``self._model is None``,
+        # which is exactly the case in the ONNX deployment - it injected fabricated person boxes
+        # (fixed 0.86/0.88 confidence) on scenes containing no people at all, and every phantom
+        # worker then produced a phantom PPE violation. It now only runs when *no* neural backend
+        # is available in any form.
+        # -------------------------------------------------------------- #
+        if person_dets:
+            active_person_dets = list(person_dets)
+        else:
+            active_person_dets = list(model_persons)
+
+        # -------------------------------------------------------------- #
+        # ROI refinement: look harder at the body region of anything still missing.
+        # -------------------------------------------------------------- #
+        if active_person_dets and getattr(settings, "ENABLE_PPE_ROI", True):
+            required = [str(e).lower() for e in (required_equipment or ["vest", "goggles"])]
+            missing_by_person = self._missing_items_by_person(
+                active_person_dets, detections, required
+            )
+            if missing_by_person and self._should_refine_now():
+                extra = self._roi_refiner.refine(
+                    image_bgr,
+                    active_person_dets,
+                    missing_by_person,
+                    infer_fn=lambda crop: self._infer_crop(crop),
+                )
+                if extra:
+                    detections.extend(extra)
+
+        # -------------------------------------------------------------- #
+        # Hi-vis corroboration for workers still considered bare-chested.
+        #
+        # The bundled PPE model has near-zero recall for a back-facing high-visibility vest
+        # (measured: 0.00 on a 500x562 worker wearing an orange vest, at full frame and at torso
+        # resolution). Rather than leave that worker in violation, a physical test is applied:
+        # fluorescent fabric PLUS the retroreflective silver band that every EN ISO 20471 garment
+        # carries, both measured *inside the worker's torso box only*.
+        #
+        # Measured separation (torso crops): garment present -> colour 0.063-0.145 with silver
+        # 0.131-0.242; a fireman in tan turnout gear -> 0.000/0.003; a worker in a red plaid shirt
+        # beside bright machinery -> 0.120 colour but only 0.026 silver. Requiring both cues is what
+        # makes the check safe, and it can only ever *clear* a worker - it never creates a violation.
+        # -------------------------------------------------------------- #
+        if active_person_dets and getattr(settings, "ENABLE_VEST_HIVIS_CORROBORATION", True):
+            for person in active_person_dets:
+                if not self._person_needs_vest(person, detections, required_equipment):
+                    continue
+                px1, py1, px2, py2 = person.bbox.to_pixel_coords(w, h)
+                _, torso_roi = prepare_worker_roi((px1, py1, px2, py2), w, h)
+                tx1, ty1, tx2, ty2 = torso_roi
+                torso_crop = image_bgr[ty1:ty2, tx1:tx2]
+                found, stats = self._hivis_torso_evidence(torso_crop)
+                if found:
+                    detections.append(DetectionResult(
+                        label="vest",
+                        confidence=round(min(0.55, 0.30 + 0.25 * min(1.0, stats["silver_ratio"] / 0.20)), 4),
+                        bbox=person.bbox,
+                        metadata={
+                            "detector_module": "PPEDetector",
+                            "engine": "OpenCV-HiVis-Corroboration",
+                            "hivis_color_ratio": round(stats["color_ratio"], 4),
+                            "hivis_silver_ratio": round(stats["silver_ratio"], 4),
+                            "evidence": "hivis_corroboration",
+                        },
+                    ))
+
+        # Legacy OpenCV glasses heuristic: off on the neural path by default. It fabricates framed
+        # "goggles" from geometric features at 0.78-0.96 confidence and was measured firing on
+        # warehouse-fire imagery. The ROI refinement above supersedes it with model evidence.
+        if getattr(settings, "ENABLE_CV_GLASSES_FALLBACK_ON_NEURAL_PATH", False):
+            if active_person_dets and getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
+                existing_goggles = [d for d in detections if d.label == "goggles"]
+                pending = []
+                for p_det in active_person_dets:
+                    has_goggles = False
+                    p_h = max(0.01, p_det.bbox.y_max - p_det.bbox.y_min)
+                    for g in existing_goggles:
+                        g_cy = (g.bbox.y_min + g.bbox.y_max) / 2.0
+                        g_cx = (g.bbox.x_min + g.bbox.x_max) / 2.0
+                        if (p_det.bbox.x_min - 0.10) <= g_cx <= (p_det.bbox.x_max + 0.10) and \
+                                (p_det.bbox.y_min - 0.15) <= g_cy <= (p_det.bbox.y_min + 0.55 * p_h):
+                            has_goggles = True
+                            break
+                    if not has_goggles:
+                        pending.append(p_det)
+                if pending:
+                    detections.extend(self._detect_glasses_cv(image_bgr, pending))
+
+        if "vest" not in {d.label for d in detections} and getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", False):
+            detections.extend(self._detect_standalone_vest_hsv(image_bgr))
+
+        detections = self._apply_nms(detections, iou_threshold=0.50)
+
+        # -------------------------------------------------------------- #
+        # Association gate: equipment that belongs to nobody is not reported.
+        # A "safety vest" hallucinated over a yellow machine, or a leftover box after a worker
+        # leaves the frame, would otherwise be drawn as "Safety Vest Found" forever.
+        # -------------------------------------------------------------- #
+        if getattr(settings, "PPE_REQUIRE_PERSON_ASSOCIATION", True) and active_person_dets:
+            detections = self._keep_associated_equipment(detections, active_person_dets)
+
+        return detections
+
+    def _keep_associated_equipment(
+        self,
+        detections: List[DetectionResult],
+        persons: List[DetectionResult],
+    ) -> List[DetectionResult]:
+        """
+        Drops equipment detections that cannot be attributed to any worker body region.
+
+        When no worker is visible the equipment list is returned untouched: a vest held up to the
+        camera is a legitimate standalone finding, and an empty-frame case should not silently
+        discard evidence.
+        """
+        if not persons:
+            return detections
+        from app.safety.association import PPEAssociationEngine
+
+        engine = self._association_engine or PPEAssociationEngine()
+        kept: List[DetectionResult] = []
+        for det in detections:
+            if det.label == "person" or det.metadata.get("evidence") == "hivis_corroboration":
+                kept.append(det)
+                continue
+            if any(engine._is_ppe_on_person(p.bbox, det.bbox, det.label) for p in persons):
+                kept.append(det)
+            else:
+                det.metadata["rejected"] = "unassociated_with_worker"
+        return kept
+
+    def _person_needs_vest(
+        self,
+        person: DetectionResult,
+        detections: List[DetectionResult],
+        required_equipment: Optional[List[str]],
+    ) -> bool:
+        """True when this worker still has no vest associated with their torso region."""
+        required = [str(e).lower() for e in (required_equipment or ["vest", "goggles"])]
+        if not any(normalise_ppe_label(item) == "vest" for item in required):
+            return False
+        from app.safety.association import PPEAssociationEngine
+
+        engine = self._association_engine or PPEAssociationEngine()
+        for det in detections:
+            if det.label != "vest":
+                continue
+            if engine._is_ppe_on_person(person.bbox, det.bbox, "vest"):
+                return False
+        return True
+
+    @staticmethod
+    def _hivis_torso_evidence(torso_crop: np.ndarray) -> Tuple[bool, Dict[str, float]]:
+        """
+        Tests a worker torso crop for high-visibility garment evidence.
+
+        Two independent physical cues must both be present:
+          * fluorescent colour - lime (H 25-90) or orange (H 5-22 / 172-179) at high saturation
+            and high value, which is what makes EN ISO 20471 fabric fluorescent;
+          * a retroreflective band - near-neutral, very bright pixels (S <= 55, V >= 150), which no
+            ordinary bright-coloured shirt produces.
+
+        :returns: ``(found, stats)`` with the two measured ratios.
+        """
+        stats = {"color_ratio": 0.0, "silver_ratio": 0.0, "mean_value": 0.0}
+        if torso_crop is None or torso_crop.size == 0:
+            return False, stats
+        th, tw = torso_crop.shape[:2]
+        if th < 40 or tw < 40:
+            return False, stats
+
+        hsv = cv2.cvtColor(torso_crop, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = cv2.split(hsv)
+
+        lime = (h_ch >= 25) & (h_ch <= 90) & (s_ch >= 110) & (v_ch >= 140)
+        orange = ((h_ch >= 5) & (h_ch <= 22) | (h_ch >= 172)) & (s_ch >= 120) & (v_ch >= 140)
+        color_mask = lime | orange
+        silver_mask = (s_ch <= 55) & (v_ch >= 150)
+
+        total = float(th * tw)
+        stats["color_ratio"] = float(np.count_nonzero(color_mask)) / total
+        stats["silver_ratio"] = float(np.count_nonzero(silver_mask)) / total
+        if np.any(color_mask):
+            stats["mean_value"] = float(np.mean(v_ch[color_mask]))
+
+        found = (
+            stats["color_ratio"] >= float(getattr(settings, "VEST_HIVIS_MIN_COLOR_RATIO", 0.06))
+            and stats["silver_ratio"] >= float(getattr(settings, "VEST_HIVIS_MIN_SILVER_RATIO", 0.10))
+        )
+        return found, stats
+
+    def _should_refine_now(self) -> bool:
+        """
+        Paces ROI refinement to every Nth worker frame.
+
+        Refinement is an evidence-*accumulation* step, not a per-frame requirement: the PPE state
+        machine needs ~1.2 s of sustained evidence before it acts, so running the extra inference on
+        alternate worker frames reaches the same decision within the same window while halving its
+        cost. Set ``PPE_ROI_REFINE_EVERY_N=1`` to refine on every frame.
+        """
+        every_n = max(1, int(getattr(settings, "PPE_ROI_REFINE_EVERY_N", 2)))
+        if every_n == 1:
+            return True
+        self._roi_refine_tick = getattr(self, "_roi_refine_tick", 0) + 1
+        return (self._roi_refine_tick % every_n) == 0
+
+    def _infer_crop(self, crop: np.ndarray) -> List[Tuple[str, float, Tuple[float, float, float, float]]]:
+        """Runs the PPE network on a worker crop and returns ``(raw_label, conf, xyxy)`` rows."""
+        results, _ = self._onnx_runner.predict(  # type: ignore[union-attr]
+            crop, conf_threshold=0.15, iou_threshold=0.45, adaptive_small_classes=True
+        )
+        rows: List[Tuple[str, float, Tuple[float, float, float, float]]] = []
+        for item in results:
+            x1, y1, x2, y2 = item["pixel_coords"]
+            rows.append((item["label"], float(item["confidence"]), (float(x1), float(y1), float(x2), float(y2))))
+        return rows
+
+    def _missing_items_by_person(
+        self,
+        persons: List[DetectionResult],
+        detections: List[DetectionResult],
+        required: List[str],
+    ) -> Dict[int, List[str]]:
+        """
+        Maps each worker to the required items currently **absent** from their body region.
+
+        The body-region geometry is reused from :class:`PPEAssociationEngine` so the refiner and the
+        association step can never disagree about what counts as "worn".
+        """
+        from app.safety.association import PPEAssociationEngine
+
+        engine = self._association_engine or PPEAssociationEngine()
+        equipment = [d for d in detections if d.label != "person"]
+        missing: Dict[int, List[str]] = {}
+        for idx, person in enumerate(persons):
+            pid = person_key(person, idx)
+            absent: List[str] = []
+            for item in required:
+                worn = any(
+                    engine._is_ppe_on_person(person.bbox, det.bbox, det.label)
+                    for det in equipment
+                    if engine._normalize_label(det.label) == engine._normalize_label(item)
+                )
+                if not worn:
+                    absent.append(engine._normalize_label(item))
+            if absent:
+                missing[int(pid)] = absent
+        return missing
 
     def _detect_cv_ppe_features(
         self,

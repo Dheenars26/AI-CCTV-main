@@ -19,6 +19,7 @@ from app.detection.verification import CameraVerificationEngine, VerifiedEvent
 from app.detection.fire_smoke_detector import FireSmokeDetector
 from app.detection.ppe_detector import PPEDetector
 from app.detection.person_detector import PersonDetector
+from app.detection.motion_gate import MotionGate
 from app.safety.tracker import PersonTracker
 from app.safety.association import PPEAssociationEngine
 from app.zones.engine import ZoneEngine
@@ -474,8 +475,16 @@ class StandardPostprocessor(BasePostprocessor):
                     self._draw_pill_badge(frame.image, badge_label, (x1, badge_y), is_found=True)
                     continue
 
-                # Fire & Smoke detection drawing with hardened confidence threshold
-                min_draw_conf = getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50) if "fire" in label else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
+                # Fire & Smoke overlay threshold = the *candidate* floor, not the alert floor.
+                # The detector deliberately reports real-but-weak evidence (a distant plume scored
+                # 0.21) so it can be corroborated over time; hiding it from the operator because it
+                # is below the alert floor would make the system look blind while it is in fact
+                # tracking the event.
+                min_draw_conf = (
+                    float(getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.14))
+                    if "fire" in label
+                    else float(getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.13))
+                )
                 if det.confidence < min_draw_conf:
                     continue
 
@@ -615,6 +624,18 @@ class FramePipeline:
         self.ppe_inference_interval_sec = ppe_inference_interval_sec
         self._last_ppe_inference_time: float = 0.0
 
+        # Motion gate: suppresses the worker/PPE branch on provably static frames.
+        self.motion_gate = MotionGate(
+            enabled=bool(getattr(settings, "AI_MOTION_GATE_ENABLED", True)),
+            min_area_ratio=float(getattr(settings, "AI_MOTION_MIN_AREA_RATIO", 0.0012)),
+            sweep_interval_seconds=float(getattr(settings, "AI_MOTION_SWEEP_SECONDS", 2.5)),
+        )
+        # Measured worker-branch cost; the scheduler interval is derived from it so the pipeline
+        # consumes frames at the rate it can actually finish them (no queue growth, no stale alerts).
+        self._adaptive_worker_interval: float = 0.0
+        self._worker_cost_ms_ema: float = 0.0
+        self._last_frame_latency_ms: float = 0.0
+
         # Subsystems
         self.verification_engine = verification_engine or CameraVerificationEngine(
             camera_id=camera_id,
@@ -629,7 +650,7 @@ class FramePipeline:
         self.ppe_verification_engine = PPETemporalVerificationEngine(
             camera_id=camera_id,
             min_consecutive_frames=getattr(settings, "PPE_VERIFICATION_FRAMES", 3),
-            min_duration_seconds=getattr(settings, "PPE_VERIFICATION_DURATION_SECONDS", 1.0)
+            min_duration_seconds=getattr(settings, "PPE_VERIFICATION_DURATION_SECONDS", 1.2)
         )
 
         self.postprocessor = postprocessor or StandardPostprocessor(debug_overlay=True)
@@ -639,6 +660,8 @@ class FramePipeline:
         self.active_ppe_profile: Optional[Dict[str, Any]] = None
         
         self._latest_detections: List[DetectionResult] = []
+        self._last_worker_analyses_objs: List[Any] = []
+        self._last_worker_analysis_time: float = 0.0
         self._latest_worker_analyses: List[Dict[str, Any]] = []
         self._latest_safety_zones: List[Dict[str, Any]] = []
         self._latest_is_frozen: bool = False
@@ -662,6 +685,54 @@ class FramePipeline:
     def set_ppe_profile(self, profile: Dict[str, Any]) -> None:
         with self._lock:
             self.active_ppe_profile = profile
+        # A profile change alters which items are "missing" and therefore which ROIs are examined;
+        # cached refiner conclusions from the previous profile are no longer valid.
+        refiner = getattr(self.ppe_detector, "_roi_refiner", None)
+        if refiner is not None:
+            refiner.forget()
+
+    def _required_equipment(self) -> List[str]:
+        """Required PPE items from the active profile, with helmet always excluded by design."""
+        profile = self.active_ppe_profile
+        raw_req = profile.get("required_equipment", ["vest", "goggles"]) if profile else ["vest", "goggles"]
+        required = [e for e in raw_req if str(e).lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
+        return required or ["vest", "goggles"]
+
+    def _observe_worker_cost(self, cost_ms: float) -> None:
+        """
+        Adapts the worker-branch cadence to the measured cost of that branch.
+
+        A fixed 250 ms interval on hardware that needs 600 ms per frame means every frame is
+        re-scheduled while the previous one is unfinished: the queue backs up, alerts arrive stale,
+        and the visual overlay strobes. Tracking the cost and aiming slightly above it keeps the
+        pipeline at its true throughput instead of at a configured fiction.
+        """
+        if not bool(getattr(settings, "PPE_ADAPTIVE_CADENCE", True)):
+            # Measurement / benchmarking mode: keep the requested interval untouched.
+            self._worker_cost_ms_ema = cost_ms
+            self._adaptive_worker_interval = 0.0
+            return
+
+        alpha = 0.3
+        if self._worker_cost_ms_ema <= 0:
+            self._worker_cost_ms_ema = cost_ms
+        else:
+            self._worker_cost_ms_ema = alpha * cost_ms + (1.0 - alpha) * self._worker_cost_ms_ema
+
+        target = (self._worker_cost_ms_ema / 1000.0) * 1.25
+        max_interval = float(getattr(settings, "PPE_MAX_INFERENCE_INTERVAL_SEC", 2.0))
+        self._adaptive_worker_interval = max(0.0, min(max_interval, target - self.ppe_inference_interval_sec))
+
+    def performance_stats(self) -> Dict[str, Any]:
+        """Per-camera AI timing/health telemetry for the metrics endpoint."""
+        return {
+            "camera_id": self.camera_id,
+            "worker_branch_cost_ms": round(self._worker_cost_ms_ema, 2),
+            "effective_worker_interval_sec": round(max(self.ppe_inference_interval_sec, self._adaptive_worker_interval), 3),
+            "last_frame_latency_ms": round(self._last_frame_latency_ms, 2),
+            "motion_gate": self.motion_gate.stats(),
+            "roi_refiner": dict(getattr(getattr(self.ppe_detector, "_roi_refiner", None), "last_report", {}) or {}),
+        }
 
     def process_frame(
         self,
@@ -675,7 +746,8 @@ class FramePipeline:
         """
         ts = timestamp or datetime.now(timezone.utc)
         now_ts = time.time()
-        
+        pipeline_t0 = time.perf_counter()
+
         # 1. Initialize Frame Data Structure
         frame = Frame(
             camera_id=self.camera_id,
@@ -707,15 +779,40 @@ class FramePipeline:
             return frame
 
         img: np.ndarray = frame.image
-        should_run_ppe = (now_ts - self._last_ppe_inference_time) >= self.ppe_inference_interval_sec
 
-        if should_run_ppe:
+        # ------------------------------------------------------------------ #
+        # 4.0 Scheduling & motion gate
+        #
+        # The worker branch (person + PPE + ROI refinement) is the expensive part of the pipeline;
+        # fire/smoke must stay responsive regardless. Two decisions are made here:
+        #   * worker inference runs on a *measured* cadence, not a fixed one - if a frame costs
+        #     300 ms, asking for a new one every 250 ms only builds queue pressure;
+        #   * nothing in the worker branch runs when the scene has been provably static and no worker
+        #     is tracked, which is both the biggest CPU saving and the removal of the OpenCV
+        #     phantom-worker failure mode.
+        # ------------------------------------------------------------------ #
+        effective_interval = max(self.ppe_inference_interval_sec, self._adaptive_worker_interval)
+        run_worker_frame = (now_ts - self._last_ppe_inference_time) >= effective_interval
+
+        if run_worker_frame:
+            # "Persons visible" must survive a single missed detection, otherwise one dropped frame
+            # can close the gate and freeze every PPE state machine at once.
+            has_recent_workers = self.tracker.has_recent_tracks()
+            run_worker_frame = self.motion_gate.update(img, persons_visible=has_recent_workers)
+
+        if run_worker_frame:
             self._last_ppe_inference_time = now_ts
+            worker_t0 = time.perf_counter()
 
             # 4.1 Person Detector Execution (Run FIRST to provide fast YOLO worker bounding boxes)
             if self.person_enabled and self.person_detector:
                 try:
-                    p_res = self.person_detector.detect(img)
+                    import inspect
+                    sig = inspect.signature(self.person_detector.detect)
+                    if "motion_rois" in sig.parameters:
+                        p_res = self.person_detector.detect(img, motion_rois=self.motion_gate.motion_rois)
+                    else:
+                        p_res = self.person_detector.detect(img)
                     person_dets.extend(p_res)
                     all_detections.extend(p_res)
                 except Exception as e:
@@ -730,10 +827,12 @@ class FramePipeline:
                 try:
                     import inspect
                     sig = inspect.signature(self.ppe_detector.detect)
+                    call_kwargs: Dict[str, Any] = {}
                     if "person_dets" in sig.parameters:
-                        ppe_res = getattr(self.ppe_detector, "detect")(img, person_dets=person_dets)
-                    else:
-                        ppe_res = self.ppe_detector.detect(img)
+                        call_kwargs["person_dets"] = person_dets
+                    if "required_equipment" in sig.parameters:
+                        call_kwargs["required_equipment"] = self._required_equipment()
+                    ppe_res = self.ppe_detector.detect(img, **call_kwargs)
                     # Exclude helmet from detections per requirement
                     ppe_res = [d for d in ppe_res if d.label.lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
                     ppe_dets.extend(ppe_res)
@@ -746,26 +845,55 @@ class FramePipeline:
                 except Exception as e:
                     logger.error(f"Camera-{self.camera_id} PPEDetector execution error: {str(e)}")
 
-        # 4.3 Fire / Smoke Detector Execution (passes candidate ROIs from person/gear detections if supported)
+            # Adapt the cadence to the measured cost so request rate never exceeds capacity.
+            self._observe_worker_cost((time.perf_counter() - worker_t0) * 1000.0)
+
+        # 4.3 Fire / Smoke Detector Execution
+        #     Worker and PPE boxes are passed as *exclusion* ROIs: a hi-vis vest is the fire model's
+        #     strongest false positive on real footage (measured scoring the vest as flame), so
+        #     anything already identified as a person or their equipment can never be reported as fire.
         if self.fire_smoke_enabled and self.fire_smoke_detector:
             try:
-                candidate_rois = [d.bbox for d in all_detections] if all_detections else None
                 import inspect
                 sig = inspect.signature(self.fire_smoke_detector.detect)
+                call_kwargs = {}
                 if "candidate_rois" in sig.parameters:
-                    fs_res = self.fire_smoke_detector.detect(img, candidate_rois=candidate_rois)
-                else:
-                    fs_res = self.fire_smoke_detector.detect(img)
+                    call_kwargs["candidate_rois"] = None
+                if "exclusion_rois" in sig.parameters:
+                    exclusions = [
+                        d.bbox for d in all_detections
+                        if d.label.lower() in [
+                            "person", "worker", "vest", "helmet", "mask", "goggles", "gloves", "safety_shoes"
+                        ]
+                    ]
+                    call_kwargs["exclusion_rois"] = exclusions or None
+                fs_res = self.fire_smoke_detector.detect(img, **call_kwargs)
                 fire_smoke_dets.extend(fs_res)
                 all_detections.extend(fs_res)
             except Exception as e:
                 logger.error(f"Camera-{self.camera_id} FireSmokeDetector execution error: {str(e)}")
 
-        for det in all_detections:
+        # On a gated frame the worker branch produced no fresh evidence. Rather than present an
+        # empty frame to telemetry consumers, the still-fresh smoothed detections are republished
+        # and flagged, so a dashboard never flickers to "nothing detected" between AI cycles.
+        persisted: List[DetectionResult] = []
+        if not run_worker_frame:
+            fresh_labels = {(d.label, round(d.bbox.x_min, 2), round(d.bbox.y_min, 2)) for d in all_detections}
+            with self._lock:
+                for det, expiry in self._smoothed_detections.values():
+                    if expiry <= now_ts:
+                        continue
+                    key = (det.label, round(det.bbox.x_min, 2), round(det.bbox.y_min, 2))
+                    if key in fresh_labels:
+                        continue
+                    persisted.append(det)
+
+        for det in all_detections + persisted:
             det.camera_id = self.camera_id
-            det.timestamp = ts.isoformat()
+            if not det.timestamp:
+                det.timestamp = ts.isoformat()
             det.frame_info = frame_info
-        frame.detections = all_detections
+        frame.detections = all_detections + persisted
 
         now_ts = time.time()
         with self._lock:
@@ -793,24 +921,38 @@ class FramePipeline:
                 if not any(p_det.bbox.iou(k.bbox) >= 0.40 for k in all_person_dets):
                     all_person_dets.append(p_det)
 
-            if should_run_ppe or not self.tracker._tracked_persons:
+            # Only advance the tracker when the worker detectors actually ran this frame; otherwise
+            # the tracker would count a gated frame as "worker disappeared" and drop live tracks.
+            if run_worker_frame:
                 tracked_persons = self.tracker.update(all_person_dets)
             else:
                 tracked_persons = self.tracker.get_active_tracks()
 
         # Enforce vest & goggles (glasses) requirement; explicitly remove helmet
-        raw_req = current_profile.get("required_equipment", ["vest", "goggles"]) if current_profile else ["vest", "goggles"]
-        required_equipment = [e for e in raw_req if e.lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
-        if not required_equipment:
-            required_equipment = ["vest", "goggles"]
+        required_equipment = self._required_equipment()
 
-        worker_analyses = self.association_engine.associate(
-            camera_id=self.camera_id,
-            tracked_persons=tracked_persons,
-            ppe_detections=ppe_dets,
-            required_equipment=required_equipment,
-            timestamp=ts.isoformat()
-        )
+        # Re-associating on a frame where the worker branch did not run would feed the engine an
+        # empty PPE list and mark every tracked worker as "missing everything" - a fabricated
+        # violation generated purely by the scheduler. Only fresh evidence may produce fresh
+        # conclusions; otherwise the previous conclusions are reused while they are still recent.
+        if run_worker_frame:
+            worker_analyses = self.association_engine.associate(
+                camera_id=self.camera_id,
+                tracked_persons=tracked_persons,
+                ppe_detections=ppe_dets,
+                required_equipment=required_equipment,
+                timestamp=ts.isoformat()
+            )
+            self._last_worker_analyses_objs = list(worker_analyses)
+            self._last_worker_analysis_time = now_ts
+        else:
+            reuse_window = float(getattr(settings, "PPE_ANALYSIS_REUSE_SECONDS", 2.0))
+            if self._last_worker_analyses_objs and (now_ts - self._last_worker_analysis_time) <= reuse_window:
+                worker_analyses = list(self._last_worker_analyses_objs)
+                for analysis in worker_analyses:
+                    analysis.metadata["reused_from_gated_frame"] = True
+            else:
+                worker_analyses = []
         frame.metadata["worker_ppe_analyses"] = [w.to_dict() for w in worker_analyses]
 
         # 6. Stage 5: Safety Zone Evaluation Engine
@@ -880,8 +1022,15 @@ class FramePipeline:
         frame.metadata["safety_decisions"] = [s.to_dict() for s in safety_decisions]
 
         # 8. Stage 7: Temporal Detection & PPE Verification (False-Alarm Reduction State Machines)
+        #
+        # The PPE state machine is only advanced when the worker branch actually ran. Feeding it an
+        # empty analysis list - which is what a gated frame produces - would read as "every worker's
+        # violation disappeared" and clear live violations after three frames of a still scene.
         verified_events = self.verification_engine.process_frame_detections(fire_smoke_dets, frame_info)
-        verified_ppe_events = self.ppe_verification_engine.process_worker_analyses(worker_analyses)
+        verified_ppe_events = (
+            self.ppe_verification_engine.process_worker_analyses(worker_analyses)
+            if run_worker_frame else []
+        )
         all_verified = verified_events + verified_ppe_events
         frame.metadata["verified_events"] = [e.to_dict() for e in all_verified]
 
@@ -890,6 +1039,9 @@ class FramePipeline:
 
         # 10. Stage 9: Event Dispatcher (WebSocket / Notifications)
         self.event_manager.dispatch_frame_events(frame)
+
+        self._last_frame_latency_ms = (time.perf_counter() - pipeline_t0) * 1000.0
+        frame.metadata["pipeline_latency_ms"] = round(self._last_frame_latency_ms, 2)
 
         return frame
 

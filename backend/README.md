@@ -214,6 +214,87 @@ pytest tests/ -v
 
 ---
 
+## Detection Accuracy & Speed Engineering
+
+The fire / smoke / PPE detectors are tuned around one principle: **report broadly, alert narrowly**.
+A candidate is surfaced (overlay, WebSocket telemetry, detection log) from a relaxed floor so nothing
+is silently discarded, while an *alert* (email, webhook, incident, evidence clip) additionally requires
+the temporal state machine to see the same physical region across consecutive frames. Sensitivity and
+alarm trust are therefore decoupled instead of being traded against each other by a single threshold.
+
+### What was measured and fixed
+
+All figures below were produced by running the bundled weights (`models/fire_smoke.onnx`,
+`models/ppe.onnx`, `models/yolov8n.onnx`) over real imagery through `FramePipeline`.
+See *Validating on your own footage* below to reproduce them on your hardware.
+
+| Problem found | Root cause | Fix |
+| :--- | :--- | :--- |
+| Real fires and smoke produced **zero** detections (0 of 4 fire scenes) | The model's score was passed through a hard colour gate (`_verify_flame_chromaticity`) that rejected anything below 0.92 confidence; genuine blazes scored 0.15-0.61 | Physics is now a *booster*, not a gate: corroboration lifts weak-but-real evidence, structure (long straight edges) suppresses man-made surfaces. 3 of the 4 scenes now detect |
+| `Person` boxes vanished next to `Safety Vest` boxes | `cv2.dnn.NMSBoxes` is class agnostic - a vest box overlapping its worker suppressed the worker | Class-aware vectorised NMS (`app/detection/nms.py`) |
+| One hard hat produced 12 overlapping boxes; workers were counted twice | Low candidate threshold + plain NMS with no duplicate fusion | Weighted Box Fusion merges same-class clusters into one score-weighted box and reports an agreement count |
+| Phantom workers on scenes with **nobody** in them (fixed 0.86-0.88 confidence) | The OpenCV Haar/skin fallback ran whenever the model found no persons - i.e. exactly on empty scenes - and each phantom worker became a phantom PPE violation | Fallbacks only run when no neural backend exists at all |
+| Every worker was labelled "Safety Glasses Found" at 0.95-0.96 confidence, including firemen in helmets | A geometric CV heuristic (`_detect_glasses_cv`) fabricated glasses from brow-bar/rim patterns | Disabled on the neural path; replaced by model-based worker-crop refinement. `ENABLE_CV_GLASSES_FALLBACK_ON_NEURAL_PATH` restores it if you want it |
+| Safety glasses never detected (model scored 0.116) | Glasses occupy ~4 px in a 640-px full-frame pass | Worker-crop refinement re-runs the network on the head crop, where the same glasses score 0.25-0.42. Verified end-to-end: `goggles` now appears in the pipeline output |
+| Worker wearing a high-vis vest was flagged as non-compliant | The bundled PPE weights have near-zero recall for a back-facing vest (measured 0.00 at both full frame and torso crop) | Hi-vis corroboration: fluorescent fabric **plus** retroreflective silver band, measured inside the worker's torso box only. Clears a false violation; can never create one |
+| Events cleared or raised because of scheduler timing | Gated frames fed the association engine an empty PPE list (fabricating violations) and the PPE state machine an empty analysis list (clearing live violations) | No fresh evidence means no state change; previous conclusions are reused for a bounded window |
+| First inference after each start stalled for 100-400 ms | No warm-up, fresh ORT memory arena | Session warm-up on load + singleton session cache |
+
+### Speed
+
+| Scenario | Behaviour |
+| :--- | :--- |
+| Empty, motionless scene | Worker and PPE networks are skipped entirely (verified: 26.5 ms/frame, ~38 FPS on a 2-vCPU host, versus a periodic re-confirmation sweep before). A guaranteed sweep every `AI_MOTION_SWEEP_SECONDS` keeps a stale background model from hiding an intruder |
+| Scene with workers | The worker branch runs on a **measured** cadence: `_observe_worker_cost` tracks the branch's true cost and schedules the next run slightly above it. A fixed interval makes the system request work it cannot finish, which backs up the queue and delivers stale alerts |
+| ROI refinement cost | Refinement only runs for items that are *missing* (never for compliant workers), on one body region per invocation, on every Nth worker frame (`PPE_ROI_REFINE_EVERY_N`), with TTL-cached conclusions. A confirmed item is not re-checked for several seconds |
+| Post-processing | Fully vectorised decode; a per-class candidate cap bounds fusion cost on pathological frames |
+| ONNX Runtime | 2-4 intra-op threads (never `cores - 2` per session across three sessions), arena and memory-pattern reuse, `ORT_ENABLE_ALL` graph optimisation |
+
+### Validating on your own footage
+
+```bash
+# Accuracy + latency against labelled frames (label 20-50 frames per scene)
+python scripts/validate_detection.py --images ./my_frames --labels ./my_frames/labels.json --out ./annotated
+
+# Throughput on an idle versus occupied scene
+python scripts/validate_detection.py --benchmark
+```
+
+The labels format is documented at the top of the script. An image with an empty label object is
+treated as a negative, so the tool reports the metric that matters operationally: how often a camera
+that should be quiet raises something.
+
+### Tuning cheat-sheet
+
+| Symptom | Knob |
+| :--- | :--- |
+| Too many fire/smoke alerts | Raise `FIRE_ALERT_CONFIDENCE` / `SMOKE_ALERT_CONFIDENCE`; detections stay visible |
+| Missing real fire/smoke | Raise `FIRE_CANDIDATE_CONFIDENCE` only if you see noise; lower `FIRE_STRUCTURE_EDGE_RATIO` to be stricter about brick/glass/grille textures |
+| Missing safety glasses on distant workers | Lower `GLASSES_CONFIDENCE_THRESHOLD`, set `PPE_ROI_REFINE_EVERY_N=1`, raise `PPE_CROP_REFINE_MAX_PERSONS` |
+| Missed vests on back-facing workers | `VEST_HIVIS_MIN_COLOR_RATIO` / `VEST_HIVIS_MIN_SILVER_RATIO` (lower to catch more, raise to be stricter) |
+| CPU saturated / low FPS | Raise `PPE_INFERENCE_INTERVAL_SEC`, set `PPE_ROI_REFINE_EVERY_N=3`, disable `ENABLE_PERSON_ROI_REFINE` |
+| Slower hardware than expected | Check `pipeline.performance_stats()` for the measured worker-branch cost; set `PPE_ADAPTIVE_CADENCE=true` (default) so the cadence follows the measurement |
+| Need reproducible, ungated numbers | `PPE_ADAPTIVE_CADENCE=false` plus `PPE_ROI_REFINE_EVERY_N=1` (what `scripts/validate_detection.py` sets for its run) |
+
+### Known limitations (measured, not guessed)
+
+* **Turnout gear is out of distribution.** The bundled PPE weights were trained on industrial
+  workers; firefighters in tan turnout coats score 0.00 on every PPE head, so a fire scene with
+  responders will report PPE violations. The supported control is the per-camera profile
+  (`set_ppe_profile` / camera configuration): set `required_equipment` to what actually applies to
+  that camera's population, or to `[]` for cameras where PPE rules do not apply.
+* **No helmet detection by design.** Helmets are removed from the detection stream per requirement.
+  The PPE network does detect them (`Hardhat` scored 0.87), so re-enabling is a policy decision, not
+  a model change.
+* **Clear glasses remain hard.** Glasses are now detected when the head region is resolvable
+  (measured 0.25-0.42 on a head crop versus 0.116 full-frame), but a worker 40 m from a 1080p camera
+  has ~4 px of eyewear - below what any detector can resolve. Cameras covering PPE-critical areas
+  should be positioned or zoomed accordingly.
+* **The motion gate is not a replacement for the fire path.** Fire/smoke inference runs on every
+  frame regardless of motion, by design: a fire that starts in a still scene must still be seen.
+
+---
+
 ## Decoupled Architecture Guarantee
 
 The backend is **completely independent** of frontend frameworks:

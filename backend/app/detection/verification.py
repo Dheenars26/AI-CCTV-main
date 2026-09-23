@@ -87,18 +87,34 @@ class ClassVerificationTracker:
         self.camera_id = camera_id
         self.class_name = class_name
         cls_lower = class_name.lower()
+        # Per-frame floor: a *candidate* floor, not an alert gate. Confirming an alert additionally
+        # requires ``alert_min_confidence`` plus the persistence window below, so detection stays
+        # sensitive while the alert channel stays trustworthy.
         if cls_lower == "fire":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 7)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.4)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(
+                settings, "FIRE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
+            )
+            self.alert_min_confidence = max(
+                self.min_confidence,
+                getattr(settings, "FIRE_ALERT_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)),
+            )
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 6)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.2)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "VERIFICATION_COOLDOWN_SECONDS", 30.0)
         elif cls_lower == "smoke":
-            self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 9)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.2)
+            self.min_confidence = min_confidence if min_confidence is not None else getattr(
+                settings, "SMOKE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
+            )
+            self.alert_min_confidence = max(
+                self.min_confidence,
+                getattr(settings, "SMOKE_ALERT_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)),
+            )
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 8)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.0)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "SMOKE_ALERT_COOLDOWN_SECONDS", 30.0)
         else:
             self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
+            self.alert_min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
             self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 7
             self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 1.4
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else 30.0
@@ -181,7 +197,17 @@ class ClassVerificationTracker:
 
             # Transition 2: POSSIBLE -> CONFIRMED -> ALERT_SENT
             if self.state == EventState.POSSIBLE:
-                if (self.consecutive_frames >= self.min_consecutive_frames) and (duration >= self.min_duration_seconds):
+                sustained = (self.consecutive_frames >= self.min_consecutive_frames) and (duration >= self.min_duration_seconds)
+                if sustained and self.max_confidence < self.alert_min_confidence:
+                    # Persistent but weak: keep tracking as a visible detection without raising an
+                    # alert. Logged once per streak at debug level to avoid log spam.
+                    if self.consecutive_frames == self.min_consecutive_frames:
+                        logger.debug(
+                            f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "
+                            f"sustained low-confidence signal (max {round(self.max_confidence, 2)} < "
+                            f"alert floor {round(self.alert_min_confidence, 2)}); detection only."
+                        )
+                elif sustained:
                     self.state = EventState.CONFIRMED
                     logger.warning(
                         f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "

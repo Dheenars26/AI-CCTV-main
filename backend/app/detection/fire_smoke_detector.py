@@ -74,12 +74,24 @@ class FireSmokeDetector(BaseDetector):
             self.status = DetectorStatus.ERROR
             return False
 
-    def detect(self, image_bgr: Any, candidate_rois: Optional[List[BoundingBox]] = None, **kwargs: Any) -> List[DetectionResult]:
+    def detect(
+        self,
+        image_bgr: Any,
+        candidate_rois: Optional[List[BoundingBox]] = None,
+        exclusion_rois: Optional[List[BoundingBox]] = None,
+        **kwargs: Any
+    ) -> List[DetectionResult]:
+        """
+        :param exclusion_rois: worker/PPE boxes that must never be reported as fire (a hi-vis vest
+               is the single strongest false-positive source for the fire model).
+        """
         if not settings.AI_FIRE_SMOKE_ENABLED or self.status == DetectorStatus.ERROR or not self._yolo:
             return []
 
         try:
-            results = self._yolo.detect(image_bgr, candidate_rois=candidate_rois)
+            results = self._yolo.detect(
+                image_bgr, candidate_rois=candidate_rois, exclusion_rois=exclusion_rois
+            )
             for res in results:
                 res.metadata["detector_module"] = "FireSmokeDetector"
             return results
