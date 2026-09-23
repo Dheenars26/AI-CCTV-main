@@ -9,11 +9,14 @@ import time
 import hashlib
 import threading
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Set
+import cv2
+from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from app.config.settings import settings
 from app.detection.base import BaseDetector, DetectionResult, BoundingBox, DetectorStatus
+from app.detection.preprocess import prepare_worker_roi
+from app.detection.roi_refine import PPERoiRefiner, normalise_ppe_label, person_key
 from app.utils.logger import logger
 
 # Global model cache to avoid re-loading heavy weights across pipeline instances
@@ -75,6 +78,13 @@ class PPEDetector(BaseDetector):
         self._model: Any = None
         self._onnx_runner: Any = None
         self._is_mock_fallback: bool = False
+
+        # Worker-crop refinement state (per detector instance == per camera pipeline).
+        self._roi_refiner = PPERoiRefiner(
+            enabled=bool(getattr(settings, "ENABLE_PPE_ROI", True)),
+            max_persons=int(getattr(settings, "PPE_CROP_REFINE_MAX_PERSONS", 4)),
+        )
+        self._association_engine: Any = None
 
         self.initialize()
 
@@ -222,11 +232,17 @@ class PPEDetector(BaseDetector):
         image_bgr: Any,
         candidate_rois: Optional[List[BoundingBox]] = None,
         person_dets: Optional[List[DetectionResult]] = None,
+        required_equipment: Optional[List[str]] = None,
         **kwargs: Any
     ) -> List[DetectionResult]:
         """
         Executes PPE object detection on image frame.
-        Supports passing pre-detected person bounding boxes to bypass redundant Haar cascades.
+
+        :param person_dets: worker boxes from the dedicated person detector. Passing these is what
+               enables ROI refinement and removes the need for any OpenCV person fallback.
+        :param required_equipment: items the active PPE profile requires (default vest + goggles).
+               Only *missing* items are ever re-examined at high resolution, so compliance costs
+               nothing extra per frame.
         """
         if not getattr(settings, "AI_PPE_ENABLED", True) or image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
@@ -235,249 +251,13 @@ class PPEDetector(BaseDetector):
 
         # Route to ONNX Inference Engine if active
         if self._onnx_runner is not None:
-            predict_conf = min(
-                self.conf_threshold,
-                getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.30),
-                getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20),
-                getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.35)
+            return self._detect_onnx(
+                image_bgr=image_bgr,
+                person_dets=person_dets,
+                required_equipment=required_equipment,
+                h=h,
+                w=w,
             )
-            raw_dets, inference_time_ms = self._onnx_runner.predict(
-                image_bgr,
-                conf_threshold=predict_conf,
-                iou_threshold=self.iou_threshold,
-                target_classes=None
-            )
-            detections: List[DetectionResult] = []
-            for item in raw_dets:
-                raw_class_name = item["label"].lower().strip()
-                confidence = item["confidence"]
-                bbox = item["bbox"]
-                x1, y1, x2, y2 = item["pixel_coords"]
-
-                matched_label = None
-                if raw_class_name in ["person", "worker", "human"]:
-                    matched_label = "person"
-                elif raw_class_name in ["helmet", "hard_hat", "hardhat", "cap", "headgear"]:
-                    matched_label = "helmet"
-                elif raw_class_name in ["vest", "safety_vest", "safety vest", "hivis", "waistcoat", "high_vis_vest", "reflective_vest"]:
-                    matched_label = "vest"
-                elif raw_class_name in ["mask", "face_mask", "n95", "respirator"]:
-                    matched_label = "mask"
-                elif raw_class_name in ["goggles", "safety_glasses", "safety_glass", "safety glass", "eye_protection", "eye protection", "protective_glasses", "protective glasses", "safety_goggles", "safety goggles"]:
-                    matched_label = "goggles"
-                elif raw_class_name in ["gloves", "glove", "hand_protection"]:
-                    matched_label = "gloves"
-                elif raw_class_name in ["safety_shoes", "safety_shoe", "shoes", "shoe", "boots", "boot"]:
-                    matched_label = "safety_shoes"
-                elif self.target_classes and raw_class_name in self.target_classes:
-                    matched_label = raw_class_name
-
-                if not matched_label or (self.target_classes and matched_label not in self.target_classes and matched_label != "person"):
-                    continue
-
-                class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.30) if matched_label == "vest" else (
-                    getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20) if matched_label == "goggles" else (
-                        getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.38) if matched_label == "person" else getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.35)
-                    )
-                )
-                neg_score = item.get("negative_class_score", 0.0)
-                # Negative class suppression: only suppress if negative class score strictly exceeds positive confidence
-                if matched_label == "vest" and neg_score > 0 and neg_score > confidence:
-                    continue
-                if matched_label == "goggles" and neg_score > 0 and neg_score > confidence:
-                    continue
-                if confidence < class_threshold:
-                    continue
-
-                detections.append(DetectionResult(
-                    label=matched_label,
-                    confidence=confidence,
-                    bbox=bbox,
-                    metadata={
-                        "detector_module": "PPEDetector",
-                        "engine": "ONNXYOLORunner",
-                        "inference_time_ms": inference_time_ms,
-                        "device": self.device,
-                        "raw_pixel_coords": [x1, y1, x2, y2]
-                    }
-                ))
-
-            # Active person detections from pipeline or ONNX output
-            if person_dets is not None and len(person_dets) > 0:
-                active_person_dets = list(person_dets)
-            else:
-                active_person_dets = [d for d in detections if d.label.lower() in ["person", "worker"]]
-                if not active_person_dets:
-                    from app.detection.person_detector import PersonDetector
-                    if getattr(settings, "ENABLE_HIGHVIS_WORKER_ANCHOR", True):
-                        active_person_dets = PersonDetector._detect_highvis_vest_worker_anchor_static(image_bgr)
-                    if not active_person_dets and (self._is_mock_fallback or self._model is None):
-                        active_person_dets = PersonDetector._detect_opencv_person_fallback_static(image_bgr)
-                    if active_person_dets:
-                        detections.extend(active_person_dets)
-
-            # Goggles / Glasses False Positive Suppression (Inanimate plastic bottles, cups, wrappers, floor glare)
-            # Legitimate safety glasses must be worn on a worker's head / facial eye zone.
-            if detections:
-                filtered_dets: List[DetectionResult] = []
-                for d in detections:
-                    if d.label.lower() == "goggles":
-                        g_cx = (d.bbox.x_min + d.bbox.x_max) / 2.0
-                        g_cy = (d.bbox.y_min + d.bbox.y_max) / 2.0
-                        
-                        # Validate against detected workers: must be in head/eye zone
-                        is_on_worker_face = False
-                        if active_person_dets:
-                            for p in active_person_dets:
-                                p_w = max(0.01, p.bbox.x_max - p.bbox.x_min)
-                                p_h = max(0.01, p.bbox.y_max - p.bbox.y_min)
-                                x_near = (p.bbox.x_min - 0.15 * p_w) <= g_cx <= (p.bbox.x_max + 0.15 * p_w)
-                                cy_rel = (g_cy - p.bbox.y_min) / p_h
-                                # Human eyes/goggles are strictly in the upper facial region (-0.12 to 0.50)
-                                if x_near and -0.12 <= cy_rel <= 0.50:
-                                    is_on_worker_face = True
-                                    break
-                        if is_on_worker_face:
-                            filtered_dets.append(d)
-                        else:
-                            logger.debug(f"PPEDetector: Suppressed plastic/inanimate goggles proposal at cy={round(g_cy, 3)}")
-                    else:
-                        filtered_dets.append(d)
-                detections = filtered_dets
-
-            # Optical Eye-Crop Verification for active workers lacking goggles
-            if active_person_dets and getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
-                existing_goggles = [d for d in detections if d.label.lower() == "goggles"]
-                workers_needing_glasses_check = []
-                for p_det in active_person_dets:
-                    has_goggles = False
-                    p_xmin, p_ymin, p_xmax, p_ymax = p_det.bbox.x_min, p_det.bbox.y_min, p_det.bbox.x_max, p_det.bbox.y_max
-                    p_h = max(0.01, p_ymax - p_ymin)
-                    for g in existing_goggles:
-                        g_cy = (g.bbox.y_min + g.bbox.y_max) / 2.0
-                        g_cx = (g.bbox.x_min + g.bbox.x_max) / 2.0
-                        if (p_xmin - 0.10) <= g_cx <= (p_xmax + 0.10) and (p_ymin - 0.15) <= g_cy <= (p_ymin + 0.55 * p_h):
-                            has_goggles = True
-                            break
-                    if not has_goggles:
-                        workers_needing_glasses_check.append(p_det)
-
-                if workers_needing_glasses_check:
-                    cv_glasses = self._detect_glasses_cv(image_bgr, workers_needing_glasses_check)
-                    if cv_glasses:
-                        detections.extend(cv_glasses)
-
-            # Optical Torso Verification for active workers lacking vest
-            if active_person_dets and getattr(settings, "ENABLE_CV_VEST_DETECTION", True):
-                existing_vests = [d for d in detections if d.label.lower() == "vest"]
-                workers_needing_vest_check = []
-                for p_det in active_person_dets:
-                    p_xmin, p_ymin, p_xmax, p_ymax = p_det.bbox.x_min, p_det.bbox.y_min, p_det.bbox.x_max, p_det.bbox.y_max
-                    p_h = max(0.01, p_ymax - p_ymin)
-                    has_vest = False
-                    for v in existing_vests:
-                        v_cy = (v.bbox.y_min + v.bbox.y_max) / 2.0
-                        v_cx = (v.bbox.x_min + v.bbox.x_max) / 2.0
-                        if (p_xmin - 0.12) <= v_cx <= (p_xmax + 0.12) and (p_ymin + 0.05 * p_h) <= v_cy <= (p_ymax):
-                            has_vest = True
-                            break
-                    if not has_vest:
-                        workers_needing_vest_check.append(p_det)
-
-                if workers_needing_vest_check:
-                    cv_ppe = self._detect_cv_ppe_features(image_bgr, workers_needing_vest_check, detected_gear_types={"helmet", "mask", "goggles"})
-                    if cv_ppe:
-                        cv_vests = [d for d in cv_ppe if d.label.lower() == "vest"]
-                        detections.extend(cv_vests)
-
-            # High-Resolution Worker-Crop ONNX detail inference for active workers
-            if active_person_dets and self._onnx_runner is not None:
-                for p_det in active_person_dets[:4]:
-                    px1, py1, px2, py2 = p_det.bbox.to_pixel_coords(w, h)
-                    pw = px2 - px1
-                    ph = py2 - py1
-                    if pw >= 30 and ph >= 45:
-                        cx1 = max(0, px1 - int(pw * 0.10))
-                        cy1 = max(0, py1 - int(ph * 0.08))
-                        cx2 = min(w, px2 + int(pw * 0.10))
-                        cy2 = min(h, py1 + int(ph * 0.90))
-                        crop_bgr = image_bgr[cy1:cy2, cx1:cx2]
-                        if crop_bgr.size > 0:
-                            try:
-                                crop_raw_dets, _ = self._onnx_runner.predict(
-                                    crop_bgr,
-                                    conf_threshold=predict_conf,
-                                    iou_threshold=self.iou_threshold,
-                                    target_classes=None
-                                )
-                                ch_crop, cw_crop = crop_bgr.shape[:2]
-                                for c_item in crop_raw_dets:
-                                    c_raw_label = c_item["label"].lower().strip()
-                                    c_conf = c_item["confidence"]
-                                    c_matched = None
-                                    if c_raw_label in ["vest", "safety_vest", "safety vest", "hivis", "waistcoat", "high_vis_vest", "reflective_vest"]:
-                                        c_matched = "vest"
-                                    elif c_raw_label in ["goggles", "safety_glasses", "safety_glass", "safety glass", "eye_protection", "eye protection", "protective_glasses", "protective glasses", "safety_goggles", "safety goggles"]:
-                                        c_matched = "goggles"
-
-                                    class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.55) if c_matched == "vest" else getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20)
-                                    if c_matched and c_conf >= class_threshold:
-                                        c_px1, c_py1, c_px2, c_py2 = c_item["pixel_coords"]
-                                        if c_matched == "goggles" and ((c_py1 + c_py2) / (2.0 * max(1.0, ch_crop))) > 0.50:
-                                            continue
-                                        abs_x1 = max(0.0, min(float(w), float(cx1 + c_px1)))
-                                        abs_y1 = max(0.0, min(float(h), float(cy1 + c_py1)))
-                                        abs_x2 = max(0.0, min(float(w), float(cx1 + c_px2)))
-                                        abs_y2 = max(0.0, min(float(h), float(cy1 + c_py2)))
-                                        c_norm_box = BoundingBox(
-                                            x_min=abs_x1 / float(w),
-                                            y_min=abs_y1 / float(h),
-                                            x_max=abs_x2 / float(w),
-                                            y_max=abs_y2 / float(h)
-                                        )
-                                        detections.append(DetectionResult(
-                                            label=c_matched,
-                                            confidence=round(c_conf, 2),
-                                            bbox=c_norm_box,
-                                            metadata={
-                                                "detector_module": "PPEDetector-WorkerCropONNX",
-                                                "engine": "ONNXYOLORunner",
-                                                "raw_confidence": round(c_conf, 3),
-                                                "raw_pixel_coords": [int(abs_x1), int(abs_y1), int(abs_x2), int(abs_y2)]
-                                            }
-                                        ))
-                            except Exception as c_err:
-                                logger.debug(f"PPEDetector: ONNX worker crop notice: {c_err}")
-
-            # Register confirmed vest from PersonDetector-VestAnchor into PPE detections
-            if active_person_dets and "vest" not in {d.label.lower() for d in detections}:
-                for p_anchor in active_person_dets:
-                    if p_anchor.metadata.get("detector_module") == "PersonDetector-VestAnchor":
-                        # Reject floor plane anchors (doormats, low floor stripes)
-                        if p_anchor.bbox.y_min >= 0.50 or p_anchor.bbox.y_max >= 0.88:
-                            continue
-                        apx1, apy1, apx2, apy2 = p_anchor.bbox.to_pixel_coords(w, h)
-                        apw, aph = apx2 - apx1, apy2 - apy1
-                        vest_norm = BoundingBox(
-                            x_min=float(apx1 + int(apw * 0.12)) / float(w),
-                            y_min=float(apy1 + int(aph * 0.22)) / float(h),
-                            x_max=float(apx2 - int(apw * 0.12)) / float(w),
-                            y_max=float(apy1 + int(aph * 0.78)) / float(h)
-                        )
-                        detections.append(DetectionResult(
-                            label="vest",
-                            confidence=min(0.96, max(0.92, p_anchor.confidence)),
-                            bbox=vest_norm,
-                            metadata={"detector_module": "PPEDetector-VestAnchor"}
-                        ))
-
-            # Standalone vest detection fallback if enabled
-            if "vest" not in {d.label.lower() for d in detections} and getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", True):
-                standalone_vests = self._detect_standalone_vest_hsv(image_bgr)
-                if standalone_vests:
-                    detections.extend(standalone_vests)
-
-            return self._apply_nms(detections, iou_threshold=0.50)
 
         if self._is_mock_fallback or self._model is None:
             if person_dets:
@@ -535,11 +315,11 @@ class PPEDetector(BaseDetector):
                         matched_label = "person"
                     elif raw_class_name in ["helmet", "hard_hat", "hardhat", "cap", "headgear"]:
                         matched_label = "helmet"
-                    elif raw_class_name in ["vest", "safety_vest", "safety vest", "hivis", "waistcoat", "high_vis_vest", "reflective_vest"]:
+                    elif raw_class_name in ["vest", "safety_vest", "safety vest", "jacket", "hivis", "waistcoat", "high_vis_vest", "reflective_vest"]:
                         matched_label = "vest"
                     elif raw_class_name in ["mask", "face_mask", "n95", "respirator"]:
                         matched_label = "mask"
-                    elif raw_class_name in ["goggles", "safety_glasses", "safety_glass", "safety glass", "eye_protection", "eye protection", "protective_glasses", "protective glasses", "safety_goggles", "safety goggles"]:
+                    elif raw_class_name in ["goggles", "glasses", "safety_glasses", "safety_glass", "safety glass", "eyewear", "eye_protection", "eye protection", "spec", "specs", "spectacles", "safety_goggles", "safety goggles", "protective_glasses", "protective glasses"] and raw_class_name not in ["wine glass", "glass", "drinking glass"]:
                         matched_label = "goggles"
                     elif raw_class_name in ["gloves", "glove", "hand_protection"]:
                         matched_label = "gloves"
@@ -628,9 +408,9 @@ class PPEDetector(BaseDetector):
                                             c_raw_label = cr.names.get(c_cls_id, f"class_{c_cls_id}").lower().strip()
                                             c_conf = float(cbox.conf[0])
                                             c_matched = None
-                                            if c_raw_label in ["vest", "safety_vest", "hivis", "reflective_vest", "high_vis_vest"]:
+                                            if c_raw_label in ["vest", "safety_vest", "jacket", "hivis", "reflective_vest", "high_vis_vest"]:
                                                 c_matched = "vest"
-                                            elif c_raw_label in ["goggles", "safety_glasses", "eye_protection", "safety_goggles", "protective_glasses"]:
+                                            elif c_raw_label in ["goggles", "glasses", "safety_glasses", "eyewear", "eye_protection", "specs", "spectacles", "safety_goggles", "protective_glasses"]:
                                                 c_matched = "goggles"
                                             elif c_raw_label in ["gloves", "glove", "hand_protection"]:
                                                 c_matched = "gloves"
@@ -639,14 +419,9 @@ class PPEDetector(BaseDetector):
 
                                             class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.55) if c_matched == "vest" else getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20)
                                             if c_matched and c_conf >= class_threshold:
-                                                if hasattr(cbox.xyxy[0], "cpu"):
-                                                    c_xyxy = cbox.xyxy[0].cpu().numpy()
-                                                else:
-                                                    c_xyxy = np.array(cbox.xyxy[0])
-
                                                 # Localize safety vest and safety glasses strictly to upper-torso and facial regions
                                                 crop_h = max(1.0, float(crop_y2 - crop_y1))
-                                                c_cy_rel = (float(c_xyxy[1]) + float(c_xyxy[3])) / (2.0 * crop_h)
+                                                c_cy_rel = (c_xyxy[1] + c_xyxy[3]) / (2.0 * crop_h)
                                                 if c_matched == "goggles" and (c_cy_rel < -0.05 or c_cy_rel > 0.38):
                                                     continue
                                                 if c_matched == "vest" and (c_cy_rel < 0.12 or c_cy_rel > 0.82):
@@ -689,6 +464,351 @@ class PPEDetector(BaseDetector):
             logger.error(f"PPEDetector: Error during inference: {str(e)}")
             self.status = DetectorStatus.DEGRADED
             return []
+
+    # ------------------------------------------------------------------ #
+    # ONNX inference path (production path for the bundled weights)
+    # ------------------------------------------------------------------ #
+    def _class_thresholds(self, class_names: List[str]) -> Dict[Any, float]:
+        """
+        Builds per-class confidence floors from configuration.
+
+        A single global floor cannot serve both a 400-pixel torso vest and 4-pixel safety glasses:
+        measured on a real worker photo the model scores ``Goggles`` at 0.116 full-frame versus
+        0.25-0.31 on the head crop, so glasses legitimately live far below the vest's floor.
+        """
+        vest = float(getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35))
+        glasses = float(getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22))
+        person = float(getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40))
+        generic = float(getattr(settings, "PPE_CONFIDENCE_THRESHOLD", 0.38))
+        mapping: Dict[Any, float] = {}
+        for name in class_names:
+            canonical = normalise_ppe_label(name)
+            if canonical == "vest":
+                mapping[name] = vest
+            elif canonical == "goggles":
+                mapping[name] = glasses
+            elif canonical == "person":
+                mapping[name] = person
+            elif canonical is not None:
+                mapping[name] = generic
+        return mapping
+
+    def _detect_onnx(
+        self,
+        image_bgr: np.ndarray,
+        person_dets: Optional[List[DetectionResult]],
+        required_equipment: Optional[List[str]],
+        h: int,
+        w: int,
+    ) -> List[DetectionResult]:
+        """
+        Full-frame inference -> worker resolution -> ROI refinement of missing items.
+        """
+        class_names = self._onnx_runner.class_names  # type: ignore[union-attr]
+        thresholds = self._class_thresholds(class_names) if class_names else None
+        predict_conf = min(
+            self.conf_threshold,
+            float(getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.35)),
+            float(getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22)),
+        )
+
+        raw_dets, inference_time_ms = self._onnx_runner.predict(  # type: ignore[union-attr]
+            image_bgr,
+            conf_threshold=predict_conf,
+            iou_threshold=self.iou_threshold,
+            target_classes=None,
+            class_thresholds=thresholds,
+            adaptive_small_classes=True,
+        )
+
+        detections: List[DetectionResult] = []
+        for item in raw_dets:
+            canonical = normalise_ppe_label(item["label"])
+            if canonical is None:
+                # Negative heads (NO-Safety Vest / NO-Goggles / Fall-Detected ...) are rejected here
+                # on purpose: they describe absent equipment, so admitting them would fabricate PPE.
+                continue
+            if self.target_classes and canonical not in self.target_classes and canonical != "person":
+                continue
+            if canonical == "person":
+                label = "person"
+                threshold = float(getattr(settings, "PERSON_CONFIDENCE_THRESHOLD", 0.40))
+            else:
+                label = canonical
+                threshold = thresholds.get(item["label"], item.get("confidence", 0.0)) if thresholds else 0.0
+            if float(item["confidence"]) < threshold:
+                continue
+
+            x1, y1, x2, y2 = item["pixel_coords"]
+            detections.append(DetectionResult(
+                label=label,
+                confidence=float(item["confidence"]),
+                bbox=item["bbox"],
+                metadata={
+                    "detector_module": "PPEDetector",
+                    "engine": "ONNXYOLORunner",
+                    "inference_time_ms": inference_time_ms,
+                    "device": self.device,
+                    "raw_pixel_coords": [x1, y1, x2, y2],
+                    "raw_class": item["label"],
+                    "box_agreement": item.get("box_agreement", 1),
+                },
+            ))
+
+        model_persons = [d for d in detections if d.label == "person"]
+
+        # -------------------------------------------------------------- #
+        # Worker resolution. The pipeline supplies worker boxes from the dedicated person
+        # detector (yolov8n) and those are authoritative.
+        #
+        # NOTE: the OpenCV Haar/skin fallback used to run here whenever ``self._model is None``,
+        # which is exactly the case in the ONNX deployment - it injected fabricated person boxes
+        # (fixed 0.86/0.88 confidence) on scenes containing no people at all, and every phantom
+        # worker then produced a phantom PPE violation. It now only runs when *no* neural backend
+        # is available in any form.
+        # -------------------------------------------------------------- #
+        if person_dets:
+            active_person_dets = list(person_dets)
+        else:
+            active_person_dets = list(model_persons)
+
+        # -------------------------------------------------------------- #
+        # ROI refinement: look harder at the body region of anything still missing.
+        # -------------------------------------------------------------- #
+        if active_person_dets and getattr(settings, "ENABLE_PPE_ROI", True):
+            required = [str(e).lower() for e in (required_equipment or ["vest", "goggles"])]
+            missing_by_person = self._missing_items_by_person(
+                active_person_dets, detections, required
+            )
+            if missing_by_person and self._should_refine_now():
+                extra = self._roi_refiner.refine(
+                    image_bgr,
+                    active_person_dets,
+                    missing_by_person,
+                    infer_fn=lambda crop: self._infer_crop(crop),
+                )
+                if extra:
+                    detections.extend(extra)
+
+        # -------------------------------------------------------------- #
+        # Hi-vis corroboration for workers still considered bare-chested.
+        #
+        # The bundled PPE model has near-zero recall for a back-facing high-visibility vest
+        # (measured: 0.00 on a 500x562 worker wearing an orange vest, at full frame and at torso
+        # resolution). Rather than leave that worker in violation, a physical test is applied:
+        # fluorescent fabric PLUS the retroreflective silver band that every EN ISO 20471 garment
+        # carries, both measured *inside the worker's torso box only*.
+        #
+        # Measured separation (torso crops): garment present -> colour 0.063-0.145 with silver
+        # 0.131-0.242; a fireman in tan turnout gear -> 0.000/0.003; a worker in a red plaid shirt
+        # beside bright machinery -> 0.120 colour but only 0.026 silver. Requiring both cues is what
+        # makes the check safe, and it can only ever *clear* a worker - it never creates a violation.
+        # -------------------------------------------------------------- #
+        if active_person_dets and getattr(settings, "ENABLE_VEST_HIVIS_CORROBORATION", True):
+            for person in active_person_dets:
+                if not self._person_needs_vest(person, detections, required_equipment):
+                    continue
+                px1, py1, px2, py2 = person.bbox.to_pixel_coords(w, h)
+                _, torso_roi = prepare_worker_roi((px1, py1, px2, py2), w, h)
+                tx1, ty1, tx2, ty2 = torso_roi
+                torso_crop = image_bgr[ty1:ty2, tx1:tx2]
+                found, stats = self._hivis_torso_evidence(torso_crop)
+                if found:
+                    detections.append(DetectionResult(
+                        label="vest",
+                        confidence=round(min(0.55, 0.30 + 0.25 * min(1.0, stats["silver_ratio"] / 0.20)), 4),
+                        bbox=person.bbox,
+                        metadata={
+                            "detector_module": "PPEDetector",
+                            "engine": "OpenCV-HiVis-Corroboration",
+                            "hivis_color_ratio": round(stats["color_ratio"], 4),
+                            "hivis_silver_ratio": round(stats["silver_ratio"], 4),
+                            "evidence": "hivis_corroboration",
+                        },
+                    ))
+
+        # Legacy OpenCV glasses heuristic: off on the neural path by default. It fabricates framed
+        # "goggles" from geometric features at 0.78-0.96 confidence and was measured firing on
+        # warehouse-fire imagery. The ROI refinement above supersedes it with model evidence.
+        if getattr(settings, "ENABLE_CV_GLASSES_FALLBACK_ON_NEURAL_PATH", False):
+            if active_person_dets and getattr(settings, "ENABLE_CV_GLASSES_DETECTION", True):
+                existing_goggles = [d for d in detections if d.label == "goggles"]
+                pending = []
+                for p_det in active_person_dets:
+                    has_goggles = False
+                    p_h = max(0.01, p_det.bbox.y_max - p_det.bbox.y_min)
+                    for g in existing_goggles:
+                        g_cy = (g.bbox.y_min + g.bbox.y_max) / 2.0
+                        g_cx = (g.bbox.x_min + g.bbox.x_max) / 2.0
+                        if (p_det.bbox.x_min - 0.10) <= g_cx <= (p_det.bbox.x_max + 0.10) and \
+                                (p_det.bbox.y_min - 0.15) <= g_cy <= (p_det.bbox.y_min + 0.55 * p_h):
+                            has_goggles = True
+                            break
+                    if not has_goggles:
+                        pending.append(p_det)
+                if pending:
+                    detections.extend(self._detect_glasses_cv(image_bgr, pending))
+
+        if "vest" not in {d.label for d in detections} and getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", False):
+            detections.extend(self._detect_standalone_vest_hsv(image_bgr))
+
+        detections = self._apply_nms(detections, iou_threshold=0.50)
+
+        # -------------------------------------------------------------- #
+        # Association gate: equipment that belongs to nobody is not reported.
+        # A "safety vest" hallucinated over a yellow machine, or a leftover box after a worker
+        # leaves the frame, would otherwise be drawn as "Safety Vest Found" forever.
+        # -------------------------------------------------------------- #
+        if getattr(settings, "PPE_REQUIRE_PERSON_ASSOCIATION", True) and active_person_dets:
+            detections = self._keep_associated_equipment(detections, active_person_dets)
+
+        return detections
+
+    def _keep_associated_equipment(
+        self,
+        detections: List[DetectionResult],
+        persons: List[DetectionResult],
+    ) -> List[DetectionResult]:
+        """
+        Drops equipment detections that cannot be attributed to any worker body region.
+
+        When no worker is visible the equipment list is returned untouched: a vest held up to the
+        camera is a legitimate standalone finding, and an empty-frame case should not silently
+        discard evidence.
+        """
+        if not persons:
+            return detections
+        from app.safety.association import PPEAssociationEngine
+
+        engine = self._association_engine or PPEAssociationEngine()
+        kept: List[DetectionResult] = []
+        for det in detections:
+            if det.label == "person" or det.metadata.get("evidence") == "hivis_corroboration":
+                kept.append(det)
+                continue
+            if any(engine._is_ppe_on_person(p.bbox, det.bbox, det.label) for p in persons):
+                kept.append(det)
+            else:
+                det.metadata["rejected"] = "unassociated_with_worker"
+        return kept
+
+    def _person_needs_vest(
+        self,
+        person: DetectionResult,
+        detections: List[DetectionResult],
+        required_equipment: Optional[List[str]],
+    ) -> bool:
+        """True when this worker still has no vest associated with their torso region."""
+        required = [str(e).lower() for e in (required_equipment or ["vest", "goggles"])]
+        if not any(normalise_ppe_label(item) == "vest" for item in required):
+            return False
+        from app.safety.association import PPEAssociationEngine
+
+        engine = self._association_engine or PPEAssociationEngine()
+        for det in detections:
+            if det.label != "vest":
+                continue
+            if engine._is_ppe_on_person(person.bbox, det.bbox, "vest"):
+                return False
+        return True
+
+    @staticmethod
+    def _hivis_torso_evidence(torso_crop: np.ndarray) -> Tuple[bool, Dict[str, float]]:
+        """
+        Tests a worker torso crop for high-visibility garment evidence.
+
+        Two independent physical cues must both be present:
+          * fluorescent colour - lime (H 25-90) or orange (H 5-22 / 172-179) at high saturation
+            and high value, which is what makes EN ISO 20471 fabric fluorescent;
+          * a retroreflective band - near-neutral, very bright pixels (S <= 55, V >= 150), which no
+            ordinary bright-coloured shirt produces.
+
+        :returns: ``(found, stats)`` with the two measured ratios.
+        """
+        stats = {"color_ratio": 0.0, "silver_ratio": 0.0, "mean_value": 0.0}
+        if torso_crop is None or torso_crop.size == 0:
+            return False, stats
+        th, tw = torso_crop.shape[:2]
+        if th < 40 or tw < 40:
+            return False, stats
+
+        hsv = cv2.cvtColor(torso_crop, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = cv2.split(hsv)
+
+        lime = (h_ch >= 25) & (h_ch <= 90) & (s_ch >= 110) & (v_ch >= 140)
+        orange = ((h_ch >= 5) & (h_ch <= 22) | (h_ch >= 172)) & (s_ch >= 120) & (v_ch >= 140)
+        color_mask = lime | orange
+        silver_mask = (s_ch <= 55) & (v_ch >= 150)
+
+        total = float(th * tw)
+        stats["color_ratio"] = float(np.count_nonzero(color_mask)) / total
+        stats["silver_ratio"] = float(np.count_nonzero(silver_mask)) / total
+        if np.any(color_mask):
+            stats["mean_value"] = float(np.mean(v_ch[color_mask]))
+
+        found = (
+            stats["color_ratio"] >= float(getattr(settings, "VEST_HIVIS_MIN_COLOR_RATIO", 0.06))
+            and stats["silver_ratio"] >= float(getattr(settings, "VEST_HIVIS_MIN_SILVER_RATIO", 0.10))
+        )
+        return found, stats
+
+    def _should_refine_now(self) -> bool:
+        """
+        Paces ROI refinement to every Nth worker frame.
+
+        Refinement is an evidence-*accumulation* step, not a per-frame requirement: the PPE state
+        machine needs ~1.2 s of sustained evidence before it acts, so running the extra inference on
+        alternate worker frames reaches the same decision within the same window while halving its
+        cost. Set ``PPE_ROI_REFINE_EVERY_N=1`` to refine on every frame.
+        """
+        every_n = max(1, int(getattr(settings, "PPE_ROI_REFINE_EVERY_N", 2)))
+        if every_n == 1:
+            return True
+        self._roi_refine_tick = getattr(self, "_roi_refine_tick", 0) + 1
+        return (self._roi_refine_tick % every_n) == 0
+
+    def _infer_crop(self, crop: np.ndarray) -> List[Tuple[str, float, Tuple[float, float, float, float]]]:
+        """Runs the PPE network on a worker crop and returns ``(raw_label, conf, xyxy)`` rows."""
+        results, _ = self._onnx_runner.predict(  # type: ignore[union-attr]
+            crop, conf_threshold=0.15, iou_threshold=0.45, adaptive_small_classes=True
+        )
+        rows: List[Tuple[str, float, Tuple[float, float, float, float]]] = []
+        for item in results:
+            x1, y1, x2, y2 = item["pixel_coords"]
+            rows.append((item["label"], float(item["confidence"]), (float(x1), float(y1), float(x2), float(y2))))
+        return rows
+
+    def _missing_items_by_person(
+        self,
+        persons: List[DetectionResult],
+        detections: List[DetectionResult],
+        required: List[str],
+    ) -> Dict[int, List[str]]:
+        """
+        Maps each worker to the required items currently **absent** from their body region.
+
+        The body-region geometry is reused from :class:`PPEAssociationEngine` so the refiner and the
+        association step can never disagree about what counts as "worn".
+        """
+        from app.safety.association import PPEAssociationEngine
+
+        engine = self._association_engine or PPEAssociationEngine()
+        equipment = [d for d in detections if d.label != "person"]
+        missing: Dict[int, List[str]] = {}
+        for idx, person in enumerate(persons):
+            pid = person_key(person, idx)
+            absent: List[str] = []
+            for item in required:
+                worn = any(
+                    engine._is_ppe_on_person(person.bbox, det.bbox, det.label)
+                    for det in equipment
+                    if engine._normalize_label(det.label) == engine._normalize_label(item)
+                )
+                if not worn:
+                    absent.append(engine._normalize_label(item))
+            if absent:
+                missing[int(pid)] = absent
+        return missing
 
     def _detect_cv_ppe_features(
         self,
@@ -838,46 +958,20 @@ class PPEDetector(BaseDetector):
                             edges = cv2.Canny(torso_gray, 40, 140)
                             edge_density = float(np.sum(edges > 0)) / float(edges.size) if edges.size > 0 else 0.0
 
-                            # Horizontal and vertical retroreflective silver tape bands
-                            m_tape = cv2.inRange(torso_crop_hsv, np.array([0, 0, 175]), np.array([180, 55, 255]))
-                            kw_h = max(2, int((vx2 - vx1) * 0.05))
-                            kh_v = max(2, int((vy2 - vy1) * 0.05))
-                            tape_kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw_h, 1))
-                            m_tape_stripes_h = cv2.morphologyEx(m_tape, cv2.MORPH_OPEN, tape_kernel_h)
-                            tape_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh_v))
-                            m_tape_stripes_v = cv2.morphologyEx(m_tape, cv2.MORPH_OPEN, tape_kernel_v)
-                            m_tape_stripes = cv2.bitwise_or(m_tape_stripes_h, m_tape_stripes_v)
+                            m_tape = cv2.inRange(torso_crop_hsv, np.array([0, 0, 180]), np.array([180, 55, 255]))
+                            tape_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(4, int((vx2 - vx1) * 0.08)), 2))
+                            m_tape_stripes = cv2.morphologyEx(m_tape, cv2.MORPH_OPEN, tape_kernel)
                             tape_ratio = float(np.sum(m_tape_stripes > 0)) / float(m_tape.size) if m_tape.size > 0 else 0.0
 
-                            # High-contrast dark edge piping (must be INSIDE the torso fabric, not outside background borders)
-                            th, tw = torso_crop_hsv.shape[:2]
-                            inner_torso_mask = np.zeros((th, tw), dtype=np.uint8)
-                            inner_torso_mask[int(th * 0.05):int(th * 0.92), int(tw * 0.12):int(tw * 0.88)] = 255
-
-                            m_dark_raw = cv2.inRange(torso_crop_hsv, np.array([0, 0, 0]), np.array([180, 255, 60]))
-                            m_dark_piping = cv2.bitwise_and(m_dark_raw, inner_torso_mask)
-                            vest_adjacent = cv2.dilate(mask_vest, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
-                            m_dark_piping = cv2.bitwise_and(m_dark_piping, vest_adjacent)
-                            dark_piping_lines = cv2.morphologyEx(m_dark_piping, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 4)))
-                            dark_piping_ratio = float(np.sum(dark_piping_lines > 0)) / float(max(1, m_dark_piping.size))
-                            dark_ratio_raw = float(np.sum(m_dark_raw > 0)) / float(max(1, m_dark_raw.size))
-
-                            # Safety vest criteria:
-                            # 1. Fluorescent neon fabric with retroreflective tape bands (silver stripes)
-                            # 2. Fluorescent neon fabric with dark contrast piping / zipper lines
-                            # 3. High fluorescent neon fabric coverage (> 25%) with vest edge geometry
-                            # Note: Plain casual cotton shirts (uniform color without stripes, piping, or vest edge geometry) are rejected!
-                            has_reflective_tape = (tape_ratio >= 0.0015)
-                            has_dark_piping = (dark_piping_ratio >= 0.006 and dark_ratio_raw < 0.40)
-                            has_piping_or_stripes = has_reflective_tape or has_dark_piping
-                            has_vest_geometry = (edge_density >= 0.030 and has_piping_or_stripes)
-
-                            is_valid_vest = (
-                                ((vest_ratio >= 0.06 or (vest_ratio + tape_ratio) >= 0.14) and has_reflective_tape) or
-                                (vest_ratio >= 0.12 and has_dark_piping and edge_density >= 0.025) or
-                                (vest_ratio >= 0.20 and has_piping_or_stripes)
-                            )
-                            if is_valid_vest:
+                            # High-vis safety vest detection: fluorescent colour is necessary but never
+                            # sufficient. A plain yellow/orange garment is a t-shirt, not a vest - what
+                            # separates them is the retroreflective tape (or, failing that, real garment
+                            # structure such as seams, pockets and quilting). Previously any patch with
+                            # >28% fluorescent coverage passed on colour alone, so a uniformly coloured
+                            # shirt scored vest 0.95 with tape_ratio 0.0.
+                            has_tape = tape_ratio >= 0.001
+                            has_structure = edge_density >= 0.02
+                            if (vest_ratio >= 0.12 and has_tape) or (vest_ratio >= 0.16 and has_structure):
                                 norm_vest_box = BoundingBox(
                                     x_min=max(0.0, min(1.0, float(vx1) / float(proc_w))),
                                     y_min=max(0.0, min(1.0, float(vy1) / float(proc_h))),
@@ -966,12 +1060,6 @@ class PPEDetector(BaseDetector):
                 if orig_pw < 20 or orig_ph < 30:
                     continue
 
-                # Reject tall vertical architectural features (doors, walls, window grates)
-                if orig_py1 <= int(h * 0.06) and orig_py2 >= int(h * 0.85):
-                    continue
-                if orig_ph > int(h * 0.75) and float(orig_pw) / float(orig_ph) < 0.45:
-                    continue
-
                 aspect = float(orig_pw) / float(orig_ph)
                 if aspect <= 0.50:  # Full-body standing worker
                     ey1 = max(0, orig_py1 + int(orig_ph * 0.03))
@@ -985,7 +1073,7 @@ class PPEDetector(BaseDetector):
                     ex2 = min(w, orig_px2 - int(orig_pw * 0.08))
                 else:  # Close-up head / bust
                     ey1 = max(0, orig_py1 + int(orig_ph * 0.10))
-                    ey2 = min(h, orig_py1 + int(orig_ph * 0.38))
+                    ey2 = min(h, orig_py1 + int(orig_ph * 0.55))
                     ex1 = max(0, orig_px1 + int(orig_pw * 0.05))
                     ex2 = min(w, orig_px2 - int(orig_pw * 0.05))
 
@@ -1002,11 +1090,11 @@ class PPEDetector(BaseDetector):
 
                 # 1. Human Skin Verification Gate
                 # Rejects inanimate backgrounds (window panes, furniture, walls, floor tiles)
-                skin_m1 = cv2.inRange(eye_crop_hsv, np.array([0, 10, 30]), np.array([35, 230, 255]))
-                skin_m2 = cv2.inRange(eye_crop_hsv, np.array([160, 10, 30]), np.array([180, 230, 255]))
+                skin_m1 = cv2.inRange(eye_crop_hsv, np.array([0, 15, 35]), np.array([32, 210, 255]))
+                skin_m2 = cv2.inRange(eye_crop_hsv, np.array([168, 15, 35]), np.array([180, 210, 255]))
                 eye_skin_mask = cv2.bitwise_or(skin_m1, skin_m2)
                 skin_ratio = float(np.sum(eye_skin_mask > 0)) / float(max(1, eye_skin_mask.size))
-                if skin_ratio < 0.04:
+                if skin_ratio < 0.06:
                     continue
 
                 # 2. Enhanced Edge & Gradient Processing
@@ -1039,29 +1127,10 @@ class PPEDetector(BaseDetector):
                 frame_edges = horiz_edges[int(eh * 0.25):int(eh * 0.85), int(ew * 0.15):int(ew * 0.85)]
                 frame_edge_ratio = float(np.sum(frame_edges)) / float(max(1, frame_edges.size))
 
-                # Find closed contour loops (typical of rigid glasses frames/rims)
-                contours, _ = cv2.findContours(eye_edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-                closed_loops = 0
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
-                    bx, by, cbw, cbh = cv2.boundingRect(cnt)
-                    # Frame rim loops must have substantial size, non-degenerate aspect ratio, and not be tall vertical cylinders
-                    if area >= 60 and cbw >= 10 and cbh >= 8 and (cbh <= cbw * 1.6) and area <= (eh * ew * 0.35):
-                        perim = cv2.arcLength(cnt, True)
-                        if perim > 0 and (4 * np.pi * area / (perim * perim)) > 0.10:
-                            closed_loops += 1
-                has_frame_loops = (closed_loops >= 1)
-
-                # Specular Glare on Clear Polycarbonate Safety Lenses (V >= 190, S <= 65)
-                glare_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 190]), np.array([180, 65, 255]))
+                # Specular Glare on Clear Polycarbonate Safety Lenses (V >= 195, S <= 60)
+                glare_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 195]), np.array([180, 60, 255]))
                 glare_center = glare_mask[int(eh * 0.20):int(eh * 0.80), int(ew * 0.15):int(ew * 0.85)]
                 glare_ratio = float(np.sum(glare_center > 0)) / float(max(1, glare_center.size))
-
-                # Horizontal specular glint stripe across curved polycarbonate lens
-                glint_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(4, int(ew * 0.08)), 1))
-                glint_stripes = cv2.morphologyEx(glare_center, cv2.MORPH_OPEN, glint_kernel)
-                glint_ratio = float(np.sum(glint_stripes > 0)) / float(max(1, glare_center.size))
-                has_lens_glint = (glint_ratio >= 0.0025) or (glare_ratio >= 0.008)
 
                 # Dark / Wireframe Rims and Outer Temple Arms (V <= 85)
                 dark_mask = cv2.inRange(eye_crop_hsv, np.array([0, 0, 10]), np.array([180, 255, 85]))
@@ -1081,82 +1150,79 @@ class PPEDetector(BaseDetector):
                 neon_temples = np.concatenate([neon_mask[:, :max(1, int(ew * 0.18))], neon_mask[:, int(ew * 0.82):]], axis=1)
                 neon_ratio = float(np.sum(neon_temples > 0)) / float(max(1, neon_temples.size))
 
-                # OpenCV Pre-Trained Eyeglasses Haar Cascade Verification
-                has_cascade_glasses = False
-                if PPEDetector._eyeglasses_cascade_obj is not None and min(eh, ew) >= 18:
-                    try:
-                        detected_glasses = PPEDetector._eyeglasses_cascade_obj.detectMultiScale(
-                            eye_clahe,
-                            scaleFactor=1.1,
-                            minNeighbors=2,
-                            minSize=(max(10, int(ew * 0.15)), max(8, int(eh * 0.15)))
-                        )
-                        if len(detected_glasses) > 0:
-                            has_cascade_glasses = True
-                    except Exception:
-                        pass
-
-                # Multi-Modal Eyewear Confirmation Rules (Must have actual physical frame or lens evidence):
-                has_bilateral_rims = dual_orbit_rim or (left_lower_ratio >= 0.026 and right_lower_ratio >= 0.026)
-                has_unilateral_rim = (left_lower_ratio >= 0.028 or right_lower_ratio >= 0.028)
-
-                # 1. Dual Orbit Rim Symmetry with closed frame loops or lens glint
+                # Multi-Modal Eyewear Confirmation Rules:
+                # 1. Dual Orbit Rim Symmetry + Brow line or Frame edge (No bridge strictly required)
+                #    Shape alone is not enough: two bright creases in a plastic sheet or bag reproduce
+                #    "dual orbits". Require one material confirmation as well - an opaque frame, tinted
+                #    lens, neon temple or genuine specular glare on a polycarbonate lens.
+                # Opaque or tinted frame material. Specular glare is deliberately excluded here:
+                # a sheet of plastic, a bag or a polished panel produces glare without ever being
+                # eyewear, whereas an opaque frame, an amber lens or a neon temple is material a
+                # garment or a wall does not have.
+                _has_frame_material = (
+                    dark_rim_ratio >= 0.03
+                    or dark_temple_ratio >= 0.03
+                    or amber_ratio >= 0.04
+                    or neon_ratio >= 0.03
+                )
+                # Eyewear is worn *on a face*, and a face has dark structure in the eye band - pupils,
+                # irises, brows, lashes or the frame itself. A skin-toned flat surface with bright
+                # creases (a plastic sheet, a bag, a wall panel) has none. Without this, specular
+                # glints on any pale surface were read as lenses.
+                _facial_dark_feature = (
+                    dark_rim_ratio >= 0.005
+                    or dark_temple_ratio >= 0.005
+                    or amber_ratio > 0.0
+                    or neon_ratio > 0.0
+                )
                 is_dual_rim_glasses = (
-                    has_bilateral_rims and (
-                        (has_frame_loops and (has_bridge or brow_ratio >= 0.030)) or
-                        (has_lens_glint and has_bridge) or
-                        (dark_rim_ratio >= 0.045 and has_frame_loops)
-                    )
+                    dual_orbit_rim
+                    and (brow_ratio >= 0.035 or frame_edge_ratio >= 0.030 or has_bridge)
+                    and _has_frame_material
                 )
 
                 # 2. Structural Dark or Wireframe Frames
                 is_structural_dark_glasses = (
-                    has_bilateral_rims and has_frame_loops and (
-                        (dark_rim_ratio >= 0.040 and (has_bridge or brow_ratio >= 0.030)) or
-                        (dark_temple_ratio >= 0.06 and (has_bridge or dark_rim_ratio >= 0.035))
-                    )
+                    (dark_rim_ratio >= 0.06 or dark_temple_ratio >= 0.06) and
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.030 or brow_ratio >= 0.040)
                 )
 
-                # 3. Clear Polycarbonate Specular Glare & Reflections (Curved lens horizon or specular glints on eye rims)
+                # 3. Clear Polycarbonate Specular Glare & Reflections
                 is_clear_safety_glasses = (
-                    has_lens_glint and (
-                        has_cascade_glasses or
-                        (has_bilateral_rims and (has_bridge or brow_ratio >= 0.028 or has_frame_loops)) or
-                        (has_unilateral_rim and (has_bridge or brow_ratio >= 0.025 or dark_temple_ratio >= 0.035 or has_frame_loops))
-                    )
+                    glare_ratio >= 0.008 and
+                    _facial_dark_feature and
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025 or brow_ratio >= 0.035)
                 )
 
-                # 4. Classic Nasal Bridge + Closed Frame Contour
+                # 4. Classic Nasal Bridge + Frame Contour
                 is_bridge_and_contour_glasses = (
-                    has_bridge and has_frame_loops and (has_bilateral_rims or has_unilateral_rim) and (
-                        frame_edge_ratio >= 0.028 or dark_rim_ratio >= 0.038 or has_lens_glint
+                    has_bridge and
+                    (
+                        (frame_edge_ratio >= 0.032 and max(left_lower_ratio, right_lower_ratio) >= 0.040) or
+                        (dual_orbit_rim and _has_frame_material) or
+                        (dark_rim_ratio >= 0.06) or
+                        (glare_ratio >= 0.02)
                     )
                 )
 
                 # 5. Tinted / Amber Polycarbonate & Neon Safety Frame Accents
                 is_tinted_or_neon_glasses = (
                     (amber_ratio >= 0.06 or neon_ratio >= 0.04) and
-                    (has_cascade_glasses or has_frame_loops or (has_bilateral_rims and (has_bridge or frame_edge_ratio >= 0.025)) or
-                     (has_unilateral_rim and (has_bridge or dark_temple_ratio >= 0.035)))
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025)
                 )
 
-                # 6. Three-Quarter Angle / Profile View Eyewear (single dominant orbit rim with closed loop/glint)
-                is_three_quarter_profile_glasses = (
-                    has_unilateral_rim and (has_frame_loops or has_lens_glint) and (
-                        (has_bridge and (dark_rim_ratio >= 0.028 or brow_ratio >= 0.025)) or
-                        (dark_temple_ratio >= 0.040 and (brow_ratio >= 0.025 or dark_rim_ratio >= 0.028)) or
-                        (has_lens_glint and (brow_ratio >= 0.025 or dark_temple_ratio >= 0.030))
-                    )
-                )
-
+                # Every positive must stand on one of two physical facts: eyewear material is
+                # visible (opaque frame, tinted or neon lens/temple), or the crop contains real
+                # facial structure (dark pupils, irises, brows, lashes) that eyewear sits on. A
+                # pale flat surface with bright creases and glints satisfies neither, which is the
+                # exact shape of the plastic-sheet / bag false positive.
                 is_safety_glasses = (
-                    has_cascade_glasses or
-                    is_dual_rim_glasses or
-                    is_structural_dark_glasses or
-                    is_clear_safety_glasses or
-                    is_bridge_and_contour_glasses or
-                    is_tinted_or_neon_glasses or
-                    is_three_quarter_profile_glasses
+                    (is_dual_rim_glasses or
+                     is_structural_dark_glasses or
+                     is_clear_safety_glasses or
+                     is_bridge_and_contour_glasses or
+                     is_tinted_or_neon_glasses) and
+                    (_has_frame_material or _facial_dark_feature)
                 )
 
                 if is_safety_glasses:
@@ -1166,11 +1232,6 @@ class PPEDetector(BaseDetector):
                     gy1 = ey1 + int(eh * 0.12)
                     gy2 = ey1 + int(eh * 0.88)
 
-                    # Safety glasses are horizontal on the face (width >= height with slight tilt tolerance)
-                    # Reject tall vertical inanimate plastic items (e.g. plastic water bottles)
-                    if (gx2 - gx1) < int((gy2 - gy1) * 0.85):
-                        continue
-
                     norm_goggles_box = BoundingBox(
                         x_min=max(0.0, min(1.0, float(gx1) / float(w))),
                         y_min=max(0.0, min(1.0, float(gy1) / float(h))),
@@ -1178,15 +1239,9 @@ class PPEDetector(BaseDetector):
                         y_max=max(0.0, min(1.0, float(gy2) / float(h)))
                     )
 
-                    conf_boost = max(
-                        0.15 if has_cascade_glasses else 0.0,
-                        notch_ratio,
-                        glare_ratio * 2.0,
-                        dark_rim_ratio,
-                        dark_temple_ratio
-                    )
+                    conf_boost = max(notch_ratio, glare_ratio * 2.0, dark_rim_ratio, dark_temple_ratio)
                     conf = min(0.96, 0.78 + conf_boost * 0.8 + max(left_lower_ratio, right_lower_ratio) * 0.6)
-                    min_conf = getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20)
+                    min_conf = getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.22)
 
                     if conf >= min_conf:
                         results.append(DetectionResult(
@@ -1292,18 +1347,6 @@ class PPEDetector(BaseDetector):
                 x, y, cw, ch = cv2.boundingRect(cnt)
                 aspect_ratio = float(cw) / float(ch) if ch > 0 else 1.0
                 if 0.30 <= aspect_ratio <= 3.0 and cw < w * 0.98 and ch < h * 0.98:
-                    crop_vest_bgr = image_bgr[y:y+ch, x:x+cw]
-                    crop_vest_hsv = hsv[y:y+ch, x:x+cw]
-                    m_tape = cv2.inRange(crop_vest_hsv, np.array([0, 0, 180]), np.array([180, 55, 255]))
-                    tape_ratio = float(np.sum(m_tape > 0)) / float(max(1, m_tape.size))
-                    gray_vest = cv2.cvtColor(crop_vest_bgr, cv2.COLOR_BGR2GRAY)
-                    edges_vest = cv2.Canny(gray_vest, 40, 140)
-                    edge_density = float(np.sum(edges_vest > 0)) / float(max(1, edges_vest.size))
-
-                    # Must have retroreflective tape or structural boundary contrast
-                    if tape_ratio < 0.002 and edge_density < 0.025:
-                        continue
-
                     norm_bbox = BoundingBox(
                         x_min=max(0.0, min(1.0, float(x) / float(w))),
                         y_min=max(0.0, min(1.0, float(y) / float(h))),

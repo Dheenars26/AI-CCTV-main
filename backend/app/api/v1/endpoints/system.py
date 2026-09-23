@@ -10,6 +10,7 @@ from sqlalchemy import func, text
 
 from app.config.settings import settings
 from app.database.session import get_db
+from app.utils.logger import logger
 from app.models.camera import Camera
 from app.models.alert import Alert
 from app.models.detection import Detection
@@ -222,10 +223,10 @@ async def get_verification_settings(
     current_user: User = Depends(RequirePermission("system:status"))
 ):
     data = VerificationSettingsResponse(
-        fire_min_confidence=getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.35),
+        fire_min_confidence=getattr(settings, "FIRE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.35)),
         fire_min_consecutive_frames=getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 3),
         fire_min_duration_seconds=getattr(settings, "FIRE_MIN_DURATION_SECONDS", 0.5),
-        smoke_min_confidence=getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.30),
+        smoke_min_confidence=getattr(settings, "SMOKE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.30)),
         smoke_min_consecutive_frames=getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 4),
         smoke_min_duration_seconds=getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 0.8),
         ppe_verification_frames=getattr(settings, "PPE_VERIFICATION_FRAMES", 3),
@@ -247,7 +248,10 @@ async def update_verification_settings(
     current_user: User = Depends(RequireRole(["ADMIN", "MANAGER"]))
 ):
     if payload.fire_min_confidence is not None:
+        # One operator knob drives reporting and the per-frame temporal floor together; the alert
+        # floor stays a separate, deliberately higher gate (see README "Detection Accuracy").
         settings.FIRE_CONFIDENCE_THRESHOLD = payload.fire_min_confidence
+        settings.FIRE_VERIFICATION_MIN_CONFIDENCE = payload.fire_min_confidence
     if payload.fire_min_consecutive_frames is not None:
         settings.FIRE_MIN_CONSECUTIVE_FRAMES = payload.fire_min_consecutive_frames
     if payload.fire_min_duration_seconds is not None:
@@ -255,6 +259,7 @@ async def update_verification_settings(
 
     if payload.smoke_min_confidence is not None:
         settings.SMOKE_CONFIDENCE_THRESHOLD = payload.smoke_min_confidence
+        settings.SMOKE_VERIFICATION_MIN_CONFIDENCE = payload.smoke_min_confidence
     if payload.smoke_min_consecutive_frames is not None:
         settings.SMOKE_MIN_CONSECUTIVE_FRAMES = payload.smoke_min_consecutive_frames
     if payload.smoke_min_duration_seconds is not None:
@@ -276,12 +281,18 @@ async def update_verification_settings(
                 if hasattr(pipeline, "verification_engine") and pipeline.verification_engine:
                     ve = pipeline.verification_engine
                     if "fire" in ve.trackers:
-                        ve.trackers["fire"].min_confidence = settings.FIRE_CONFIDENCE_THRESHOLD
+                        ve.trackers["fire"].min_confidence = settings.FIRE_VERIFICATION_MIN_CONFIDENCE
+                        ve.trackers["fire"].alert_min_confidence = max(
+                            ve.trackers["fire"].min_confidence, settings.FIRE_ALERT_CONFIDENCE
+                        )
                         ve.trackers["fire"].min_consecutive_frames = settings.FIRE_MIN_CONSECUTIVE_FRAMES
                         ve.trackers["fire"].min_duration_seconds = settings.FIRE_MIN_DURATION_SECONDS
                         ve.trackers["fire"].cooldown_seconds = settings.VERIFICATION_COOLDOWN_SECONDS
                     if "smoke" in ve.trackers:
-                        ve.trackers["smoke"].min_confidence = settings.SMOKE_CONFIDENCE_THRESHOLD
+                        ve.trackers["smoke"].min_confidence = settings.SMOKE_VERIFICATION_MIN_CONFIDENCE
+                        ve.trackers["smoke"].alert_min_confidence = max(
+                            ve.trackers["smoke"].min_confidence, settings.SMOKE_ALERT_CONFIDENCE
+                        )
                         ve.trackers["smoke"].min_consecutive_frames = settings.SMOKE_MIN_CONSECUTIVE_FRAMES
                         ve.trackers["smoke"].min_duration_seconds = settings.SMOKE_MIN_DURATION_SECONDS
                         ve.trackers["smoke"].cooldown_seconds = settings.VERIFICATION_COOLDOWN_SECONDS
@@ -292,10 +303,10 @@ async def update_verification_settings(
                 pass
 
     data = VerificationSettingsResponse(
-        fire_min_confidence=settings.FIRE_CONFIDENCE_THRESHOLD,
+        fire_min_confidence=settings.FIRE_VERIFICATION_MIN_CONFIDENCE,
         fire_min_consecutive_frames=settings.FIRE_MIN_CONSECUTIVE_FRAMES,
         fire_min_duration_seconds=settings.FIRE_MIN_DURATION_SECONDS,
-        smoke_min_confidence=settings.SMOKE_CONFIDENCE_THRESHOLD,
+        smoke_min_confidence=settings.SMOKE_VERIFICATION_MIN_CONFIDENCE,
         smoke_min_consecutive_frames=settings.SMOKE_MIN_CONSECUTIVE_FRAMES,
         smoke_min_duration_seconds=settings.SMOKE_MIN_DURATION_SECONDS,
         ppe_verification_frames=settings.PPE_VERIFICATION_FRAMES,
