@@ -639,9 +639,14 @@ class PPEDetector(BaseDetector):
 
                                             class_threshold = getattr(settings, "VEST_CONFIDENCE_THRESHOLD", 0.55) if c_matched == "vest" else getattr(settings, "GLASSES_CONFIDENCE_THRESHOLD", 0.20)
                                             if c_matched and c_conf >= class_threshold:
+                                                if hasattr(cbox.xyxy[0], "cpu"):
+                                                    c_xyxy = cbox.xyxy[0].cpu().numpy()
+                                                else:
+                                                    c_xyxy = np.array(cbox.xyxy[0])
+
                                                 # Localize safety vest and safety glasses strictly to upper-torso and facial regions
                                                 crop_h = max(1.0, float(crop_y2 - crop_y1))
-                                                c_cy_rel = (c_xyxy[1] + c_xyxy[3]) / (2.0 * crop_h)
+                                                c_cy_rel = (float(c_xyxy[1]) + float(c_xyxy[3])) / (2.0 * crop_h)
                                                 if c_matched == "goggles" and (c_cy_rel < -0.05 or c_cy_rel > 0.38):
                                                     continue
                                                 if c_matched == "vest" and (c_cy_rel < 0.12 or c_cy_rel > 0.82):
