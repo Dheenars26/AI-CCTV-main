@@ -84,7 +84,7 @@ class ONNXYOLORunner:
         enable_wbf: bool = True,
     ):
         self.model_path = model_path
-        self.device = str(device).lower()
+        self.device = device.lower()
         self.session: Optional[Any] = None
         self.net_cv: Optional[Any] = None
         self.input_name: str = "images"
@@ -93,7 +93,7 @@ class ONNXYOLORunner:
         self.in_w: int = 640
         self.names: Dict[int, str] = {}
         self.backend_type: str = "none"
-        self.enable_wbf = bool(enable_wbf)
+        self.enable_wbf = enable_wbf
         self.threads = threads
 
         # Per-thread scratch buffers so the runner stays safe to share across camera workers
@@ -119,7 +119,7 @@ class ONNXYOLORunner:
         aggregate throughput.
         """
         if self.threads is not None:
-            return max(1, int(self.threads))
+            return max(1, self.threads)
         cores = os.cpu_count() or 2
         if cores <= 1:
             return 1
@@ -168,6 +168,15 @@ class ONNXYOLORunner:
                         self.names = json.loads(raw_names.replace("'", '"'))
                     except Exception:
                         pass
+                        
+            # HOTFIX: ppe.onnx has swapped class indices for goggles (2) and vest (1) in this environment
+            if self.names and getattr(self, "names", None) and len(self.names) >= 3:
+                n1 = self.names.get(1, "").lower()
+                n2 = self.names.get(2, "").lower()
+                if "vest" in n1 and "goggles" in n2:
+                    logger.warning(f"ONNXYOLORunner: Detected swapped classes in {self.model_path}, auto-correcting vest <-> goggles.")
+                    self.names[1] = "goggles"
+                    self.names[2] = "Vest"
 
             self.backend_type = "onnxruntime"
             logger.info(
@@ -224,13 +233,13 @@ class ONNXYOLORunner:
         """Lower-cased class names in id order."""
         if not self.names:
             return []
-        size = max(int(k) for k in self.names.keys()) + 1
-        return [str(self.names.get(i, str(i))).lower().strip() for i in range(size)]
+        size = max(self.names.keys()) + 1
+        return [self.names.get(i, str(i)).lower().strip() for i in range(size)]
 
     def name_for(self, class_id: int) -> str:
         """Robust class-id to label lookup (metadata dicts may use int or str keys)."""
         if class_id in self.names:
-            return str(self.names[class_id]).lower().strip()
+            return self.names[class_id].lower().strip()
         str_key = str(class_id)
         if str_key in self.names:  # type: ignore[operator]
             return str(self.names[str_key]).lower().strip()  # type: ignore[index]
@@ -505,25 +514,222 @@ class ONNXYOLORunner:
         }
 
 
+def resolve_model_path(raw_path: Optional[str] = None, default_names: Optional[List[str]] = None) -> str:
+    """
+    Resolves model weights path across workspace, backend, runs, and default directories.
+    Handles relative paths from different execution directories (root, backend, scripts).
+    """
+    backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    workspace_root = os.path.dirname(backend_root)
+
+    defaults = default_names or [
+        "runs/detect/train/weights/best.pt",
+        "models/fire_smoke.pt",
+        "models/fire_smoke.onnx",
+        "fire_smoke.pt",
+        "fire_smoke.onnx",
+        "best.pt",
+        "yolov8n.pt",
+    ]
+
+    check_paths: List[str] = []
+    if raw_path:
+        check_paths.append(raw_path)
+        check_paths.append(os.path.join(workspace_root, raw_path))
+        check_paths.append(os.path.join(backend_root, raw_path))
+        basename = os.path.basename(raw_path)
+        check_paths.append(os.path.join(backend_root, "models", basename))
+        check_paths.append(os.path.join(workspace_root, "models", basename))
+        check_paths.append(os.path.join(workspace_root, "runs", "detect", "train", "weights", basename))
+        stem, ext = os.path.splitext(raw_path)
+        alt_ext = ".onnx" if ext.lower() == ".pt" else (".pt" if ext.lower() == ".onnx" else "")
+        if alt_ext:
+            check_paths.append(stem + alt_ext)
+            check_paths.append(os.path.join(workspace_root, stem + alt_ext))
+            check_paths.append(os.path.join(backend_root, stem + alt_ext))
+            check_paths.append(os.path.join(backend_root, "models", os.path.basename(stem) + alt_ext))
+            check_paths.append(os.path.join(workspace_root, "models", os.path.basename(stem) + alt_ext))
+
+    for d in defaults:
+        check_paths.extend([
+            os.path.join(workspace_root, d),
+            os.path.join(backend_root, d),
+            os.path.join(workspace_root, "runs", "detect", "train", "weights", os.path.basename(d)),
+            os.path.join(backend_root, "models", os.path.basename(d)),
+            os.path.join(workspace_root, "models", os.path.basename(d)),
+        ])
+
+    for p in check_paths:
+        if p and os.path.isfile(p):
+            return os.path.abspath(p)
+
+    return raw_path or os.path.join(workspace_root, "runs", "detect", "train", "weights", "best.pt")
+
+
+_GLOBAL_ULTRALYTICS_CACHE: Dict[str, "UltralyticsYOLORunner"] = {}
+_ULTRALYTICS_CACHE_LOCK = threading.Lock()
+
+
+class UltralyticsYOLORunner:
+    """
+    High-Performance Ultralytics YOLO Runner for PyTorch (.pt) checkpoints.
+    Fulfills the ONNXYOLORunner contract: predict() returns (results, latency_ms).
+    """
+
+    def __init__(self, model_path: str, device: str = "cpu"):
+        from ultralytics import YOLO
+        import torch
+
+        self.model_path = resolve_model_path(model_path)
+        self.device = device or "cpu"
+        if self.device not in ("cpu", ""):
+            try:
+                if not torch.cuda.is_available():
+                    self.device = "cpu"
+            except Exception:
+                self.device = "cpu"
+
+        self.backend_type = "ultralytics_yolo"
+        self.model = YOLO(self.model_path)
+        self.names = {k: v.lower().strip() for k, v in self.model.names.items()}
+        self.in_w = 640
+        self.in_h = 640
+        self._last_inf_ms: float = 0.0
+
+    @property
+    def class_names(self) -> List[str]:
+        if not self.names:
+            return []
+        size = max(self.names.keys()) + 1
+        return [self.names.get(i, str(i)).lower().strip() for i in range(size)]
+
+    def name_for(self, class_id: int) -> str:
+        return self.names.get(class_id, str(class_id))
+
+    def predict(
+        self,
+        image_bgr: np.ndarray,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        target_classes: Optional[List[str]] = None,
+        class_thresholds: Optional[Dict[Any, float]] = None,
+        use_wbf: bool = True,
+        adaptive_small_classes: bool = True,
+        max_det: int = 100,
+        **kwargs: Any
+    ) -> Tuple[List[Dict[str, Any]], float]:
+        if image_bgr is None or image_bgr.size == 0:
+            return [], 0.0
+
+        t0 = time.perf_counter()
+        h, w = image_bgr.shape[:2]
+
+        results = list(self.model.predict(
+            source=image_bgr,
+            conf=float(conf_threshold),
+            iou=float(iou_threshold),
+            device=self.device,
+            verbose=False,
+            max_det=max_det,
+        ))
+        inf_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_inf_ms = inf_ms
+
+        target_lower = [t.lower().strip() for t in target_classes] if target_classes else None
+        formatted_results: List[Dict[str, Any]] = []
+
+        if results and len(results) > 0:
+            first_result: Any = results[0]
+            if first_result.boxes is not None:
+                boxes = first_result.boxes
+                for i in range(len(boxes)):
+                    cls_id = int(boxes.cls[i].item())
+                    label = self.name_for(cls_id)
+                    if target_lower and label not in target_lower:
+                        continue
+
+                    conf = float(boxes.conf[i].item())
+                    if class_thresholds:
+                        req_floor = class_thresholds.get(label, class_thresholds.get(cls_id, conf_threshold))
+                        if conf < req_floor:
+                            continue
+
+                    xyxy = boxes.xyxy[i].tolist()
+                    x1, y1, x2, y2 = xyxy
+                    norm_bbox = BoundingBox(
+                        x_min=max(0.0, min(1.0, float(x1) / float(w))),
+                        y_min=max(0.0, min(1.0, float(y1) / float(h))),
+                        x_max=max(0.0, min(1.0, float(x2) / float(w))),
+                        y_max=max(0.0, min(1.0, float(y2) / float(h))),
+                    )
+                    formatted_results.append({
+                        "label": label,
+                        "confidence": conf,
+                        "bbox": norm_bbox,
+                        "class_id": cls_id,
+                        "pixel_coords": [int(x1), int(y1), int(x2), int(y2)],
+                        "box_agreement": 1,
+                    })
+
+        return formatted_results, round(inf_ms, 2)
+
+    def get_last_timings(self) -> Dict[str, Any]:
+        return {"inf_time_ms": round(self._last_inf_ms, 2)}
+
+
+def get_ultralytics_yolo_runner(
+    model_path: str,
+    device: str = "cpu",
+) -> UltralyticsYOLORunner:
+    """
+    Returns a cached :class:`UltralyticsYOLORunner` for the given PyTorch checkpoint.
+    """
+    resolved = resolve_model_path(model_path)
+    key = f"{os.path.abspath(resolved)}_{device}"
+    with _ULTRALYTICS_CACHE_LOCK:
+        if key not in _GLOBAL_ULTRALYTICS_CACHE:
+            _GLOBAL_ULTRALYTICS_CACHE[key] = UltralyticsYOLORunner(resolved, device=device)
+        return _GLOBAL_ULTRALYTICS_CACHE[key]
+
+
 def get_onnx_yolo_runner(
     model_path: str,
     device: str = "cpu",
     threads: Optional[int] = None,
     enable_wbf: bool = True,
-) -> ONNXYOLORunner:
+) -> Any:
     """
-    Returns a cached :class:`ONNXYOLORunner` for the given weights path and device.
+    Returns a cached runner for the given weights path and device.
+    If the weights path is a PyTorch checkpoint (.pt) or only a .pt exists,
+    gracefully routes to UltralyticsYOLORunner.
+    """
+    resolved = resolve_model_path(model_path)
+    if resolved.lower().endswith(".pt"):
+        return get_ultralytics_yolo_runner(resolved, device=device)
 
-    Caching is essential: several detectors (fire/smoke, PPE, person) resolve to the same ONNX file
-    in some deployments, and each instantiation costs tens of megabytes of session memory.
-    """
-    key = f"{os.path.abspath(model_path)}_{device}_{threads}_{int(enable_wbf)}"
+    key = f"{os.path.abspath(resolved)}_{device}_{threads}_{int(enable_wbf)}"
     with _ONNX_CACHE_LOCK:
         if key not in _GLOBAL_ONNX_CACHE:
             _GLOBAL_ONNX_CACHE[key] = ONNXYOLORunner(
-                model_path, device=device, threads=threads, enable_wbf=enable_wbf
+                resolved, device=device, threads=threads, enable_wbf=enable_wbf
             )
         return _GLOBAL_ONNX_CACHE[key]
+
+
+def get_yolo_runner(
+    model_path: str,
+    device: str = "cpu",
+    threads: Optional[int] = None,
+    enable_wbf: bool = True,
+) -> Any:
+    """
+    Unified YOLO model loader: automatically detects format (.pt vs .onnx)
+    and returns either an UltralyticsYOLORunner or an ONNXYOLORunner.
+    """
+    resolved = resolve_model_path(model_path)
+    if resolved.lower().endswith(".pt"):
+        return get_ultralytics_yolo_runner(resolved, device=device)
+    return get_onnx_yolo_runner(resolved, device=device, threads=threads, enable_wbf=enable_wbf)
 
 
 def create_optimized_onnx_session(model_path: str, device: str = "cpu") -> Any:
@@ -540,7 +746,7 @@ def create_optimized_onnx_session(model_path: str, device: str = "cpu") -> Any:
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-    if str(device).lower() in ["cpu", ""]:
+    if device.lower() in ["cpu", ""]:
         cores = os.cpu_count() or 2
         sess_options.intra_op_num_threads = int(
             getattr(settings, "AI_ORT_THREADS", 0) or 0
@@ -554,7 +760,7 @@ def create_optimized_onnx_session(model_path: str, device: str = "cpu") -> Any:
 
     providers = ["CPUExecutionProvider"]
     available = ort.get_available_providers()
-    if str(device).lower() in ["cuda", "gpu", "0"] and "CUDAExecutionProvider" in available:
+    if device.lower() in ["cuda", "gpu", "0"] and "CUDAExecutionProvider" in available:
         providers.insert(0, "CUDAExecutionProvider")
 
     session = ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
