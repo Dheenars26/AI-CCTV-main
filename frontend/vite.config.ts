@@ -90,20 +90,23 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         configure: (proxy) => {
-          // Retry on connection failure (covers uvicorn --reload restart window)
+          // Retry on connection failure (covers uvicorn --reload restart window).
+          // POST is also retried for /auth/login which fires immediately after page load
+          // while the backend is still loading ONNX models (~4-5 s cold start).
           proxy.on('error', (err, req, res) => {
             const MAX_RETRIES = 3;
             const RETRY_DELAY_MS = 1500;
             const retryCount: number = ((req as any).__proxyRetry) || 0;
-            const isIdempotent = req.method === 'GET' || req.method === 'HEAD';
+            const isRetryable = req.method === 'GET' || req.method === 'HEAD' || req.method === 'POST';
 
-            if (isIdempotent && retryCount < MAX_RETRIES && (err as any).code === 'ECONNREFUSED' && res && 'writeHead' in res) {
+            if (isRetryable && retryCount < MAX_RETRIES && (err as any).code === 'ECONNREFUSED' && res && 'writeHead' in res) {
               (req as any).__proxyRetry = retryCount + 1;
+              const delay = RETRY_DELAY_MS * ((req as any).__proxyRetry);
               setTimeout(() => {
                 try {
                   proxy.web(req, res, { target: 'http://127.0.0.1:8000' });
                 } catch (_) { /* ignore retry error */ }
-              }, RETRY_DELAY_MS);
+              }, delay);
               return;
             }
 
@@ -120,6 +123,7 @@ export default defineConfig({
           });
         },
       },
+
       '/evidence': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,

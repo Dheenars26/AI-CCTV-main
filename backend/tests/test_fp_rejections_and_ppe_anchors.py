@@ -102,7 +102,7 @@ def test_worker_status_label_stays_inside_the_frame():
     ])
     frame.metadata["worker_ppe_analyses"] = [{
         "person_id": 7,
-        "bounding_box": edge_person.model_dump() if hasattr(edge_person, "model_dump") else edge_person.__dict__,
+        "bounding_box": getattr(edge_person, "model_dump")() if hasattr(edge_person, "model_dump") else edge_person.to_dict(),
         "status": "VIOLATION",
         "missing_equipment": ["vest"],
         "detected_equipment": [],
@@ -110,6 +110,7 @@ def test_worker_status_label_stays_inside_the_frame():
     frame.metadata["safety_zones"] = []
 
     out = StandardPostprocessor(debug_overlay=True).process(frame)
+    assert out.image is not None
     assert out.image.shape == (h, w, 3)
 
     # Content must be painted inside the frame near the top - evidence that the label was clamped
@@ -124,6 +125,7 @@ def test_worker_status_label_stays_inside_the_frame():
     frame2.metadata["worker_ppe_analyses"] = []
     frame2.metadata["safety_zones"] = []
     out2 = StandardPostprocessor(debug_overlay=True).process(frame2)
+    assert out2.image is not None
     assert out2.image.shape == (h, w, 3)
 def test_person_ppe_roi_localization_consistency():
     """

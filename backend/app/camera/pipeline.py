@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from app.detection.base import BaseDetector, DummyDetector, DetectionResult
-from app.detection.verification import CameraVerificationEngine, VerifiedEvent
+from app.detection.verification import CameraVerificationEngine, VerifiedEvent, EventState
 from app.detection.fire_smoke_detector import FireSmokeDetector
 from app.detection.ppe_detector import PPEDetector
 from app.detection.person_detector import PersonDetector
@@ -381,12 +381,26 @@ class StandardPostprocessor(BasePostprocessor):
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.50
                 thickness = 1
+                req_raw = worker.get("required_equipment", []) or (self._required_equipment() if hasattr(self, "_required_equipment") else ["vest", "goggles"])
+                canon_map = {
+                    "vest": "vest", "safety_vest": "vest", "jacket": "vest", "safety_jacket": "vest",
+                    "goggles": "glasses", "glass": "glasses", "glasses": "glasses", "safety_glasses": "glasses",
+                    "safety_glass": "glasses", "eyewear": "glasses", "spectacles": "glasses", "safety_goggles": "glasses",
+                    "gloves": "gloves", "glove": "gloves",
+                    "mask": "mask", "face_mask": "mask",
+                    "safety_shoes": "shoes", "shoes": "shoes", "boots": "shoes",
+                }
+                req_canonicals = {canon_map.get(r.lower(), r.lower()) for r in req_raw if r.lower() not in ["helmet", "cap", "hard_hat", "headgear"]}
+                if not req_canonicals:
+                    req_canonicals = {"vest", "glasses"}
+
                 if is_pass:
-                    worker_tag = f"Worker #{person_id} | PASS"
+                    worker_tag = f"Worker #{person_id} | PASS (ALL PPE)"
                     badge_bg_color = (0, 160, 60)       # Solid Emerald Green
                     text_color = (255, 255, 255)       # Crisp Pure White Text
                 else:
-                    clean_missing = [m for m in missing if m.lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
+                    clean_missing = [m for m in missing if canon_map.get(m.lower(), m.lower()) in req_canonicals]
+                    clean_detected = [d for d in detected if canon_map.get(d.lower(), d.lower()) in req_canonicals]
                     missing_display_map = {
                         "vest": "VEST",
                         "safety_vest": "VEST",
@@ -395,10 +409,27 @@ class StandardPostprocessor(BasePostprocessor):
                         "glass": "GLASSES",
                         "glasses": "GLASSES",
                         "safety_glasses": "GLASSES",
-                        "safety_glass": "GLASSES"
+                        "safety_glass": "GLASSES",
+                        "gloves": "GLOVES",
+                        "mask": "MASK",
+                        "safety_shoes": "SHOES",
                     }
-                    missing_str = ", ".join([missing_display_map.get(m.lower(), m.upper()) for m in clean_missing]) if clean_missing else "VEST & GLASSES"
-                    worker_tag = f"Worker #{person_id} | MISSING: {missing_str}"
+                    parts = []
+                    # Show confirmed equipment with green OK label
+                    for d in clean_detected:
+                        d_name = missing_display_map.get(d.lower(), d.upper())
+                        item_str = f"OK: {d_name}"
+                        if item_str not in parts:
+                            parts.append(item_str)
+                    # Show missing equipment
+                    for m in clean_missing:
+                        m_name = missing_display_map.get(m.lower(), m.upper())
+                        item_str = f"MISSING: {m_name}"
+                        if item_str not in parts:
+                            parts.append(item_str)
+
+                    status_str = " | ".join(parts) if parts else "MISSING: VEST & GLASSES"
+                    worker_tag = f"Worker #{person_id} | {status_str}"
                     badge_bg_color = (30, 30, 210)      # Solid High-Vis Crimson Red
                     text_color = (255, 255, 255)       # Crisp Pure White Text
 
@@ -409,15 +440,18 @@ class StandardPostprocessor(BasePostprocessor):
                 self._draw_rounded_rect(frame.image, (x1, tag_y - th - 8), (badge_x2, tag_y + 4), worker_box_color, radius=6, thickness=1)
                 cv2.putText(frame.image, worker_tag, (x1 + 8, tag_y - 2), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
-                # Equipment categories to render (ONLY draw badges for DETECTED items; helmet removed per requirements)
+                # Equipment categories to render (ONLY draw badges for DETECTED items matching monitored requirements)
                 equipment_specs = [
-                    (["vest", "jacket", "safety_vest", "safety_jacket"], "Safety Vest Found"),
-                    (["gloves", "glove"], "Gloves Found"),
-                    (["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection", "spectacles", "safety_goggles"], "Safety Glasses Found"),
-                    (["safety_shoes", "shoes", "boots"], "Safety Shoes Found"),
+                    (["vest", "jacket", "safety_vest", "safety_jacket"], "Safety Vest Found", "vest"),
+                    (["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection", "spectacles", "safety_goggles"], "Safety Glasses Found", "glasses"),
+                    (["gloves", "glove"], "Gloves Found", "gloves"),
+                    (["mask", "face_mask"], "Mask Found", "mask"),
+                    (["safety_shoes", "shoes", "boots"], "Safety Shoes Found", "shoes"),
                 ]
 
-                for keys, found_label in equipment_specs:
+                for keys, found_label, canon_req in equipment_specs:
+                    if canon_req not in req_canonicals:
+                        continue
                     is_det = any(k in detected for k in keys)
                     if not is_det:
                         continue
@@ -495,22 +529,23 @@ class StandardPostprocessor(BasePostprocessor):
                     if already_associated:
                         continue
 
-                    box_color = (0, 215, 80)
-                    self._draw_corner_brackets(frame.image, (x1, y1), (x2, y2), box_color, line_len=12, thickness=2)
-                    badge_label = "Safety Vest Found" if label in ["vest", "jacket"] else f"{label.title()} Found"
-                    badge_y = max(5, y1 - 28) if y1 >= 32 else y1 + 4
-                    self._draw_pill_badge(frame.image, badge_label, (x1, badge_y), is_found=True)
+                    # Only standalone vest (hung on a wall/hook) may be drawn without a worker,
+                    # and ONLY when explicitly enabled. Worn items (glasses, masks, gloves, shoes)
+                    # must NEVER be rendered as floating standalone badges in empty space.
+                    if label in ["vest", "jacket"] and getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", False):
+                        box_color = (0, 215, 80)
+                        self._draw_corner_brackets(frame.image, (x1, y1), (x2, y2), box_color, line_len=12, thickness=2)
+                        badge_label = "Safety Vest Found"
+                        badge_y = max(5, y1 - 28) if y1 >= 32 else y1 + 4
+                        self._draw_pill_badge(frame.image, badge_label, (x1, badge_y), is_found=True)
                     continue
 
-                # Fire & Smoke overlay threshold = the *candidate* floor, not the alert floor.
-                # The detector deliberately reports real-but-weak evidence (a distant plume scored
-                # 0.21) so it can be corroborated over time; hiding it from the operator because it
-                # is below the alert floor would make the system look blind while it is in fact
-                # tracking the event.
+                # Fire & Smoke overlay threshold = the alert floor so low-confidence sub-threshold
+                # noise is never rendered as an alarming red emergency box on live displays.
                 min_draw_conf = (
-                    float(getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.14))
+                    float(getattr(settings, "FIRE_ALERT_CONFIDENCE", 0.35))
                     if "fire" in label
-                    else float(getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.13))
+                    else float(getattr(settings, "SMOKE_ALERT_CONFIDENCE", 0.35))
                 )
                 if det.confidence < min_draw_conf:
                     continue
@@ -695,6 +730,7 @@ class FramePipeline:
         self._smoothed_detections: Dict[str, Tuple[DetectionResult, float]] = {}
         self._smoothed_workers: Dict[int, Tuple[Dict[str, Any], float]] = {}
         self._worker_compliance_history: Dict[int, Dict[str, float]] = {}
+        self._last_frame_fire_smoke_boxes: List[DetectionResult] = []  # Previous frame's fire/smoke for PPE gating
         self._lock = threading.Lock()
 
     @property
@@ -718,8 +754,36 @@ class FramePipeline:
         if refiner is not None:
             refiner.forget()
 
+    def reset(self) -> None:
+        """Resets per-camera state (tracker, temporal caches, smoothed detections) for independent frame/scene evaluation."""
+        with self._lock:
+            self._smoothed_detections.clear()
+            self._smoothed_workers.clear()
+            self._latest_detections.clear()
+            self._latest_worker_analyses.clear()
+            self._last_worker_analyses_objs.clear()
+            self._last_worker_analysis_time = 0.0
+            self._last_ppe_inference_time = 0.0
+            self._last_frame_fire_smoke_boxes = []
+            self._worker_compliance_history.clear()
+            if hasattr(self, "tracker") and hasattr(self.tracker, "reset"):
+                self.tracker.reset()
+            if hasattr(self, "verification_engine") and hasattr(self.verification_engine, "reset"):
+                self.verification_engine.reset()
+            if hasattr(self, "ppe_verification_engine") and hasattr(self.ppe_verification_engine, "reset"):
+                self.ppe_verification_engine.reset()
+            if hasattr(self, "motion_gate") and hasattr(self.motion_gate, "reset"):
+                self.motion_gate.reset()
+            refiner = getattr(getattr(self, "ppe_detector", None), "_roi_refiner", None)
+            if refiner is not None and hasattr(refiner, "forget"):
+                refiner.forget()
+
+
     def _required_equipment(self) -> List[str]:
-        """Required PPE items from the active profile, with helmet always excluded by design."""
+        """Required PPE items from the active profile, with helmet always excluded by design.
+        
+        Defaults to ['vest', 'goggles'] if no profile is configured.
+        """
         profile = self.active_ppe_profile
         raw_req = profile.get("required_equipment", ["vest", "goggles"]) if profile else ["vest", "goggles"]
         required = [e for e in raw_req if str(e).lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
@@ -832,21 +896,27 @@ class FramePipeline:
             worker_t0 = time.perf_counter()
 
             # 4.1 Person Detector Execution (Run FIRST to provide fast YOLO worker bounding boxes)
+            #     Previous frame's fire/smoke boxes are forwarded so person confidence is boosted
+            #     in fire scenes (avoids phantom silhouettes while still allowing real workers).
+            fire_context = self._last_frame_fire_smoke_boxes  # from frame N-1
             if self.person_enabled and self.person_detector:
                 try:
                     import inspect
                     sig = inspect.signature(self.person_detector.detect)
+                    call_kwargs_person: Dict[str, Any] = {}
                     if "motion_rois" in sig.parameters:
-                        p_res = self.person_detector.detect(img, motion_rois=self.motion_gate.motion_rois)
-                    else:
-                        p_res = self.person_detector.detect(img)
+                        call_kwargs_person["motion_rois"] = self.motion_gate.motion_rois
+                    if "fire_smoke_boxes" in sig.parameters and fire_context:
+                        call_kwargs_person["fire_smoke_boxes"] = fire_context
+                    p_res = self.person_detector.detect(img, **call_kwargs_person)
                     person_dets.extend(p_res)
                     all_detections.extend(p_res)
                 except Exception as e:
                     logger.error(f"Camera-{self.camera_id} PersonDetector execution error: {str(e)}")
 
             # 4.2 PPE Detector Execution (Conditionally bypass if no workers/persons are in view to save ~50% CPU)
-            has_persons = len(person_dets) > 0 or any(d.label.lower() in ["person", "worker"] for d in all_detections)
+            active_tracks = self.tracker.get_active_tracks() if hasattr(self, "tracker") else []
+            has_persons = len(person_dets) > 0 or len(active_tracks) > 0 or any(d.label.lower() in ["person", "worker"] for d in all_detections)
             standalone_vest = getattr(settings, "ENABLE_STANDALONE_VEST_FALLBACK", False)
             should_execute_ppe = (not self.person_enabled) or has_persons or standalone_vest
 
@@ -856,9 +926,22 @@ class FramePipeline:
                     sig = inspect.signature(self.ppe_detector.detect)
                     call_kwargs: Dict[str, Any] = {}
                     if "person_dets" in sig.parameters:
-                        call_kwargs["person_dets"] = person_dets
+                        # Combine freshly detected persons with active tracked persons so seated or temporarily occluded workers
+                        # always receive facial and torso ROI refinement (goggles/spectacles and vest checks).
+                        effective_person_dets = list(person_dets)
+                        for trk in active_tracks:
+                            if not any(trk.bbox.iou(p.bbox) >= 0.25 for p in effective_person_dets):
+                                effective_person_dets.append(DetectionResult(
+                                    label="person",
+                                    confidence=trk.confidence,
+                                    bbox=trk.bbox,
+                                    metadata={"source": "tracker", "person_id": trk.person_id}
+                                ))
+                        call_kwargs["person_dets"] = effective_person_dets
                     if "required_equipment" in sig.parameters:
                         call_kwargs["required_equipment"] = self._required_equipment()
+                    if "fire_smoke_boxes" in sig.parameters and fire_context:
+                        call_kwargs["fire_smoke_boxes"] = fire_context
                     ppe_res = self.ppe_detector.detect(img, **call_kwargs)
                     # Exclude helmet from detections per requirement
                     ppe_res = [d for d in ppe_res if d.label.lower() not in ["helmet", "cap", "hard_hat", "headgear"]]
@@ -887,18 +970,54 @@ class FramePipeline:
                 if "candidate_rois" in sig.parameters:
                     call_kwargs["candidate_rois"] = None
                 if "exclusion_rois" in sig.parameters:
-                    exclusions = [
+                    # Pass both worker bounding boxes and worn PPE items as exclusion ROIs for smoke
+                    # (a worker's dark hair/beard, neckband, or collar must never be tagged as smoke).
+                    # For fire, only confirmed hi-vis vests may veto: worker bodies must NEVER veto fire.
+                    smoke_exclusions = [p.bbox for p in person_dets] + [
                         d.bbox for d in all_detections
                         if d.label.lower() in [
-                            "person", "worker", "vest", "helmet", "mask", "goggles", "gloves", "safety_shoes"
+                            "vest", "safety_vest", "jacket", "person", "worker"
                         ]
+                        and d.metadata.get("detection_engine") != "OpenCV-Standalone-Vest-Detector"
                     ]
-                    call_kwargs["exclusion_rois"] = exclusions or None
+                    fire_exclusions = [
+                        d.bbox for d in all_detections
+                        if d.label.lower() in ["vest", "safety_vest", "jacket"]
+                        and d.metadata.get("detection_engine") != "OpenCV-Standalone-Vest-Detector"
+                    ]
+                    call_kwargs["exclusion_rois"] = {
+                        "smoke": smoke_exclusions,
+                        "fire": fire_exclusions,
+                    }
+                if "motion_context" in sig.parameters:
+                    m_ratio = getattr(self.motion_gate, "motion_ratio", 1.0) if hasattr(self, "motion_gate") else 1.0
+                    m_rois = getattr(self.motion_gate, "motion_rois", []) if hasattr(self, "motion_gate") else []
+                    call_kwargs["motion_context"] = {
+                        "motion_ratio": m_ratio,
+                        "motion_rois": m_rois,
+                    }
                 fs_res = self.fire_smoke_detector.detect(img, **call_kwargs)
                 fire_smoke_dets.extend(fs_res)
                 all_detections.extend(fs_res)
+
+                # Active combustion / flame takes precedence over any standalone CV vest
+                if any(d.label.lower() == "fire" for d in fire_smoke_dets):
+                    all_detections = [
+                        d for d in all_detections
+                        if not (
+                            d.label.lower() in ["vest", "safety_vest", "jacket"]
+                            and d.metadata.get("detection_engine") == "OpenCV-Standalone-Vest-Detector"
+                            and any(f.label.lower() == "fire" and f.bbox.iou(d.bbox) > 0.10 for f in fire_smoke_dets)
+                        )
+                    ]
             except Exception as e:
                 logger.error(f"Camera-{self.camera_id} FireSmokeDetector execution error: {str(e)}")
+
+        # Store this frame's fire/smoke detections for use as gating context in frame N+1.
+        # The one-frame lag is irrelevant for fire scenes (they persist for many frames) and
+        # avoids the circular dependency where fire detection needs vest boxes that don't exist
+        # yet if fire ran first.
+        self._last_frame_fire_smoke_boxes = list(fire_smoke_dets)
 
         # On a gated frame the worker branch produced no fresh evidence. Rather than present an
         # empty frame to telemetry consumers, the still-fresh smoothed detections are republished
@@ -952,8 +1071,19 @@ class FramePipeline:
             # the tracker would count a gated frame as "worker disappeared" and drop live tracks.
             if run_worker_frame:
                 tracked_persons = self.tracker.update(all_person_dets)
+                if not tracked_persons and hasattr(self.tracker, "_tracked_persons"):
+                    # Grace window: retain workers who disappeared for <= 6 frames so seated or occluded workers don't drop
+                    tracked_persons = [
+                        t for pid, t in self.tracker._tracked_persons.items()
+                        if self.tracker._disappeared_counts.get(pid, 0) <= 6
+                    ]
             else:
                 tracked_persons = self.tracker.get_active_tracks()
+                if not tracked_persons and hasattr(self.tracker, "_tracked_persons"):
+                    tracked_persons = [
+                        t for pid, t in self.tracker._tracked_persons.items()
+                        if self.tracker._disappeared_counts.get(pid, 0) <= 6
+                    ]
 
         # Enforce vest & goggles (glasses) requirement; explicitly remove helmet
         required_equipment = self._required_equipment()
@@ -980,6 +1110,28 @@ class FramePipeline:
                     analysis.metadata["reused_from_gated_frame"] = True
             else:
                 worker_analyses = []
+
+        # INVARIANT: Never render a PPE status badge without a fresh person box this frame.
+        # A worker analysis backed only by a stale/phantom track must not produce a visible
+        # badge — this is the final guard against fire silhouettes and ghost tracks.
+        if run_worker_frame and person_dets:
+            fresh_person_boxes = [p.bbox for p in person_dets]
+            corroborated = []
+            for w in worker_analyses:
+                w_box = getattr(w, "bbox", None) or getattr(w, "person_bbox", None)
+                if w_box is None:
+                    # Fallback: check if any tracked person matches
+                    corroborated.append(w)
+                    continue
+                if any(w_box.iou(pb) >= 0.15 for pb in fresh_person_boxes):
+                    corroborated.append(w)
+                else:
+                    logger.debug(
+                        f"Camera-{self.camera_id} Worker #{w.person_id} analysis dropped: "
+                        f"no fresh person box corroboration (fire-scene safety invariant)"
+                    )
+            worker_analyses = corroborated
+
         frame.metadata["worker_ppe_analyses"] = [w.to_dict() for w in worker_analyses]
 
         # 6. Stage 5: Safety Zone Evaluation Engine
@@ -1002,10 +1154,10 @@ class FramePipeline:
 
                 for item in w.detected_equipment:
                     l_item = item.lower()
-                    worker_gear_times[l_item] = now_ts + 1.5
+                    worker_gear_times[l_item] = now_ts + 2.5
                     if l_item in ["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection"]:
                         for alt in ["goggles", "glasses", "safety_glasses", "safety_glass", "glass", "eyewear", "eye_protection"]:
-                            worker_gear_times[alt] = now_ts + 1.5
+                            worker_gear_times[alt] = now_ts + 2.5
 
                 # If an item is in missing_equipment but was detected recently (within 0.75s),
                 # grace it as detected to prevent 1-frame strobe/violation

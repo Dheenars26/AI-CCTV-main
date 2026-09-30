@@ -105,7 +105,7 @@ class PPERoiRefiner:
         positive_ttl: float = 4.0,
         negative_ttl: float = 1.0,
         min_crop_side: int = 220,
-        confidence_floor: float = 0.20,
+        confidence_floor: float = 0.085,
     ):
         self.enabled = enabled
         self.max_persons = max_persons
@@ -114,8 +114,8 @@ class PPERoiRefiner:
         self.min_crop_side = min_crop_side
         self.confidence_floor = confidence_floor
 
-        # person_id -> item -> (expiry_timestamp, found)
-        self._cache: Dict[int, Dict[str, Tuple[float, bool]]] = {}
+        # person_id -> item -> (expiry_timestamp, found, det_info)
+        self._cache: Dict[int, Dict[str, Tuple[float, bool, Optional[Dict[str, Any]]]]] = {}
         self._round_robin: int = 0
         self.last_report: Dict[str, object] = {}
 
@@ -124,17 +124,36 @@ class PPERoiRefiner:
         entry = self._cache.get(person_id, {}).get(item)
         if not entry:
             return None
-        expiry, found = entry
+        expiry = entry[0]
+        found = entry[1]
         if time.time() > expiry:
             return None
         return found
 
-    def _remember(self, person_id: int, item: str, found: bool, confidence: float = 0.0) -> None:
+    def _cached_entry(self, person_id: int, item: str) -> Optional[Tuple[bool, Optional[Dict[str, Any]]]]:
+        entry = self._cache.get(person_id, {}).get(item)
+        if not entry:
+            return None
+        expiry = entry[0]
+        found = entry[1]
+        det_info = entry[2] if len(entry) > 2 else None
+        if time.time() > expiry:
+            return None
+        return found, det_info
+
+    def _remember(
+        self,
+        person_id: int,
+        item: str,
+        found: bool,
+        confidence: float = 0.0,
+        det_info: Optional[Dict[str, Any]] = None,
+    ) -> None:
         ttl = self.positive_ttl if found else self.negative_ttl
         # A high-confidence finding is trusted for longer than a marginal one.
         if found and confidence >= 0.55:
             ttl *= 1.5
-        self._cache.setdefault(person_id, {})[item] = (time.time() + ttl, found)
+        self._cache.setdefault(person_id, {})[item] = (time.time() + ttl, found, det_info)
 
     def forget(self, person_id: Optional[int] = None) -> None:
         """Drops cached conclusions (all workers, or one) after a config/profile change."""
@@ -167,20 +186,44 @@ class PPERoiRefiner:
 
         h, w = image_bgr.shape[:2]
 
-        # Build the pending work list, skipping anything covered by the cache.
+        # Build the pending work list, collecting any valid cached positive detections.
+        cached_results: List[DetectionResult] = []
         pending: List[Tuple[int, Any, str, str]] = []
         for index, person in enumerate(persons[: self.max_persons]):
             pid = person_key(person, index)
             for item in missing_by_person.get(pid, []):
                 item_l = item.lower()
-                cached = self._cached(pid, item_l)
-                if cached is True:
-                    continue  # already corroborated recently - nothing to prove
+                cached_entry = self._cached_entry(pid, item_l)
+                if cached_entry is not None:
+                    found, det_info = cached_entry
+                    if found and det_info is not None:
+                        # Re-emit cached detection adjusted to person's current bbox
+                        p_bbox = person.bbox
+                        p_w = max(1e-4, p_bbox.x_max - p_bbox.x_min)
+                        p_h = max(1e-4, p_bbox.y_max - p_bbox.y_min)
+                        rx1, ry1, rx2, ry2 = det_info["rel_bbox"]
+                        cached_results.append(DetectionResult(
+                            label=det_info["label"],
+                            confidence=det_info["confidence"],
+                            bbox=BoundingBox(
+                                x_min=max(0.0, min(1.0, p_bbox.x_min + rx1 * p_w)),
+                                y_min=max(0.0, min(1.0, p_bbox.y_min + ry1 * p_h)),
+                                x_max=max(0.0, min(1.0, p_bbox.x_min + rx2 * p_w)),
+                                y_max=max(0.0, min(1.0, p_bbox.y_min + ry2 * p_h)),
+                            ),
+                            metadata={
+                                "detector_module": "PPEDetector-WorkerROI",
+                                "roi": det_info.get("region", "head"),
+                                "evidence": "roi_refine_cached",
+                                "person_id": pid,
+                            }
+                        ))
+                    continue  # already corroborated recently - nothing to re-infer
                 pending.append((pid, person, item_l, _BODY_REGION_FOR_ITEM.get(item_l, "torso")))
 
         self.last_report["candidates"] = len(pending)
         if not pending:
-            return []
+            return cached_results
 
         # Round-robin so a worker who never gets the item cannot starve other workers.
         picked = pending[self._round_robin % len(pending)]
@@ -198,7 +241,7 @@ class PPERoiRefiner:
         x1, y1, x2, y2 = clip_roi(roi, w, h)
         crop = image_bgr[y1:y2, x1:x2]
         if crop.size == 0 or (x2 - x1) < 16 or (y2 - y1) < 16:
-            return []
+            return cached_results
 
         crop_prepared, upscale = upscale_if_small(crop, min_side=self.min_crop_side)
         self.last_report["attempted"] = 1
@@ -208,7 +251,7 @@ class PPERoiRefiner:
         try:
             raw_items = infer_fn(crop_prepared)
         except Exception:
-            return []
+            return cached_results
 
         results: List[DetectionResult] = []
         found_items: List[str] = []
@@ -216,13 +259,28 @@ class PPERoiRefiner:
             canonical = normalise_ppe_label(raw_label)
             if canonical is None or canonical == "person":
                 continue
-            if confidence < self.confidence_floor:
+            min_conf = self.confidence_floor
+            if canonical == "vest":
+                from app.config.settings import settings
+                min_conf = float(getattr(settings, "VEST_CROP_CONFIDENCE_FLOOR", 0.15))
+            elif canonical == "gloves":
+                min_conf = max(0.20, self.confidence_floor)
+
+            if confidence < min_conf:
                 continue
             # A body-region crop can only testify about the equipment that lives there.
             if region == "head" and canonical not in ("goggles", "mask", "helmet"):
                 continue
-            if region == "torso" and canonical not in ("vest", "gloves", "mask"):
+            if region == "torso" and canonical not in ("vest", "gloves"):
                 continue
+
+            # Geometry sanity check for glasses (prevent "head" being classified as "glasses")
+            lx1, ly1, lx2, ly2 = xyxy
+            if canonical == "goggles":
+                crop_area = (x2 - x1) * (y2 - y1)
+                box_area = (lx2 - lx1) * (ly2 - ly1)
+                if box_area > 0.40 * crop_area:  # Glasses shouldn't cover >40% of the head
+                    continue
 
             lx1, ly1, lx2, ly2 = xyxy
             scale_back = 1.0 / (upscale if upscale > 0 else 1.0)
@@ -249,20 +307,28 @@ class PPERoiRefiner:
             ))
             found_items.append(canonical)
 
-        improve = any(item in found_items for item in _items_for_region(region)) or (
-            item in found_items
-        )
-        self._remember(pid, item, found=improve, confidence=max(
-            [r.confidence for r in results], default=0.0
-        ))
-        # Any additional item corroborated by this crop is cached too.
-        for extra in found_items:
-            if extra != item:
-                self._remember(pid, extra, found=True, confidence=0.6)
+        p_w = max(1e-4, bbox.x_max - bbox.x_min)
+        p_h = max(1e-4, bbox.y_max - bbox.y_min)
+        for det in results:
+            det_info = {
+                "label": det.label,
+                "confidence": det.confidence,
+                "rel_bbox": (
+                    (det.bbox.x_min - bbox.x_min) / p_w,
+                    (det.bbox.y_min - bbox.y_min) / p_h,
+                    (det.bbox.x_max - bbox.x_min) / p_w,
+                    (det.bbox.y_max - bbox.y_min) / p_h,
+                ),
+                "region": region,
+            }
+            self._remember(pid, det.label, found=True, confidence=det.confidence, det_info=det_info)
+
+        if item not in found_items:
+            self._remember(pid, item, found=False, confidence=0.0, det_info=None)
 
         self.last_report["hit"] = bool(results)
         self.last_report["found"] = found_items
-        return results
+        return cached_results + results
 
 
 def person_key(person: Any, index: int = 0) -> int:

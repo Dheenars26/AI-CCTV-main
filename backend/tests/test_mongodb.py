@@ -1,5 +1,5 @@
 """
-Unit & Integration Tests for MongoDB Hybrid Architecture.
+Unit & Integration Tests for MongoDB Alert Events Architecture.
 Validates async connection handling, schemas, resilient offline degradation, and mock queries.
 """
 
@@ -9,54 +9,36 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.database.mongodb import MongoDBManager, mongodb_manager, connect_to_mongo, close_mongo_connection, get_mongo_db
 from app.schemas.mongo_docs import (
-    BoundingBoxDoc,
-    DetectionEventDoc,
-    CameraTelemetryDoc,
-    MongoQueryFilter,
+    AlertEventDoc,
+    AlertEventQueryFilter,
     MongoHealthStatus
 )
 from app.services.mongo_service import (
-    MongoDetectionService,
-    mongo_detection_service,
-    schedule_mongo_detection_log,
-    schedule_mongo_detections_batch
+    MongoAlertService,
+    mongo_alert_service,
+    schedule_mongo_alert_log
 )
 
 
 @pytest.mark.asyncio
 async def test_mongo_schemas_validation():
     """Validates Pydantic schema validation for MongoDB document models."""
-    bbox = BoundingBoxDoc(
-        x1=10.5,
-        y1=20.0,
-        x2=100.0,
-        y2=200.0,
-        confidence=0.88,
-        class_name="fire"
-    )
-    assert bbox.class_name == "fire"
-    assert bbox.confidence == 0.88
-
-    event = DetectionEventDoc(
+    alert_event = AlertEventDoc(
         camera_id=1,
         camera_name="Main Gate Cam",
-        detections=[bbox],
-        module="FIRE_SMOKE"
+        location="Building A - Entrance",
+        alert_type="fire",
+        confidence=0.88,
+        snapshot_path="evidence/2026-09-25/cam1_fire_001.jpg"
     )
-    assert event.camera_id == 1
-    assert len(event.detections) == 1
+    assert alert_event.camera_id == 1
+    assert alert_event.alert_type == "fire"
+    assert alert_event.location == "Building A - Entrance"
+    assert alert_event.snapshot_path == "evidence/2026-09-25/cam1_fire_001.jpg"
 
-    telemetry = CameraTelemetryDoc(
-        camera_id=2,
-        ai_fps=14.5,
-        stream_fps=25.0
-    )
-    assert telemetry.camera_id == 2
-    assert telemetry.ai_fps == 14.5
-
-    query_filter = MongoQueryFilter(camera_id=1, class_name="fire", limit=10)
+    query_filter = AlertEventQueryFilter(camera_id=1, alert_type="fire", limit=10)
     assert query_filter.limit == 10
-    assert query_filter.class_name == "fire"
+    assert query_filter.alert_type == "fire"
 
 
 @pytest.mark.asyncio
@@ -76,31 +58,24 @@ async def test_mongo_offline_graceful_handling():
 
 @pytest.mark.asyncio
 async def test_mongo_service_when_offline():
-    """Verifies that MongoDetectionService safely no-ops when MongoDB is offline."""
+    """Verifies that MongoAlertService safely no-ops when MongoDB is offline."""
     # Ensure offline state
     mongodb_manager.is_connected = False
     mongodb_manager.db = None
 
-    # log_detection should return None, not raise
-    det_id = await mongo_detection_service.log_detection(
+    # log_alert_event should return None, not raise
+    alert_id = await mongo_alert_service.log_alert_event(
         camera_id=99,
         camera_name="Test Cam",
-        class_name="smoke",
+        location="Test Location",
+        alert_type="smoke",
         confidence=0.75,
-        bounding_box={"x1": 0, "y1": 0, "x2": 50, "y2": 50}
+        snapshot_path="evidence/test/snap.jpg"
     )
-    assert det_id is None
+    assert alert_id is None
 
-    # log_detections_batch should return 0, not raise
-    count = await mongo_detection_service.log_detections_batch(
-        camera_id=99,
-        camera_name="Test Cam",
-        detections=[{"class_name": "fire", "confidence": 0.9}]
-    )
-    assert count == 0
-
-    # query_detection_history should return empty items with mongodb_connected=False
-    res = await mongo_detection_service.query_detection_history(MongoQueryFilter())
+    # query_alert_events should return empty items with mongodb_connected=False
+    res = await mongo_alert_service.query_alert_events(AlertEventQueryFilter())
     assert res["mongodb_connected"] is False
     assert res["items"] == []
 
@@ -109,18 +84,13 @@ def test_sync_scheduling_helpers():
     """Verifies that synchronous code can call schedule helpers without exceptions."""
     # When offline
     mongodb_manager.is_connected = False
-    schedule_mongo_detection_log(
+    schedule_mongo_alert_log(
         camera_id=1,
         camera_name="Sync Test Cam",
-        class_name="fire",
+        location="Test Site",
+        alert_type="fire",
         confidence=0.85,
-        bounding_box={"x1": 10, "y1": 10, "x2": 100, "y2": 100}
-    )
-
-    schedule_mongo_detections_batch(
-        camera_id=1,
-        camera_name="Sync Test Cam",
-        detections=[{"class_name": "smoke", "confidence": 0.8}]
+        snapshot_path="evidence/test/fire.jpg"
     )
 
 
@@ -135,11 +105,6 @@ async def test_mocked_mongo_insert_and_query():
     mock_result.inserted_id = "mock_mongo_id_12345"
     mock_collection.insert_one = AsyncMock(return_value=mock_result)
 
-    # Mock insert_many
-    mock_many_res = MagicMock()
-    mock_many_res.inserted_ids = ["id_1", "id_2"]
-    mock_collection.insert_many = AsyncMock(return_value=mock_many_res)
-
     # Mock count_documents
     mock_collection.count_documents = AsyncMock(return_value=2)
 
@@ -150,8 +115,18 @@ async def test_mocked_mongo_insert_and_query():
     mock_cursor.limit.return_value = mock_cursor
 
     async def mock_cursor_iter():
-        yield {"_id": "id_1", "camera_id": 1, "class_name": "fire", "confidence": 0.91}
-        yield {"_id": "id_2", "camera_id": 1, "class_name": "smoke", "confidence": 0.82}
+        yield {
+            "_id": "id_1", "camera_id": 1, "camera_name": "Cam 1",
+            "location": "Gate A", "alert_type": "fire", "confidence": 0.91,
+            "snapshot_path": "evidence/2026-09-25/fire_001.jpg",
+            "timestamp": datetime.now(timezone.utc)
+        }
+        yield {
+            "_id": "id_2", "camera_id": 1, "camera_name": "Cam 1",
+            "location": "Gate A", "alert_type": "smoke", "confidence": 0.82,
+            "snapshot_path": "evidence/2026-09-25/smoke_001.jpg",
+            "timestamp": datetime.now(timezone.utc)
+        }
 
     mock_cursor.__aiter__ = lambda self: mock_cursor_iter()
     mock_collection.find.return_value = mock_cursor
@@ -160,29 +135,24 @@ async def test_mocked_mongo_insert_and_query():
 
     with patch.object(mongodb_manager, "is_connected", True):
         with patch.object(mongodb_manager, "db", mock_db):
-            # Test log_detection
-            doc_id = await mongo_detection_service.log_detection(
+            # Test log_alert_event
+            doc_id = await mongo_alert_service.log_alert_event(
                 camera_id=1,
                 camera_name="Cam 1",
-                class_name="fire",
+                location="Gate A",
+                alert_type="fire",
                 confidence=0.91,
-                bounding_box={"x1": 0, "y1": 0, "x2": 10, "y2": 10}
+                snapshot_path="evidence/2026-09-25/fire_001.jpg"
             )
             assert doc_id == "mock_mongo_id_12345"
 
-            # Test log_detections_batch
-            batch_count = await mongo_detection_service.log_detections_batch(
-                camera_id=1,
-                camera_name="Cam 1",
-                detections=[{"class_name": "fire"}, {"class_name": "smoke"}]
-            )
-            assert batch_count == 2
-
             # Test query
-            history = await mongo_detection_service.query_detection_history(
-                MongoQueryFilter(camera_id=1)
+            history = await mongo_alert_service.query_alert_events(
+                AlertEventQueryFilter(camera_id=1)
             )
             assert history["mongodb_connected"] is True
             assert history["total"] == 2
             assert len(history["items"]) == 2
             assert history["items"][0]["id"] == "id_1"
+            assert history["items"][0]["alert_type"] == "fire"
+            assert history["items"][0]["snapshot_path"] == "evidence/2026-09-25/fire_001.jpg"

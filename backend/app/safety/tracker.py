@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from app.detection.base import BoundingBox, DetectionResult
+from app.config.settings import settings
 
 
 @dataclass
@@ -17,6 +18,7 @@ class TrackedPerson:
     bbox: BoundingBox
     confidence: float
     last_seen_timestamp: float
+    last_confirmed_time: float = 0.0  # Wall-clock time of last matched fresh detection
     hits: int = 1
     age: int = 1
 
@@ -57,11 +59,13 @@ class PersonTracker:
             if d.confidence >= 0.28 and (d.bbox.y_max - d.bbox.y_min) >= 0.08
         ]
 
-        # If no active detections, increment disappeared counts
+        # If no active detections, increment disappeared counts and purge stale tracks
         if not person_detections:
+            staleness_limit = float(getattr(settings, "FIRE_SCENE_TRACK_STALENESS_SECONDS", 3.0))
             for pid in list(self._tracked_persons.keys()):
                 self._disappeared_counts[pid] = self._disappeared_counts.get(pid, 0) + 1
-                if self._disappeared_counts[pid] > self.max_disappeared_frames:
+                track = self._tracked_persons[pid]
+                if self._disappeared_counts[pid] > self.max_disappeared_frames or (now - track.last_confirmed_time) > staleness_limit:
                     self._tracked_persons.pop(pid, None)
                     self._disappeared_counts.pop(pid, None)
             return self.get_active_tracks()
@@ -105,6 +109,7 @@ class PersonTracker:
 
                     tracked.confidence = round(0.3 * tracked.confidence + 0.7 * matched_det.confidence, 4)
                     tracked.last_seen_timestamp = now
+                    tracked.last_confirmed_time = now
                     tracked.hits += 1
                     tracked.age += 1
                     self._disappeared_counts[pid] = 0
@@ -123,14 +128,25 @@ class PersonTracker:
                 camera_id=self.camera_id,
                 bbox=det.bbox,
                 confidence=det.confidence,
-                last_seen_timestamp=now
+                last_seen_timestamp=now,
+                last_confirmed_time=now
             )
             self._tracked_persons[pid] = new_track
             self._disappeared_counts[pid] = 0
 
-        # Remove stale tracks
+        # Remove stale tracks (frame-count based)
         for pid in list(self._tracked_persons.keys()):
             if self._disappeared_counts.get(pid, 0) > self.max_disappeared_frames:
+                self._tracked_persons.pop(pid, None)
+                self._disappeared_counts.pop(pid, None)
+
+        # Hard-drop tracks not reconfirmed by a fresh detection within the staleness window.
+        # A worker who genuinely left the scene (or was a phantom silhouette) must not keep a
+        # track alive indefinitely just because the frame-count grace window hasn't been exhausted.
+        staleness_limit = float(getattr(settings, "FIRE_SCENE_TRACK_STALENESS_SECONDS", 3.0))
+        for pid in list(self._tracked_persons.keys()):
+            track = self._tracked_persons[pid]
+            if (now - track.last_confirmed_time) > staleness_limit:
                 self._tracked_persons.pop(pid, None)
                 self._disappeared_counts.pop(pid, None)
 

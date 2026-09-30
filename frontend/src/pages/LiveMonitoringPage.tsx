@@ -17,7 +17,7 @@ export const LiveMonitoringPage: React.FC = () => {
   const camera = cameras.find((c) => c.id === selectedCameraId) || cameras[0];
 
   return (
-    <div className="flex flex-col flex-1 h-[calc(100vh-6.5rem)] min-h-[500px] w-full gap-3 font-sans">
+    <div className="flex flex-col flex-1 w-full gap-3 font-sans">
       {/* Top Stream Control Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white px-4 py-2.5 rounded-2xl border border-slate-200/80 shadow-card shrink-0">
         <div className="flex items-center gap-3">
@@ -115,7 +115,7 @@ export const LiveMonitoringPage: React.FC = () => {
         ) : (
           <CameraStreamPlayer
             camera={camera}
-            fullHeight={true}
+            fullHeight={false}
             fitMode={fitMode}
             onFitModeChange={setFitMode}
           />

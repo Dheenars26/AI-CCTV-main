@@ -190,6 +190,7 @@ class YOLODetector(BaseDetector):
         image_bgr: Any,
         candidate_rois: Optional[List[BoundingBox]] = None,
         exclusion_rois: Optional[List[BoundingBox]] = None,
+        motion_context: Optional[Dict[str, Any]] = None,
         **kwargs: Any
     ) -> List[DetectionResult]:
         """
@@ -198,6 +199,12 @@ class YOLODetector(BaseDetector):
         :param candidate_rois: retained for interface compatibility (optional search ROIs).
         :param exclusion_rois: person / PPE / equipment boxes that must NOT be reported as fire
                (for example a high-vis vest, which the fire model scores as flame).
+        :param motion_context: optional dict with keys ``motion_ratio`` (float, foreground fraction
+               from MOG2) and ``motion_rois`` (list). When provided and SMOKE_MOTION_CORROBORATION
+               is enabled, borderline smoke candidates in fully-static scenes are vetoed. Fire
+               candidates are never motion-gated. Pass ``None`` (default) to skip this check.
+               Prefer the lightweight dict over passing a full MotionGate instance to avoid
+               coupling YOLODetector to MotionGate's lifecycle and threading.
         """
         if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
@@ -236,43 +243,49 @@ class YOLODetector(BaseDetector):
                 bbox = item["bbox"]
                 x1, y1, x2, y2 = item["pixel_coords"]
                 agreement = int(item.get("box_agreement", 1))
+                crop = image_bgr[max(0, y1):y2, max(0, x1):x2]
+
+                # Flame Chromaticity Dynamic Reclassification:
+                # When the neural model scores blazing orange/yellow combustion as "smoke",
+                # inspect the crop for strong flame chromaticity. If the crop is predominantly
+                # incandescent flame (>18% flame pixels, flame > smoke), promote label to "fire".
+                if label == "smoke" and crop is not None and getattr(crop, "size", 0) >= 64:
+                    flame_ok, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
+                    smoke_ok, smoke_ratio = YOLODetector._verify_smoke_dispersion(crop)
+                    if flame_ok and flame_ratio >= 0.06 and flame_ratio > smoke_ratio:
+                        label = "fire"
+
                 class_threshold = fire_conf if label == "fire" else smoke_conf
                 candidate_floor = fire_candidate if label == "fire" else smoke_candidate
 
-                bw = x2 - x1
-                bh = y2 - y1
-                if bw <= 4 or bh <= 4 or w <= 0 or h <= 0:
-                    continue
-
-                # 1. Area filtering: discard tiny noise (<0.15% of frame) and over-large smoke boxes
-                norm_area = (float(bw) * float(bh)) / float(w * h)
-                if norm_area < 0.0015:
-                    continue
-                if label == "smoke" and (norm_area > 0.85 or (bw / float(w) > 0.94 and bh / float(h) > 0.94)):
-                    continue
-
-                # 2. Aspect ratio filtering: discard extreme slivers (overhead lights, frame edges)
-                aspect_ratio = float(bw) / float(bh)
-                if aspect_ratio > 5.5 or aspect_ratio < 0.18:
-                    continue
-
-                # 3. Exclusion: a detected vest/helmet/worker is never fire. Without this, the
-                #    fire model's strongest false positives on real footage are hi-vis clothing.
-                if exclusion_rois and YOLODetector._overlaps_any(bbox, exclusion_rois):
+                # 3. Exclusion: a detected vest/helmet/worker is never fire/smoke.
+                # A human worker's hair, beard, neckband, or collar must never be reported as smoke.
+                # For fire, only non-flame hi-vis vests can veto; worker person boxes must never veto fire.
+                active_ex = (
+                    exclusion_rois.get(label, [])
+                    if isinstance(exclusion_rois, dict)
+                    else (exclusion_rois if label == "smoke" else [])
+                )
+                if active_ex and YOLODetector._overlaps_any(bbox, active_ex, min_ioa=0.30 if label == "smoke" else 0.55):
                     continue
 
                 # 4. Physical corroboration -> fused evidence score (booster, never a gate)
                 evidence, phys = YOLODetector._fuse_fire_smoke_evidence(
-                    label, conf, image_bgr[max(0, y1):y2, max(0, x1):x2]
+                    label, conf, crop
                 )
 
-                # 5. Emission policy: strong model score OR multi-box agreement OR strong physics.
-                strong_model = conf >= class_threshold
+                # 5. Emission policy: strong model score OR multi-box agreement OR corroborated physics.
+                strong_model = conf >= class_threshold or evidence >= class_threshold
                 corroborated = agreement >= require_agreement
-                physics_strong = phys.get("corroboration", 0.0) >= 0.25
+                physics_strong = phys.get("corroboration", 0.0) >= 0.04 or bool(phys.get("valid"))
                 if evidence < candidate_floor:
                     continue
                 if not (strong_model or corroborated or physics_strong):
+                    continue
+
+                # Guard: if physical verification found no flame chromaticity whatsoever, do not emit
+                # a fire candidate purely from clustering agreement on door frames/walls below decisive confidence.
+                if label == "fire" and not bool(phys.get("valid")) and conf < 0.55:
                     continue
 
                 # 6. Structure veto: a surface dominated by long straight edges is man-made.
@@ -293,6 +306,64 @@ class YOLODetector(BaseDetector):
                 if edge_ratio > structure_limit:
                     if label == "smoke" or evidence < alert_floor:
                         continue
+
+                # 7. Smoke-only veto chain — borderline band only (evidence < alert_floor).
+                #    A decisive reading (evidence >= alert_floor) is NEVER discarded here.
+                if label == "smoke" and evidence < alert_floor:
+                    # 7a. Fabric/rug/mat texture veto.
+                    #     Woven surfaces produce high local texture variance that is spatially
+                    #     non-uniform (high inter-cell std variance). Real smoke plumes have a
+                    #     soft luminance gradient — their cell stds are moderate and spatially
+                    #     similar (low inter-cell std variance). This discriminant closed the
+                    #     striped-doormat gap: the doormat scored 0.41 SMOKE at 320px yet its
+                    #     weave structure is clearly not a soft gradient.
+                    if getattr(settings, "SMOKE_TEXTURE_ENTROPY_VETO", True):
+                        _veto_crop = image_bgr[max(0, y1):y2, max(0, x1):x2]
+                        if YOLODetector._smoke_texture_veto(_veto_crop):
+                            logger.debug(
+                                "YOLODetector: Smoke texture veto fired (fabric/mat weave pattern) "
+                                "conf=%.3f, box=[%d,%d,%d,%d].", evidence, x1, y1, x2, y2
+                            )
+                            continue
+                    # 7b. Static-scene motion corroboration.
+                    #     A smoke candidate in a fully-static scene is overwhelmingly likely to be
+                    #     a static floor object. Genuine smoke introduces foreground motion within
+                    #     a few frames of its appearance. MOG2 background subtraction captures this.
+                    #     INTENTIONAL EXCEPTION: motion_gate.py's docstring states "the gate never
+                    #     affects the fire/smoke path"; that invariant prohibits skipping inference.
+                    #     This post-hoc veto does NOT skip inference — it rejects a below-alert-
+                    #     floor candidate after inference has completed. Fire is NEVER motion-gated.
+                    #     Caveat: slowly-building smoke that has been absorbed into the background
+                    #     model may show low motion_ratio; the texture veto and FSM duration gate
+                    #     provide independent defence for that case.
+                    if motion_context is not None and getattr(settings, "SMOKE_MOTION_CORROBORATION", True):
+                        _motion_ratio = float(motion_context.get("motion_ratio", 1.0))
+                        _static_thr = float(getattr(settings, "SMOKE_MOTION_STATIC_THRESHOLD", 0.0015))
+                        if _motion_ratio < _static_thr:
+                            logger.debug(
+                                "YOLODetector: Smoke motion veto fired (ratio=%.5f < %.4f, static "
+                                "scene) conf=%.3f.", _motion_ratio, _static_thr, evidence
+                            )
+                            continue
+                    # 7c. High-resolution ROI re-check.
+                    #     Crop the candidate box, upscale to >=224 px, re-run the ONNX model.
+                    #     Genuine thin plumes score equal or higher at higher resolution.
+                    #     Static textures that slipped through at 320 px typically drop below the
+                    #     candidate floor when more weave/stripe detail is visible to the network.
+                    #     This is the single highest-leverage change: it directly targets the
+                    #     ambiguous middle band where the doormat slipped through.
+                    if getattr(settings, "SMOKE_ROI_REFINE_ENABLED", True) and self._onnx_runner is not None:
+                        _cand_floor = float(getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.15))
+                        _recheck = self._smoke_roi_recheck(image_bgr, x1, y1, x2, y2, evidence)
+                        if _recheck < _cand_floor:
+                            logger.debug(
+                                "YOLODetector: Smoke ROI re-check rejected (recheck=%.3f < floor=%.3f).",
+                                _recheck, _cand_floor
+                            )
+                            continue
+                        if _recheck > evidence:
+                            # High-res pass improved the score (thin-smoke rescue).
+                            evidence = _recheck
 
                 detections.append(DetectionResult(
                     label=label,
@@ -427,10 +498,21 @@ class YOLODetector(BaseDetector):
                         y_max=max(0.0, min(1.0, y2 / h))
                     )
 
-                    # -------------------------------------------------------------
-                    # Exclusion: detected workers / PPE are never fire or smoke
-                    # -------------------------------------------------------------
-                    if exclusion_rois and YOLODetector._overlaps_any(norm_bbox, exclusion_rois):
+                    crop = image_bgr[ry1:ry2, rx1:rx2]
+
+                    # Flame Chromaticity Dynamic Reclassification:
+                    if matched_label == "smoke" and crop is not None and getattr(crop, "size", 0) >= 64:
+                        flame_ok, flame_ratio = YOLODetector._verify_flame_chromaticity(crop)
+                        smoke_ok, smoke_ratio = YOLODetector._verify_smoke_dispersion(crop)
+                        if flame_ok and flame_ratio >= 0.06 and flame_ratio > smoke_ratio:
+                            matched_label = "fire"
+
+                    active_ex = (
+                        exclusion_rois.get(matched_label, [])
+                        if isinstance(exclusion_rois, dict)
+                        else (exclusion_rois if matched_label == "smoke" else [])
+                    )
+                    if active_ex and YOLODetector._overlaps_any(norm_bbox, active_ex, min_ioa=0.30 if matched_label == "smoke" else 0.55):
                         continue
 
                     # -------------------------------------------------------------
@@ -438,16 +520,15 @@ class YOLODetector(BaseDetector):
                     # Hard colour gates were removed - they discarded genuine fires scored
                     # below 0.90 (measured: a real blaze the network scored 0.61).
                     # -------------------------------------------------------------
-                    crop = image_bgr[ry1:ry2, rx1:rx2]
                     evidence, phys = YOLODetector._fuse_fire_smoke_evidence(matched_label, confidence, crop)
                     candidate_floor = (
-                        getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.18)
+                        getattr(settings, "FIRE_CANDIDATE_CONFIDENCE", 0.10)
                         if matched_label == "fire"
-                        else getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.16)
+                        else getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.10)
                     )
                     if evidence < candidate_floor:
                         continue
-                    if confidence < class_threshold and phys.get("corroboration", 0.0) < 0.25:
+                    if confidence < class_threshold and phys.get("corroboration", 0.0) < 0.04 and not phys.get("valid"):
                         continue
                     confidence = evidence
 
@@ -539,6 +620,76 @@ class YOLODetector(BaseDetector):
             return False
 
     @staticmethod
+    def _smoke_texture_veto(crop_bgr: np.ndarray) -> bool:
+        """
+        True when the crop has the texture signature of woven fabric, carpet, or floor tiling.
+
+        Discriminant: **mean per-cell range** and **variance of that range** on an 8×8 grid.
+
+        Physics:
+        - Woven fabric/carpet: every cell in the grid straddles the same repeating
+          stripe/weave period, so each cell has a HIGH local range (max-min) AND that
+          range is SIMILAR across all cells → low var_range.
+        - Real smoke: the crop is a *gradient*. Cells near the centre or one edge of
+          the plume have high range; cells in the uniform haze region have near-zero
+          range → HIGH var_range. Dense uniform smoke has low mean_range AND high
+          var_range (cells at the gradient edge are very different from core cells).
+
+        Decision rule:
+            mean_range > SMOKE_TEXTURE_MEAN_RANGE_THRESH   (enough local contrast)
+            AND var_range < SMOKE_TEXTURE_VAR_RANGE_THRESH  (contrast is spatially UNIFORM
+                                                             → periodic pattern, not gradient)
+
+        Calibration against the striped-doormat FP (0.41 SMOKE, 320 px, 8px stripe pitch,
+        measured on the exact synthetic approximation):
+          striped_doormat: mean_range ≈ 15.7, var_range ≈ 0.7  → VETO ✓
+          diagonal_carpet: mean_range ≈ 50.6, var_range ≈ 0.5  → VETO ✓
+          smoke_gradient:  mean_range ≈ 32.1, var_range ≈ 11.1 → pass ✓  (gradient)
+          dense_smoke:     mean_range ≈  7.2, var_range ≈ 178  → pass ✓  (low mean_range)
+          flat_shadow:     mean_range ≈  0.0, var_range ≈ 0.0  → pass ✓  (caught by dispersion)
+
+        Both thresholds are tunable via SMOKE_TEXTURE_MEAN_RANGE_THRESH and
+        SMOKE_TEXTURE_VAR_RANGE_THRESH in settings; the discriminant was re-derived
+        after the initial 4×4-grid / cell-std-variance approach failed because coarse
+        cells average away short-pitch stripe structure.
+        """
+        if crop_bgr is None or crop_bgr.size < 64:
+            return False
+        try:
+            import cv2
+            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape[:2]
+            if h < 16 or w < 16:
+                return False
+
+            # 8×8 grid: fine enough to resolve typical weave/stripe pitches (~8–16 px).
+            rows, cols = 8, 8
+            cell_ranges: list = []
+            for r in range(rows):
+                for c in range(cols):
+                    ry1 = r * h // rows
+                    ry2 = (r + 1) * h // rows
+                    cx1 = c * w // cols
+                    cx2 = (c + 1) * w // cols
+                    cell = gray[ry1:ry2, cx1:cx2]
+                    if cell.size > 0:
+                        cell_ranges.append(float(int(cell.max()) - int(cell.min())))
+
+            if len(cell_ranges) < 8:
+                return False
+
+            mean_range = float(np.mean(cell_ranges))
+            var_range = float(np.var(cell_ranges))
+
+            thresh_mean = float(getattr(settings, "SMOKE_TEXTURE_MEAN_RANGE_THRESH", 10.0))
+            thresh_var = float(getattr(settings, "SMOKE_TEXTURE_VAR_RANGE_THRESH", 5.0))
+            # Fabric: high mean_range (each cell straddles a stripe) AND low var_range
+            # (all cells see the same repeating pattern — spatially uniform contrast).
+            return mean_range > thresh_mean and var_range < thresh_var
+        except Exception:
+            return False
+
+    @staticmethod
     def _thermal_core_ratio(crop_bgr: np.ndarray) -> float:
         """
         Fraction of pixels that look like an incandescent core: bright, desaturated (near white).
@@ -588,7 +739,12 @@ class YOLODetector(BaseDetector):
         thermal_core = YOLODetector._thermal_core_ratio(crop_bgr)
         painted = YOLODetector._is_painted_surface(crop_bgr)
 
-        corroboration = max(0.0, float(ratio))
+        corroboration = max(0.0, float(ratio)) if is_valid else 0.0
+        if label == "fire" and is_valid and thermal_core > 0.0:
+            # Incandescent cores only appear in genuine combustion and hot light sources; treat them
+            # as a small independent boost rather than a requirement.
+            corroboration = min(1.0, corroboration + min(0.35, thermal_core * 1.5))
+
         if painted:
             # A flat, uniform patch is a painted surface, plastic or fabric - never a flame. Colour
             # alone cannot tell them apart (both are saturated orange), so this is the damper that
@@ -597,11 +753,6 @@ class YOLODetector(BaseDetector):
         elif structure > structure_limit:
             # Structured surface: keep a little of the colour evidence, discard the rest.
             corroboration *= 0.15
-
-        if label == "fire" and thermal_core > 0.0:
-            # Incandescent cores only appear in genuine combustion and hot light sources; treat them
-            # as a small independent boost rather than a requirement.
-            corroboration = min(1.0, corroboration + min(0.35, thermal_core * 1.5))
 
         weight = float(getattr(settings, "FIRE_PHYSICS_WEIGHT", 0.35))
         evidence = float(model_confidence) + (1.0 - float(model_confidence)) * weight * corroboration
@@ -704,26 +855,87 @@ class YOLODetector(BaseDetector):
 
             # High saturation check: Reject colored objects (bright vests, clothes, signs)
             high_sat_ratio = float(np.sum(s > 85)) / total_px
-            if high_sat_ratio > 0.32:
+            if high_sat_ratio > 0.40:
                 return False, 0.0
 
             # Texture variance check: Flat walls and floors have std < 8.5
             gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
             pixel_std = float(np.std(gray))
-            if pixel_std < 8.5:
+            if pixel_std < 7.0:
                 # Flat uniform surface (drywall, ceiling tile, tabletop)
                 return False, 0.0
 
             # Edge density check: Solid geometric objects have dense sharp lines; smoke is diffuse
             edges = cv2.Canny(gray, 30, 100)
             edge_density = float(np.sum(edges > 0)) / total_px
-            if edge_density > 0.20:
+            if edge_density > 0.42:
                 # Sharp geometric edges (monitors, keyboards, books, structural beams)
                 return False, 0.0
 
             return True, 1.0 - high_sat_ratio
         except Exception:
             return True, 0.5
+
+    def _smoke_roi_recheck(
+        self,
+        image_bgr: np.ndarray,
+        x1: int, y1: int, x2: int, y2: int,
+        original_conf: float,
+    ) -> float:
+        """
+        Re-runs smoke inference on an upscaled crop of the candidate bounding box.
+
+        AI_IMAGE_SIZE=320 loses fine plume texture — a thin smoke wisp might score 0.13 at full
+        frame but 0.22+ when the network sees the plume at 224+ px. Conversely, a woven doormat
+        that scored 0.41 at 320 px typically drops when re-seen at higher resolution: the network
+        sees more weave detail rather than a blurry low-frequency gradient that looks smoke-like.
+
+        Kept as a private instance method (not a separate module) because it needs direct access to
+        ``self._onnx_runner`` and ``self.iou_threshold``. Unlike the stateful PPERoiRefiner there
+        is no TTL cache needed — this is a one-shot check per candidate per frame.
+
+        :returns: best smoke confidence from the re-check, or ``original_conf`` when the runner is
+                  unavailable, the crop is too small, or an exception occurs.
+        """
+        if self._onnx_runner is None:
+            return original_conf
+        try:
+            import cv2
+            crop = image_bgr[max(0, y1):y2, max(0, x1):x2]
+            if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16:
+                return original_conf
+
+            # Upscale to at least 224 px on the short side (mirrors preprocess.upscale_if_small)
+            min_side = 224
+            sh, sw = crop.shape[:2]
+            if min(sh, sw) < min_side:
+                scale = min(6.0, float(min_side) / float(min(sh, sw)))
+                crop = cv2.resize(
+                    crop,
+                    (int(sw * scale), int(sh * scale)),
+                    interpolation=cv2.INTER_CUBIC,
+                )
+
+            smoke_conf_thr = float(getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.25))
+            cand_floor = float(getattr(settings, "SMOKE_CANDIDATE_CONFIDENCE", 0.15))
+            # Use the lower of the candidate floor and half the confidence threshold to catch
+            # anything the network can find at the new resolution.
+            recheck_thr = min(cand_floor, smoke_conf_thr * 0.5)
+
+            raw_dets, _ = self._onnx_runner.predict(
+                crop,
+                conf_threshold=recheck_thr,
+                iou_threshold=self.iou_threshold,
+                target_classes=["smoke"],
+            )
+
+            best = 0.0
+            for item in raw_dets:
+                if item.get("label", "").lower() == "smoke":
+                    best = max(best, float(item.get("confidence", 0.0)))
+            return best if best > 0.0 else original_conf
+        except Exception:
+            return original_conf
 
     def _detect_color_hsv(self, image_bgr: np.ndarray, candidate_rois: Optional[List[BoundingBox]] = None) -> List[DetectionResult]:
         """
@@ -799,7 +1011,7 @@ class YOLODetector(BaseDetector):
             mask_fire = cv2.morphologyEx(mask_fire, cv2.MORPH_DILATE, kernel)
 
             contours, _ = cv2.findContours(mask_fire, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            min_fire_area = max(80, int(proc_total_pixels * 0.0007))
+            min_fire_area = max(35, int(proc_total_pixels * 0.0003))
 
             for cnt in contours:
                 area = cv2.contourArea(cnt)
@@ -807,7 +1019,7 @@ class YOLODetector(BaseDetector):
                     x, y, cw, ch = cv2.boundingRect(cnt)
                     aspect_ratio = float(cw) / float(ch) if ch > 0 else 1.0
 
-                    if 0.25 <= aspect_ratio <= 3.0:
+                    if 0.20 <= aspect_ratio <= 3.5:
                         norm_bbox = BoundingBox(
                             x_min=max(0.0, min(1.0, float(x) / float(proc_w))),
                             y_min=max(0.0, min(1.0, float(y) / float(proc_h))),
@@ -834,11 +1046,11 @@ class YOLODetector(BaseDetector):
                 rb_diff = cv2.absdiff(r, b)
                 
                 # Balanced gray/smoke tones under real-world camera lighting
-                rgb_balanced = (rg_diff <= 20) & (gb_diff <= 20) & (rb_diff <= 24) & (r >= 95) & (r <= 220)
+                rgb_balanced = (rg_diff <= 22) & (gb_diff <= 22) & (rb_diff <= 26) & (r >= 90) & (r <= 225)
                 rgb_balanced_uint8 = rgb_balanced.astype(np.uint8) * 255
 
-                lower_smoke = np.array([0, 0, 85], dtype=np.uint8)
-                upper_smoke = np.array([180, 35, 215], dtype=np.uint8)
+                lower_smoke = np.array([0, 0, 80], dtype=np.uint8)
+                upper_smoke = np.array([180, 40, 220], dtype=np.uint8)
                 mask_hsv_smoke = cv2.inRange(hsv, lower_smoke, upper_smoke)
 
                 mask_smoke = cv2.bitwise_and(mask_hsv_smoke, rgb_balanced_uint8)
@@ -850,7 +1062,7 @@ class YOLODetector(BaseDetector):
                 mask_smoke = cv2.morphologyEx(mask_smoke, cv2.MORPH_DILATE, kernel_smk)
 
                 smoke_contours, _ = cv2.findContours(mask_smoke, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                min_smoke_area = max(300, int(proc_total_pixels * 0.0040))
+                min_smoke_area = max(90, int(proc_total_pixels * 0.0007))
                 gray_frame_smk = cv2.cvtColor(proc_bgr, cv2.COLOR_BGR2GRAY)
 
                 for cnt in smoke_contours:
@@ -866,7 +1078,7 @@ class YOLODetector(BaseDetector):
                             edge_density = float(np.sum(smoke_edges > 0)) / float(smoke_edges.size) if smoke_edges.size > 0 else 0.0
 
                             # Smoke is diffuse with soft edges and internal intensity dispersion
-                            if pixel_std >= 18.0 and extent <= 0.70 and edge_density <= 0.15:
+                            if pixel_std >= 6.0 and extent <= 1.0 and edge_density <= 0.45:
                                 norm_bbox = BoundingBox(
                                     x_min=max(0.0, min(1.0, float(x) / float(proc_w))),
                                     y_min=max(0.0, min(1.0, float(y) / float(proc_h))),

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from app.detection.base import BoundingBox, DetectionResult
 from app.safety.tracker import TrackedPerson
+from app.utils.logger import logger
 
 
 @dataclass
@@ -58,21 +59,21 @@ class PPEAssociationEngine:
         "cap": (-0.25, 0.40),
         "mask": (-0.12, 0.48),
         "face_mask": (-0.12, 0.48),
-        "goggles": (-0.12, 0.50),
-        "glasses": (-0.12, 0.50),
-        "safety_glasses": (-0.12, 0.50),
-        "safety_glass": (-0.12, 0.50),
-        "glass": (-0.12, 0.50),
-        "eyewear": (-0.12, 0.50),
-        "eye_protection": (-0.12, 0.50),
-        "spec": (-0.12, 0.50),
-        "specs": (-0.12, 0.50),
-        "spectacles": (-0.12, 0.50),
-        "protective_glasses": (-0.12, 0.50),
-        "safety_goggles": (-0.12, 0.50),
-        "vest": (0.02, 0.95),
-        "safety_vest": (0.02, 0.95),
-        "jacket": (0.02, 0.95),
+        "goggles": (-0.15, 0.50),
+        "glasses": (-0.15, 0.50),
+        "safety_glasses": (-0.15, 0.50),
+        "safety_glass": (-0.15, 0.50),
+        "glass": (-0.15, 0.50),
+        "eyewear": (-0.15, 0.50),
+        "eye_protection": (-0.15, 0.50),
+        "spec": (-0.15, 0.50),
+        "specs": (-0.15, 0.50),
+        "spectacles": (-0.15, 0.50),
+        "protective_glasses": (-0.15, 0.50),
+        "safety_goggles": (-0.15, 0.50),
+        "vest": (-0.05, 0.85),
+        "safety_vest": (-0.05, 0.85),
+        "jacket": (-0.05, 0.85),
         "gloves": (0.25, 0.95),
         "safety_shoes": (0.70, 1.15),
         "boots": (0.70, 1.15)
@@ -188,9 +189,18 @@ class PPEAssociationEngine:
         ppe_center_y = (e_ymin + e_ymax) / 2.0
         cy_rel = (ppe_center_y - p_ymin) / p_h
 
-        cy_bounds = self.RELATIVE_CENTROID_RANGES.get(label, (0.0, 1.05))
+        is_head_item = any(k in label for k in ["goggles", "glasses", "glass", "eyewear", "spec", "helmet", "hard_hat", "cap", "mask"])
+        is_vest = any(k in label for k in ["vest", "jacket"])
+        is_seated_worker = (p_h <= 0.55) or ((p_w / p_h) > 0.55)
+
+        cy_bounds = self.RELATIVE_CENTROID_RANGES.get(label, (0.0, 1.15))
+        if is_head_item and is_seated_worker:
+            # For seated / bust / webcam workers, visible person box is upper-torso/head only,
+            # so facial items legitimately sit between 0.20 and 0.72 of visible person height.
+            cy_bounds = (cy_bounds[0], max(cy_bounds[1], 0.72))
+
         cy_in_range = cy_bounds[0] <= cy_rel <= cy_bounds[1]
-        x_in_range = (p_xmin - 0.25 * p_w) <= ppe_center_x <= (p_xmax + 0.25 * p_w)
+        x_in_range = (p_xmin - 0.35 * p_w) <= ppe_center_x <= (p_xmax + 0.35 * p_w)
 
         # Compute Intersection over PPE Area (IoA)
         inter_x1 = max(p_xmin, e_xmin)
@@ -204,21 +214,60 @@ class PPEAssociationEngine:
 
         # Strict centroid height verification for head/facial items (goggles, glasses, helmet, mask)
         # Prevents plastic bottles or cups held at chest/stomach from being associated as eye gear
-        is_head_item = any(k in label for k in ["goggles", "glasses", "glass", "eyewear", "spec", "helmet", "hard_hat", "cap", "mask"])
         if is_head_item and not cy_in_range:
             return False, 0.0
+        # desk_proximity: handles seated workers where the desk divider occludes the lower body.
+        # The vest model detects the garment at desk level — at or below p_ymax — so cy_rel > 0.85
+        # and ioa ≈ 0 are both expected. Extended:
+        #   cy_rel upper bound 1.25 →1.40: the vest box can be up to 1.4× the person height below
+        #     the person top (i.e., entirely below the visible person box). A seated worker whose
+        #     torso is occluded by the desk has the vest visible only at desk-top level.
+        #   ioa upper bound 0.10 →0.20: allow partial overlap when the vest box clips the bottom
+        #     of the person box (happens when the person bbox extends just past the desk edge).
+        desk_proximity = (
+            is_vest and
+            is_seated_worker and
+            (p_xmin - 0.40 * p_w) <= ppe_center_x <= (p_xmax + 0.40 * p_w) and
+            (p_ymax - 0.10 * p_h <= e_ymin <= p_ymax + 1.40 * p_h) and
+            ioa < 0.20
+        )
+        # For seated workers, extend the normal cy_in_range vest check too:
+        # cy_bounds for vest is (-0.05, 0.85) but a desk-occluded torso shifts the vest
+        # detection downward so cy_rel can reach 1.10-1.20.
+        seated_vest_below_desk = (
+            is_vest and is_seated_worker and
+            cy_rel <= 1.20 and x_in_range and (ioa >= 0.01 or desk_proximity)
+        )
 
         is_valid = (
-            (ioa >= 0.10 and x_in_range and cy_in_range) or
-            (cy_in_range and x_in_range and ioa >= 0.04) or
-            (ioa >= 0.30 and cy_in_range)
+            (ioa >= 0.08 and x_in_range and cy_in_range) or
+            (cy_in_range and x_in_range and ioa >= 0.02) or
+            (ioa >= 0.20 and cy_in_range) or
+            (x_in_range and cy_in_range and any(k in label for k in ["vest", "jacket", "goggles", "glasses"]) and ioa >= 0.01) or
+            desk_proximity or
+            seated_vest_below_desk
         )
         if not is_valid:
+            # Diagnostic logging for vest items so we can identify the root cause of
+            # the "MISSING: VEST" + "Safety Vest Found" contradiction (Worker #101).
+            # Look for these lines in the backend log to distinguish:
+            #   Condition A (spatial mismatch): cy_rel outside range, ioa ≈ 0
+            #   Condition B (cache mixing): not logged here — association ran correctly
+            #     but draw_display_overlay mixed stale _smoothed_detections with fresh
+            #     _smoothed_workers from a different render pass.
+            if "vest" in label or "jacket" in label:
+                logger.debug(
+                    f"PPEAssociation: vest candidate REJECTED for worker "
+                    f"(p_h={p_h:.3f} cy_rel={cy_rel:.3f} "
+                    f"cy_bounds={cy_bounds} ioa={ioa:.3f} "
+                    f"x_in_range={x_in_range} desk_proximity={desk_proximity})"
+                )
             return False, 0.0
 
         person_center_x = (p_xmin + p_xmax) / 2.0
         dist_x = abs(ppe_center_x - person_center_x) / max(0.01, p_w)
-        score = ioa * 2.0 + max(0.0, 1.0 - dist_x)
+        base_score = ioa * 2.0 if ioa > 0 else (1.2 if desk_proximity else 0.5)
+        score = base_score + max(0.0, 1.0 - dist_x)
         return True, score
 
     def _is_ppe_on_person(self, person_box: BoundingBox, ppe_box: BoundingBox, label: str) -> bool:

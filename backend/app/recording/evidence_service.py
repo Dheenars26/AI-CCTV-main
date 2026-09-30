@@ -359,6 +359,27 @@ class EvidenceService:
                 session.watchdog = watchdog
                 watchdog.start()
 
+            # Forward alert event to MongoDB with snapshot path
+            try:
+                from app.services.mongo_service import schedule_mongo_alert_log
+                from app.models.camera import Camera
+                cam_location = None
+                if hasattr(self, '_db_session') and self._db_session:
+                    cam = self._db_session.query(Camera).filter(Camera.id == event.camera_id).first()
+                    cam_location = getattr(cam, "location", None) if cam else None
+                schedule_mongo_alert_log(
+                    camera_id=event.camera_id,
+                    camera_name=camera_name,
+                    location=cam_location,
+                    alert_type=event.class_name,
+                    confidence=event.max_confidence,
+                    snapshot_path=os.path.relpath(snapshot_path, self.base_storage_dir),
+                    timestamp=event.start_time,
+                    metadata={"evidence_id": evidence_id}
+                )
+            except Exception:
+                pass
+
             logger.info(
                 f"EvidenceService: Archived Evidence {evidence_id} for Camera {event.camera_id} "
                 f"[{event.class_name.upper()} conf={round(event.max_confidence, 2)}] -> Snapshot: '{snapshot_path}'"

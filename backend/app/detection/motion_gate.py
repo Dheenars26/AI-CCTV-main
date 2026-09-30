@@ -180,6 +180,11 @@ class MotionGate:
 
     # ------------------------------------------------------------------ #
     @property
+    def motion_ratio(self) -> float:
+        """Foreground motion ratio of the most recent frame."""
+        return float(self._last_motion_ratio)
+
+    @property
     def motion_rois(self) -> List[Tuple[float, float, float, float]]:
         """Normalised boxes of the most recent moving regions."""
         return list(self._last_rois)

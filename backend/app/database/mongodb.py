@@ -18,9 +18,10 @@ try:  # pragma: no cover - environment dependent
     from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
     MOTOR_AVAILABLE = True
 except Exception:  # pragma: no cover
-    AsyncIOMotorClient = None  # type: ignore[assignment]
-    AsyncIOMotorDatabase = None  # type: ignore[assignment]
+    AsyncIOMotorClient: Any = None
+    AsyncIOMotorDatabase: Any = None
     MOTOR_AVAILABLE = False
+
 
 
 class MongoDBManager:
@@ -43,7 +44,8 @@ class MongoDBManager:
             self.is_connected = False
             return False
 
-        if not MOTOR_AVAILABLE:
+        client_cls = AsyncIOMotorClient
+        if not MOTOR_AVAILABLE or client_cls is None:
             self.is_connected = False
             self.last_error = "motor driver not installed"
             logger.warning(
@@ -58,17 +60,19 @@ class MongoDBManager:
 
         try:
             logger.info(f"Connecting to MongoDB at '{url}' (database: '{db_name}')...")
-            self.client = AsyncIOMotorClient(
+            client = client_cls(
                 url,
                 serverSelectionTimeoutMS=timeout_ms,
                 connectTimeoutMS=timeout_ms,
                 maxPoolSize=50,
                 minPoolSize=5
             )
-            self.db = self.client[db_name]
+            db = client[db_name]
+            self.client = client
+            self.db = db
 
             # Fast ping check
-            await self.db.command("ping")
+            await db.command("ping")
             self.is_connected = True
             self.last_error = None
             logger.info(f"MongoDB connected successfully to database '{db_name}'.")
@@ -87,19 +91,23 @@ class MongoDBManager:
             return False
 
     async def _ensure_indices(self) -> None:
-        """Creates compound indices for high-velocity detection logs."""
+        """Drops legacy collections and creates indices on the new alert_events collection."""
         if not self.is_connected or self.db is None:
             return
 
         try:
-            # detection_logs indices
-            await self.db["detection_logs"].create_index([("camera_id", 1), ("timestamp", -1)])
-            await self.db["detection_logs"].create_index([("timestamp", -1)])
-            await self.db["detection_logs"].create_index([("class_name", 1)])
+            # Drop legacy collections that stored verbose per-frame data
+            existing = await self.db.list_collection_names()
+            for legacy_coll in ["detection_logs", "telemetry_logs"]:
+                if legacy_coll in existing:
+                    await self.db.drop_collection(legacy_coll)
+                    logger.info(f"MongoDB: Dropped legacy collection '{legacy_coll}'.")
 
-            # telemetry_logs indices
-            await self.db["telemetry_logs"].create_index([("camera_id", 1), ("timestamp", -1)])
-            logger.debug("MongoDB: Query indices verified on 'detection_logs' and 'telemetry_logs'.")
+            # alert_events indices
+            await self.db["alert_events"].create_index([("camera_id", 1), ("timestamp", -1)])
+            await self.db["alert_events"].create_index([("timestamp", -1)])
+            await self.db["alert_events"].create_index([("alert_type", 1)])
+            logger.debug("MongoDB: Query indices verified on 'alert_events'.")
         except Exception as e:
             logger.warning(f"MongoDB: Index creation warning: {e}")
 
@@ -133,7 +141,7 @@ class MongoDBManager:
 
                 # Count documents in primary collections
                 counts = {}
-                for coll_name in ["detection_logs", "telemetry_logs", "audit_events"]:
+                for coll_name in ["alert_events"]:
                     if coll_name in collections:
                         counts[coll_name] = await self.db[coll_name].count_documents({})
                     else:
@@ -160,8 +168,9 @@ async def close_mongo_connection() -> None:
     await mongodb_manager.close()
 
 
-def get_mongo_db() -> Optional[AsyncIOMotorDatabase]:
+def get_mongo_db() -> Optional[Any]:
     """FastAPI dependency for accessing the MongoDB database instance."""
     if mongodb_manager.is_connected:
         return mongodb_manager.db
     return None
+

@@ -532,11 +532,12 @@ def resolve_model_path(raw_path: Optional[str] = None, default_names: Optional[L
         "yolov8n.pt",
     ]
 
-    check_paths: List[str] = []
     if raw_path:
-        check_paths.append(raw_path)
-        check_paths.append(os.path.join(workspace_root, raw_path))
-        check_paths.append(os.path.join(backend_root, raw_path))
+        check_paths = [
+            raw_path,
+            os.path.join(workspace_root, raw_path),
+            os.path.join(backend_root, raw_path),
+        ]
         basename = os.path.basename(raw_path)
         check_paths.append(os.path.join(backend_root, "models", basename))
         check_paths.append(os.path.join(workspace_root, "models", basename))
@@ -550,20 +551,25 @@ def resolve_model_path(raw_path: Optional[str] = None, default_names: Optional[L
             check_paths.append(os.path.join(backend_root, "models", os.path.basename(stem) + alt_ext))
             check_paths.append(os.path.join(workspace_root, "models", os.path.basename(stem) + alt_ext))
 
+        for p in check_paths:
+            if p and os.path.isfile(p):
+                return os.path.abspath(p)
+
+        return raw_path
+
     for d in defaults:
-        check_paths.extend([
+        fallback_paths = [
             os.path.join(workspace_root, d),
             os.path.join(backend_root, d),
             os.path.join(workspace_root, "runs", "detect", "train", "weights", os.path.basename(d)),
             os.path.join(backend_root, "models", os.path.basename(d)),
             os.path.join(workspace_root, "models", os.path.basename(d)),
-        ])
+        ]
+        for p in fallback_paths:
+            if p and os.path.isfile(p):
+                return os.path.abspath(p)
 
-    for p in check_paths:
-        if p and os.path.isfile(p):
-            return os.path.abspath(p)
-
-    return raw_path or os.path.join(workspace_root, "runs", "detect", "train", "weights", "best.pt")
+    return os.path.join(workspace_root, "runs", "detect", "train", "weights", "best.pt")
 
 
 _GLOBAL_ULTRALYTICS_CACHE: Dict[str, "UltralyticsYOLORunner"] = {}

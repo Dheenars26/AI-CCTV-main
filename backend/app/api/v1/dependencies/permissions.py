@@ -30,6 +30,7 @@ ROLE_PERMISSIONS: Dict[str, Set[str]] = {
         "dvr:health_read",
         "alerts:read",
         "alerts:write",
+        "detections:read",
         "evidence:read",
         "evidence:purge",
         "reports:read",

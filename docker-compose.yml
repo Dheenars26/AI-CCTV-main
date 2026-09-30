@@ -70,13 +70,14 @@ services:
           memory: 4G
     restart: always
 
-  # 4. Ingestion Worker Service (Camera Workers)
+  # 4. Ingestion Worker Service (Optional Distributed Cluster Profile)
   ingestion-worker:
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
     container_name: cctv_ingestion_worker
     command: ["python", "-m", "app.cli.start_ingestion_worker"]
+    profiles: ["distributed"]
     env_file:
       - ./backend/.env.production
     volumes:
@@ -96,13 +97,14 @@ services:
           memory: 8G
     restart: always
 
-  # 5. AI Worker Service (GPU Acceleration + PyTorch)
+  # 5. AI Worker Service (Optional Distributed GPU Profile)
   ai-worker:
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
     container_name: cctv_ai_worker
     command: ["python", "-m", "app.cli.start_ai_worker"]
+    profiles: ["distributed"]
     env_file:
       - ./backend/.env.production
     volumes:
@@ -125,13 +127,14 @@ services:
         condition: service_healthy
     restart: always
 
-  # 6. Retention Cleaner Worker
+  # 6. Retention Cleaner Worker (Optional Distributed Profile)
   retention-worker:
     build:
       context: ./backend
       dockerfile: Dockerfile.worker
     container_name: cctv_retention_worker
     command: ["python", "-m", "app.cli.start_retention_worker"]
+    profiles: ["distributed"]
     env_file:
       - ./backend/.env.production
     volumes:
@@ -151,7 +154,7 @@ services:
     environment:
       POSTGRES_DB: cctv_monitor
       POSTGRES_USER: cctv_user
-      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cctv_secure_pass_2026}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -172,13 +175,13 @@ services:
   redis:
     image: redis:7-alpine
     container_name: cctv_redis
-    command: redis-server --appendonly yes --requirepass_file /run/secrets/redis_password
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-cctv_redis_pass_2026}"]
     volumes:
       - redis_data:/data
     networks:
       - data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-cctv_redis_pass_2026} ping"]
       interval: 10s
       timeout: 5s
       retries: 5

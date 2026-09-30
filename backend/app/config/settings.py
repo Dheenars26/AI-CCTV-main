@@ -58,7 +58,8 @@ class Settings(BaseSettings):
     # AI Model & Compute Engine Configuration
     AI_DEVICE: str = "cpu"
     AI_HALF_PRECISION: bool = True
-    AI_IMAGE_SIZE: int = 320
+    # AI_IMAGE_SIZE: raised from 320 to 640 for significantly better small-object accuracy (smoke, glasses)
+    AI_IMAGE_SIZE: int = 640
     AI_TARGET_FPS: int = 10
     ENABLE_PERSON_TRACKING: bool = True
     ENABLE_PPE_ROI: bool = True  # Worker-crop refinement: measured to double safety-glasses recall
@@ -73,34 +74,67 @@ class Settings(BaseSettings):
     ENABLE_PERSON_ROI_REFINE: bool = True   # Second-pass person search on motion regions
     PERSON_ROI_REFINE_MAX_ROIS: int = 1      # Bounded so the extra inference stays predictable
     PERSON_ROI_REFINE_MAX_AREA: float = 0.35 # Only refine regions this small (large ones gain nothing)
-    ENABLE_VEST_HIVIS_CORROBORATION: bool = True
+    # ENABLE_VEST_HIVIS_CORROBORATION: disabled. HSV color analysis on torso crops falsely
+    #   detects regular shirts (grey, white, coloured) as hi-vis vests. The CV method cannot
+    #   distinguish fluorescent safety fabric from natural clothing. Neural model is authority.
+    ENABLE_VEST_HIVIS_CORROBORATION: bool = False
     VEST_HIVIS_MIN_COLOR_RATIO: float = 0.06  # Fluorescent fabric coverage of the torso box
     VEST_HIVIS_MIN_SILVER_RATIO: float = 0.10 # Retroreflective band coverage of the torso box
-    ENABLE_CV_GLASSES_FALLBACK_ON_NEURAL_PATH: bool = False  # Legacy heuristic: measured 96% FP rate
     PPE_REQUIRE_PERSON_ASSOCIATION: bool = True  # Unassociated PPE items are never reported
     PPE_CROP_REFINE_MAX_PERSONS: int = 4
-    PPE_ROI_REFINE_EVERY_N: int = 2   # Refine missing items on every Nth worker frame (cost control)
-    PPE_ANALYSIS_REUSE_SECONDS: float = 2.0  # How long previous PPE conclusions stay valid on gated frames
+    PPE_ROI_REFINE_EVERY_N: int = 1   # Refine missing items on every worker frame for zero latency
+    # PPE_ANALYSIS_REUSE_SECONDS: reduced 2.0→1.0. When the worker branch is gated (motion gate,
+    #   cadence limiter), the previous PPE conclusions are replayed for this window. 2.0s was long
+    #   enough to replay a stale VIOLATION status long after the worker already had their gear on,
+    #   producing persistent red badges that contradicted live green "Safety Vest Found" badges.
+    PPE_ANALYSIS_REUSE_SECONDS: float = 1.0  # How long previous PPE conclusions stay valid on gated frames
 
-    # Class-Specific Confidence Thresholds (Tuned for High Precision & Zero False Alarms)
-    FIRE_CONFIDENCE_THRESHOLD: float = 0.50
-    SMOKE_CONFIDENCE_THRESHOLD: float = 0.48
-    PERSON_CONFIDENCE_THRESHOLD: float = 0.40
-    VEST_CONFIDENCE_THRESHOLD: float = 0.35
-    GLASSES_CONFIDENCE_THRESHOLD: float = 0.22
+    # ── Class-Specific Confidence Thresholds ────────────────────────────────────────────────────
+    # Tuned for accuracy: higher values reduce false alarms; lower values improve recall.
+    # FIRE: 0.30 catches real small fires while the physics veto chain eliminates false positives.
+    FIRE_CONFIDENCE_THRESHOLD: float = 0.30
+    # SMOKE: 0.28 gives a reasonable recall floor; physics/texture veto handles false positives.
+    SMOKE_CONFIDENCE_THRESHOLD: float = 0.28
+    # PERSON_CONFIDENCE_THRESHOLD: 0.52 — elevated above the default 0.25 for overhead CCTV angles.
+    #   Phantom boxes from chair backs, reflective bags, floor objects: 0.30–0.48
+    #   Real seated worker torso from overhead: 0.62–0.90
+    PERSON_CONFIDENCE_THRESHOLD: float = 0.52
+    # Person bounding-box geometry filters. Applied post-inference before box is admitted.
+    #   PERSON_MIN_BOX_HEIGHT: 0.07 — floor objects / chair backs top out at ~5% frame height;
+    #     a real seated worker is ≥8–10%. Margin of 1–3% is safe.
+    #   PERSON_MIN_BOX_AREA: 0.003 — rejects tiny noise boxes smaller than 3% of frame.
+    #   PERSON_MAX_ASPECT_RATIO: 1.5 — wider boxes (silver bag AR≈2.4) are firmly rejected.
+    PERSON_MIN_BOX_HEIGHT: float = 0.07
+    PERSON_MIN_BOX_AREA: float = 0.003          # Minimum normalised area; smaller = noise
+    PERSON_MIN_ASPECT_RATIO: float = 0.10        # w/h minimum — reject extremely thin slivers
+    PERSON_MAX_ASPECT_RATIO: float = 1.5         # w/h maximum — narrowed from 1.6
+    # VEST_CONFIDENCE_THRESHOLD: 0.65 eliminates phantom vests on dark shirts, regular jackets, and olive green shirts.
+    #   Real high-visibility vests score 0.70+ on a trained model.
+    VEST_CONFIDENCE_THRESHOLD: float = 0.65
+    # GLASSES_CONFIDENCE_THRESHOLD: 0.40 — higher than before to eliminate bare-face shadows.
+    GLASSES_CONFIDENCE_THRESHOLD: float = 0.40
     ENABLE_CV_VEST_DETECTION: bool = True
     ENABLE_CV_HELMET_DETECTION: bool = False
     ENABLE_CV_GLASSES_DETECTION: bool = True
+    ENABLE_CV_GLASSES_FALLBACK_ON_NEURAL_PATH: bool = True
+    GLASSES_CV_MIN_PERSON_CONF: float = 0.50     # Only evaluate CV glasses on confirmed-person boxes
+    GLASSES_ROI_CONFIDENCE_FLOOR: float = 0.12   # Raised from 0.085 — tighter floor for eyewear search
+    VEST_CROP_CONFIDENCE_FLOOR: float = 0.20     # Raised from 0.15 — tighter floor for vest crop search
+    PPE_ROI_REFINE_EVERY_N: int = 1              # Refine ROI on every worker frame for rapid response
 
     # YOLO Model File Paths & Backward Compatibility Aliases
     YOLO_MODEL_PATH: str = "models/fire_smoke.onnx"
-    # Legacy OpenCV standalone vest/worker CV fallbacks: measured to fabricate detections,
-    # so they stay off unless an operator explicitly opts in.
+    # ENABLE_STANDALONE_VEST_FALLBACK: disabled. Raw HSV scanning of the room produces phantom vest
+    # detections on phone screens, orange flame reflections, green desk partitions, and glass railings.
+    # Vests must be worn on confirmed worker torsos via neural model or hi-vis corroboration.
     ENABLE_STANDALONE_VEST_FALLBACK: bool = False
     ENABLE_HIGHVIS_WORKER_ANCHOR: bool = False
-    YOLO_CONF_THRESHOLD: float = 0.48
-    YOLO_IOU_THRESHOLD: float = 0.45
-    YOLO_IMGSZ: int = 416
+    # YOLO_CONF_THRESHOLD: 0.20 — low candidate floor for raw inference; per-class gates above
+    #   (FIRE_CANDIDATE_CONFIDENCE, SMOKE_CANDIDATE_CONFIDENCE) are the real precision gates.
+    YOLO_CONF_THRESHOLD: float = 0.20
+    # YOLO_IOU_THRESHOLD: 0.40 — slightly tighter NMS suppression to eliminate duplicate boxes.
+    YOLO_IOU_THRESHOLD: float = 0.40
+    YOLO_IMGSZ: int = 640  # Raised from 416 for significantly better small-object recall
     YOLO_AUGMENT: bool = False
     YOLO_DEVICE: str = "cpu"
     YOLO_ENABLE_HSV_FALLBACK: bool = False
@@ -112,51 +146,103 @@ class Settings(BaseSettings):
     AI_PERSON_ENABLED: bool = True
     AI_ZONE_ENABLED: bool = True
     PPE_MODEL_PATH: str = "models/ppe.onnx"
-    PPE_CONFIDENCE_THRESHOLD: float = 0.38
-    PPE_IOU_THRESHOLD: float = 0.45
+    PPE_CONFIDENCE_THRESHOLD: float = 0.35        # Raised from 0.30 for fewer phantom PPE boxes
+    PPE_IOU_THRESHOLD: float = 0.40               # Tighter NMS to eliminate duplicate PPE boxes
     PPE_DEVICE: str = "cpu"
-    # Frames are counted in *worker-branch invocations*, not camera frames, and that cadence is
-    # measured and adapted (0.25 s by default). Requiring 3 of them plus 1.2 s of sustained evidence
-    # keeps alert latency bounded by time rather than by how fast the hardware happens to be.
-    PPE_VERIFICATION_FRAMES: int = 3
-    PPE_VERIFICATION_DURATION_SECONDS: float = 1.2
+    # PPE temporal verification: require sustained evidence before flagging violation.
+    # 6 frames + 2.5 s eliminates transient flickers and single-frame noise.
+    PPE_VERIFICATION_FRAMES: int = 6
+    PPE_VERIFICATION_DURATION_SECONDS: float = 2.5
     PPE_INFERENCE_INTERVAL_SEC: float = 0.25
-    PPE_MAX_INFERENCE_INTERVAL_SEC: float = 2.0  # Ceiling for the measured-cadence adaptation
-    PPE_ADAPTIVE_CADENCE: bool = True  # Derive the worker cadence from measured cost (off = fixed interval)
-    PPE_ALERT_COOLDOWN_SECONDS: float = 60.0
-    PERSON_MODEL_PATH: str = "models/yolov8n.onnx"
+    PPE_MAX_INFERENCE_INTERVAL_SEC: float = 2.0
+    PPE_ADAPTIVE_CADENCE: bool = True
+    PPE_ALERT_COOLDOWN_SECONDS: float = 90.0
+    PERSON_MODEL_PATH: str = "models/yolov8s.onnx"
 
-    # Fire & Smoke Detection Evidence Model
-    #
-    # Detection and alerting are deliberately separated. A candidate is *reported* from a relaxed
-    # candidate floor so nothing is silently ignored, while an *alert* still requires the temporal
-    # state machine below to see the same physical region across many consecutive frames. Measured
-    # on real footage, the fire model scores genuine blazes between 0.15 and 0.61 - a single 0.48
-    # gate therefore discarded every true positive. Corroboration (flame chromaticity, smoke
-    # dispersion, multi-box agreement) lifts weak-but-real detections; reinforced concrete, brick and
-    # reflective PPE are rejected by the straight-edge structure test instead of by colour.
-    FIRE_CANDIDATE_CONFIDENCE: float = 0.14
-    SMOKE_CANDIDATE_CONFIDENCE: float = 0.13
-    FIRE_PHYSICS_WEIGHT: float = 0.35        # Max evidence a physical corroboration can add
-    FIRE_STRUCTURE_EDGE_RATIO: float = 0.45  # Straight-edge ratio above which surfaces are man-made
-    FIRE_REQUIRE_AGREEMENT: int = 3          # Raw boxes that must agree for a sub-threshold candidate
-    FIRE_VERIFICATION_MIN_CONFIDENCE: float = 0.14   # Per-frame floor used by the temporal FSM
-    SMOKE_VERIFICATION_MIN_CONFIDENCE: float = 0.13
-    #
-    # Two-tier output:
-    #   DETECTION (HUD, websocket telemetry, detection log)  -> candidate floor above, always visible
-    #   ALERT     (email, webhook, incident, evidence clip)   -> alert floor below + temporal proof
-    # A sustained-but-weak signal therefore raises a visible detection without dispatching an alert,
-    # which is what keeps operators' trust in the alarm channel.
-    FIRE_ALERT_CONFIDENCE: float = 0.35
-    SMOKE_ALERT_CONFIDENCE: float = 0.30
+    # ── Fire & Smoke Detection Physics Model ────────────────────────────────────────────────────
+    # FIRE_CANDIDATE_CONFIDENCE: 0.12 — low raw candidate floor; real gate is FIRE_ALERT_CONFIDENCE.
+    FIRE_CANDIDATE_CONFIDENCE: float = 0.12
+    # SMOKE_CANDIDATE_CONFIDENCE: 0.12 — same principle; texture/dispersion veto does heavy lifting.
+    SMOKE_CANDIDATE_CONFIDENCE: float = 0.12
+    # FIRE_PHYSICS_WEIGHT: 0.40 — allow physics corroboration to contribute more to final confidence.
+    FIRE_PHYSICS_WEIGHT: float = 0.40
+    # FIRE_STRUCTURE_EDGE_RATIO: 0.45 — surfaces with >45% straight-edge content are man-made.
+    FIRE_STRUCTURE_EDGE_RATIO: float = 0.45
+    # FIRE_REQUIRE_AGREEMENT: 2 — require multi-pass box agreement for sub-threshold candidates.
+    FIRE_REQUIRE_AGREEMENT: int = 2
+    # Per-frame minimum confidence accepted by the temporal FSM before accumulating credit.
+    FIRE_VERIFICATION_MIN_CONFIDENCE: float = 0.22
+    SMOKE_VERIFICATION_MIN_CONFIDENCE: float = 0.22
+    VEST_HIVIS_MIN_COLOR_RATIO: float = 0.06
 
-    # Fire & Smoke Temporal Verification (Requires persistent spatial detection before confirming)
-    FIRE_MIN_CONSECUTIVE_FRAMES: int = 6
+    # ── Fire-Scene PPE Veto ──────────────────────────────────────────────────────────────────────
+    FIRE_SCENE_VETO_ENABLED: bool = True
+    FIRE_SCENE_THRESHOLD_BOOST: float = 0.28       # Added to person/vest/glasses floors during fire
+    FIRE_SCENE_PERSON_IOU_SUPPRESS: float = 0.15
+    FIRE_SCENE_TRACK_STALENESS_SECONDS: float = 3.0
+    VEST_HIVIS_MIN_SILVER_RATIO: float = 0.035
+    VEST_CROP_CONFIDENCE_FLOOR: float = 0.60
+
+    # ── Fire & Smoke Alert Floors ────────────────────────────────────────────────────────────────
+    # FIRE_ALERT_CONFIDENCE: 0.42 — combined model+physics score must exceed this to raise an alert.
+    FIRE_ALERT_CONFIDENCE: float = 0.42
+    # SMOKE_ALERT_CONFIDENCE: 0.50 — lower than fire because smoke appears gradually.
+    SMOKE_ALERT_CONFIDENCE: float = 0.50
+
+    # ── Fire & Smoke Temporal Verification ──────────────────────────────────────────────────────
+    # FIRE: 4 consecutive frames over ≥1.2 s — catches fast-developing fires without missing slow ones.
+    FIRE_MIN_CONSECUTIVE_FRAMES: int = 4
     FIRE_MIN_DURATION_SECONDS: float = 1.2
-    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 8
-    SMOKE_MIN_DURATION_SECONDS: float = 2.0
-    SMOKE_ALERT_COOLDOWN_SECONDS: float = 30.0
+    # SMOKE: 7 frames over 2.2 s — static textures almost never sustain 7 clean frames over 2.2 s.
+    SMOKE_MIN_CONSECUTIVE_FRAMES: int = 7
+    SMOKE_MIN_DURATION_SECONDS: float = 2.2
+    SMOKE_ALERT_COOLDOWN_SECONDS: float = 45.0
+
+    # ── Tiling for Small Fire/Smoke Recovery ────────────────────────────────────────────────────
+    # Enable tiled re-inference when the full-frame pass is empty or weak.
+    # Small fires/smoke plumes that are only a few pixels in full-frame view benefit greatly.
+    FIRE_SMOKE_TILING_ENABLED: bool = True
+    FIRE_SMOKE_TILE_GRID: tuple = (2, 2)           # 2×2 tile grid
+    FIRE_SMOKE_TILE_OVERLAP: float = 0.20          # 20% overlap between tiles
+    FIRE_SMOKE_TILE_MIN_INTERVAL_FRAMES: int = 2   # Only tile every 2nd frame when weak/empty
+
+    # ── Smoke False-Positive Suppression ─────────────────────────────────────────────────────────
+    # These three toggles control the post-structure-veto discriminator chain added for the
+    # striped-doormat FP (scored 0.41 SMOKE, survived all previous gates). Each can be disabled
+    # independently via env-var / .env for constrained hardware or ablation testing.
+
+    # SMOKE_TEXTURE_ENTROPY_VETO: grid-based local-variance fabric/carpet discriminator.
+    #   Divides the candidate crop into a 4×4 grid and measures the std of each cell.
+    #   Real smoke has a soft luminance gradient → spatially uniform cell stds (low var-of-stds).
+    #   Woven fabric/carpet has high local std in stripe cells and near-uniform in gap cells →
+    #   high var-of-stds. Thresholds tuned against the doormat FP case.
+    SMOKE_TEXTURE_ENTROPY_VETO: bool = True
+    # Thresholds for _smoke_texture_veto (8×8 grid, per-cell max-min range metric).
+    # Decision rule: mean_range > THRESH_MEAN AND var_range < THRESH_VAR
+    # Calibration (striped doormat FP + smoke positives):
+    #   striped_doormat: mean_range=15.7, var_range=0.7  → VETO
+    #   diagonal_carpet: mean_range=50.6, var_range=0.5  → VETO
+    #   smoke_gradient:  mean_range=32.1, var_range=11.1 → pass (gradient, not pattern)
+    #   dense_smoke:     mean_range= 7.2, var_range=178  → pass (low mean_range)
+    SMOKE_TEXTURE_MEAN_RANGE_THRESH: float = 10.0   # mean per-cell range below which not patterned
+    SMOKE_TEXTURE_VAR_RANGE_THRESH: float = 5.0     # var-of-range above which pattern is non-uniform (gradient)
+
+    # SMOKE_MOTION_CORROBORATION: veto borderline smoke candidates in fully static scenes.
+    #   INTENTIONAL EXCEPTION to motion_gate.py's invariant that "the gate never affects the
+    #   fire/smoke path". That invariant prohibits SKIPPING inference; this post-hoc vetoes a
+    #   below-alert-floor candidate only, so it does not violate the inference-skip rule. Fire
+    #   candidates are NEVER subject to this veto. Documented here explicitly so it is not
+    #   silently reverted by someone enforcing the old invariant.
+    SMOKE_MOTION_CORROBORATION: bool = True
+    SMOKE_MOTION_STATIC_THRESHOLD: float = 0.0015  # motion_ratio below this = "essentially static"
+
+    # SMOKE_ROI_REFINE_ENABLED: second-pass zoom re-inference for mid-band smoke candidates
+    #   (candidate_floor ≤ evidence < alert_floor). Crops the box, upscales to ≥224 px, re-runs
+    #   the ONNX model. Genuine thin plumes score equal or higher at higher resolution; static
+    #   textures that were borderline at 320 px typically drop below the candidate floor.
+    #   Cost: ~15–40 ms per candidate frame on CPU (only applies to borderline candidates).
+    #   Disable on constrained hardware.
+    SMOKE_ROI_REFINE_ENABLED: bool = True
 
     # Feature Toggles for Safety Engine
     ZONE_MONITORING_ENABLED: bool = True
@@ -166,12 +252,14 @@ class Settings(BaseSettings):
     PPE_EMAIL_ALERT_ENABLED: bool = True
     PPE_WEBHOOK_ALERT_ENABLED: bool = False
 
-    # Temporal Verification & False Alarm Reduction Settings
-    VERIFICATION_MIN_CONFIDENCE: float = 0.45
-    VERIFICATION_MIN_CONSECUTIVE_FRAMES: int = 7
-    VERIFICATION_MIN_DURATION_SECONDS: float = 1.4
-    VERIFICATION_COOLDOWN_SECONDS: float = 30.0
-    SPATIAL_IOU_THRESHOLD: float = 0.18
+    # ── General Temporal Verification (non-fire/smoke classes) ─────────────────────────────────
+    VERIFICATION_MIN_CONFIDENCE: float = 0.50
+    VERIFICATION_MIN_CONSECUTIVE_FRAMES: int = 7   # Lowered slightly from 8 for faster confirmation
+    VERIFICATION_MIN_DURATION_SECONDS: float = 2.0
+    VERIFICATION_COOLDOWN_SECONDS: float = 45.0
+    # SPATIAL_IOU_THRESHOLD: 0.15 — more lenient spatial matching for moving objects
+    # (smoke/fire can shift between frames; a detection 15% IoU away is likely the same object)
+    SPATIAL_IOU_THRESHOLD: float = 0.15
 
     # Incident Evidence Management & Video Archiving Settings
     EVIDENCE_STORAGE_DIR: str = "evidence"

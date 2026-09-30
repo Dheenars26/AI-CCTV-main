@@ -29,9 +29,9 @@ class Letterbox:
     __slots__ = ("in_w", "in_h", "_canvas", "_blob", "_cached_hw", "pad_value")
 
     def __init__(self, in_w: int, in_h: int, pad_value: int = DEFAULT_PAD_VALUE):
-        self.in_w = int(in_w)
-        self.in_h = int(in_h)
-        self.pad_value = int(pad_value)
+        self.in_w = in_w
+        self.in_h = in_h
+        self.pad_value = pad_value
         self._canvas: Optional[np.ndarray] = None
         self._blob: Optional[np.ndarray] = None
         self._cached_hw: Optional[Tuple[int, int]] = None
@@ -146,17 +146,35 @@ def prepare_worker_roi(
 
     pw = px2 - px1
     ph = py2 - py1
-    pad_x = int(pw * head_pad)
+    aspect = float(pw) / float(ph) if ph > 0 else 1.0
 
+    # Adapt head ROI vertical coverage and horizontal padding to camera viewpoint
+    if aspect > 0.85:
+        # Close-up head / bust / seated at desk: head & face occupy up to ~68% of visible height
+        eff_head_ratio = 0.68
+        eff_pad_x = 0.05
+    elif aspect > 0.55:
+        # Upper torso / half-body
+        eff_head_ratio = 0.52
+        eff_pad_x = 0.08
+    else:
+        # Standing full-body worker
+        eff_head_ratio = head_ratio
+        eff_pad_x = head_pad
+
+    pad_x = int(pw * eff_pad_x)
     head_x1 = max(0, px1 - pad_x)
     head_x2 = min(frame_w, px2 + pad_x)
     head_y1 = max(0, py1 - int(ph * 0.06))
-    head_y2 = min(frame_h, py1 + max(2, int(ph * head_ratio)))
+    head_y2 = min(frame_h, py1 + max(2, int(ph * eff_head_ratio)))
 
     torso_x1 = max(0, px1 - int(pw * 0.04))
     torso_x2 = min(frame_w, px2 + int(pw * 0.04))
     torso_y1 = max(0, py1 + int(ph * 0.15))
-    torso_y2 = min(frame_h, py1 + max(4, int(ph * 0.92)))
+    # If aspect is high (webcam/bust), the person box is only head & shoulders.
+    # The torso sits *below* the box, so we must extend y2 further down.
+    eff_torso_h = 1.8 if aspect > 0.85 else 0.92
+    torso_y2 = min(frame_h, py1 + max(4, int(ph * eff_torso_h)))
 
     return (head_x1, head_y1, head_x2, head_y2), (torso_x1, torso_y1, torso_x2, torso_y2)
 
@@ -164,10 +182,10 @@ def prepare_worker_roi(
 def clip_roi(roi: Tuple[int, int, int, int], frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
     """Clamps ``(x1, y1, x2, y2)`` into frame bounds guaranteeing a non-empty box."""
     x1, y1, x2, y2 = roi
-    x1 = int(max(0, min(frame_w - 1, x1)))
-    y1 = int(max(0, min(frame_h - 1, y1)))
-    x2 = int(max(x1 + 1, min(frame_w, x2)))
-    y2 = int(max(y1 + 1, min(frame_h, y2)))
+    x1 = max(0, min(frame_w - 1, x1))
+    y1 = max(0, min(frame_h - 1, y1))
+    x2 = max(x1 + 1, min(frame_w, x2))
+    y2 = max(y1 + 1, min(frame_h, y2))
     return (x1, y1, x2, y2)
 
 

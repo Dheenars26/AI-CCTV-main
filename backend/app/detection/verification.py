@@ -91,34 +91,45 @@ class ClassVerificationTracker:
         # requires ``alert_min_confidence`` plus the persistence window below, so detection stays
         # sensitive while the alert channel stays trustworthy.
         if cls_lower == "fire":
+            # Settings keys: FIRE_VERIFICATION_MIN_CONFIDENCE, FIRE_ALERT_CONFIDENCE,
+            # FIRE_MIN_CONSECUTIVE_FRAMES (default 2), FIRE_MIN_DURATION_SECONDS (default 0.3 s),
+            # VERIFICATION_COOLDOWN_SECONDS.
+            # Fast-track applies; fire's response-time budget is safety-critical.
             self.min_confidence = min_confidence if min_confidence is not None else getattr(
-                settings, "FIRE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)
+                settings, "FIRE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.28)
             )
             self.alert_min_confidence = max(
                 self.min_confidence,
-                getattr(settings, "FIRE_ALERT_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.50)),
+                getattr(settings, "FIRE_ALERT_CONFIDENCE", getattr(settings, "FIRE_CONFIDENCE_THRESHOLD", 0.28)),
             )
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 6)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 1.2)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "FIRE_MIN_CONSECUTIVE_FRAMES", 2)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "FIRE_MIN_DURATION_SECONDS", 0.3)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "VERIFICATION_COOLDOWN_SECONDS", 30.0)
         elif cls_lower == "smoke":
+            # Settings keys: SMOKE_VERIFICATION_MIN_CONFIDENCE, SMOKE_ALERT_CONFIDENCE,
+            # SMOKE_MIN_CONSECUTIVE_FRAMES (default 3), SMOKE_MIN_DURATION_SECONDS (default 0.5 s),
+            # SMOKE_ALERT_COOLDOWN_SECONDS.
             self.min_confidence = min_confidence if min_confidence is not None else getattr(
-                settings, "SMOKE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)
+                settings, "SMOKE_VERIFICATION_MIN_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.28)
             )
             self.alert_min_confidence = max(
                 self.min_confidence,
-                getattr(settings, "SMOKE_ALERT_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.48)),
+                getattr(settings, "SMOKE_ALERT_CONFIDENCE", getattr(settings, "SMOKE_CONFIDENCE_THRESHOLD", 0.28)),
             )
-            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 8)
-            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 2.0)
+            self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else getattr(settings, "SMOKE_MIN_CONSECUTIVE_FRAMES", 3)
+            self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else getattr(settings, "SMOKE_MIN_DURATION_SECONDS", 0.5)
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else getattr(settings, "SMOKE_ALERT_COOLDOWN_SECONDS", 30.0)
         else:
+            # Generic fallback (other classes, e.g. restricted-zone violations).
+            # Settings keys: VERIFICATION_MIN_CONFIDENCE (0.45), VERIFICATION_MIN_CONSECUTIVE_FRAMES
+            # (7 frames), VERIFICATION_MIN_DURATION_SECONDS (1.4 s).
             self.min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
             self.alert_min_confidence = min_confidence if min_confidence is not None else getattr(settings, "VERIFICATION_MIN_CONFIDENCE", 0.45)
             self.min_consecutive_frames = min_consecutive_frames if min_consecutive_frames is not None else 7
             self.min_duration_seconds = min_duration_seconds if min_duration_seconds is not None else 1.4
             self.cooldown_seconds = cooldown_seconds if cooldown_seconds is not None else 30.0
-        self.cleared_miss_tolerance = max(2, cleared_miss_tolerance)
+
+        self.cleared_miss_tolerance = cleared_miss_tolerance
 
         # Internal state metrics
         # Confirmation credit: accrues faster while corroborated evidence keeps arriving and decays
@@ -166,7 +177,7 @@ class ClassVerificationTracker:
                     c_curr_x = (d.bbox.x_min + d.bbox.x_max) / 2.0
                     c_curr_y = (d.bbox.y_min + d.bbox.y_max) / 2.0
                     dist = ((c_prev_x - c_curr_x) ** 2 + (c_prev_y - c_curr_y) ** 2) ** 0.5
-                    if iou >= spatial_iou_threshold or dist <= 0.35:
+                    if iou >= spatial_iou_threshold or dist <= 0.30:  # tightened from 0.35
                         matching_dets.append((d, max(iou, 1.0 - dist)))
 
                 if matching_dets:
@@ -311,10 +322,11 @@ class ClassVerificationTracker:
         # CASE B: Detection Absent in Current Frame
         # -----------------------------------------------------------------
         else:
-            # Sub-case B1: False Alarm Recovery (POSSIBLE -> NORMAL)
+            # False-alarm recovery: decay credit faster in POSSIBLE state so that noise bursts
+            # (e.g., single-frame reflections) don't linger and accumulate to a false confirmation.
             if self.state == EventState.POSSIBLE:
                 self.missed_frames += 1
-                self.detection_credit = max(0.0, self.detection_credit - 1.0)
+                self.detection_credit = max(0.0, self.detection_credit - 1.5)  # faster decay vs 1.0
                 if self.consecutive_frames <= 1 or self.missed_frames >= self.cleared_miss_tolerance:
                     logger.info(
                         f"TemporalTracker: Camera {self.camera_id} [{self.class_name.upper()}] "
@@ -384,7 +396,8 @@ class CameraVerificationEngine:
         min_confidence: Optional[float] = None,
         min_consecutive_frames: Optional[int] = None,
         min_duration_seconds: Optional[float] = None,
-        cooldown_seconds: Optional[float] = None
+        cooldown_seconds: Optional[float] = None,
+        cleared_miss_tolerance: int = 2
     ):
         self.camera_id = camera_id
         target_classes = target_classes or ["fire", "smoke"]
@@ -395,7 +408,8 @@ class CameraVerificationEngine:
                 min_confidence=min_confidence,
                 min_consecutive_frames=min_consecutive_frames,
                 min_duration_seconds=min_duration_seconds,
-                cooldown_seconds=cooldown_seconds
+                cooldown_seconds=cooldown_seconds,
+                cleared_miss_tolerance=cleared_miss_tolerance
             )
             for cls_name in target_classes
         }
@@ -422,3 +436,5 @@ class CameraVerificationEngine:
         """
         for tracker in self.trackers.values():
             tracker.reset()
+
+    reset = reset_all

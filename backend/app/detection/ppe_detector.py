@@ -882,20 +882,35 @@ class PPEDetector(BaseDetector):
         stripe_edges = (np.abs(sobel_h) > 40) & (color_mask | silver_mask)
         stats["stripe_ratio"] = float(np.count_nonzero(stripe_edges)) / total
 
-        # Plain white/light shirt rejection: solid light fabric (>55% white/silver) without strong fluorescent color (<10%)
-        if stats["silver_ratio"] > 0.55 and stats["color_ratio"] < 0.10:
+        # Expanded plain shirt/background rejection:
+        # - Solid light fabric (>45% silver/white) without strong fluorescent color (<12%) → reject
+        #   This covers bright olive/brown shirts lit by a bright window, which get high silver_ratio
+        #   from neutral bright pixels but have negligible neon green/orange fluorescence.
+        if stats["silver_ratio"] > 0.45 and stats["color_ratio"] < 0.12:
+            found = False
+        elif stats["silver_ratio"] > 0.30 and stats["color_ratio"] < 0.08:
+            # Medium-bright background (window light on plain shirt) — also reject
             found = False
         else:
-            # Tri-modal vest verification:
-            # 1. Standard: Fluorescent fabric + silver retroreflective band
+            # Tri-modal vest verification (all require BOTH fluorescent color AND retroreflective evidence):
             min_c = float(getattr(settings, "VEST_HIVIS_MIN_COLOR_RATIO", 0.06))
-            min_s = float(getattr(settings, "VEST_HIVIS_MIN_SILVER_RATIO", 0.035))
-            is_standard_hivis = (stats["color_ratio"] >= min_c and stats["silver_ratio"] >= min_s)
-            # 2. Rich fluorescent neon vest with stripe edges / retroreflective tape
-            is_highvis_fabric = (stats["color_ratio"] >= 0.14 and (stats["silver_ratio"] >= 0.015 or stats["stripe_ratio"] >= 0.025))
-            # 3. High-contrast reflective crossbands with fluorescent base
-            is_band_dominant = (stats["silver_ratio"] >= 0.04 and stats["color_ratio"] >= 0.03)
-            found = is_standard_hivis or is_highvis_fabric or is_band_dominant
+            # Raised silver threshold: genuine retroreflective tape is dense (>=0.08), not just window glare
+            min_s = float(getattr(settings, "VEST_HIVIS_MIN_SILVER_RATIO", 0.08))
+            # 1. Standard: Fluorescent fabric + silver retroreflective band (both must be substantial)
+            is_standard_hivis = (
+                stats["color_ratio"] >= min_c
+                and stats["silver_ratio"] >= min_s
+                and stats["stripe_ratio"] >= 0.010  # Must have visible stripe edges too
+            )
+            # 2. Rich fluorescent neon vest: high color coverage + clear stripe edges (tape required)
+            is_highvis_fabric = (
+                stats["color_ratio"] >= 0.18
+                and stats["silver_ratio"] >= 0.025
+                and stats["stripe_ratio"] >= 0.030  # Without real tape edges, it's just a colored shirt
+            )
+            # NOTE: is_band_dominant removed — silver+color without tape is indistinguishable from
+            # a bright background (window) reflecting off a plain shirt's fabric.
+            found = is_standard_hivis or is_highvis_fabric
         return found, stats
 
     def _should_refine_now(self) -> bool:
@@ -1105,12 +1120,12 @@ class PPEDetector(BaseDetector):
                         if torso_crop_hsv.size > 0:
                             torso_crop_hsv[:, :, 2] = clahe.apply(torso_crop_hsv[:, :, 2])
 
-                            # High-Vis Fluorescent Neon Yellow/Lime: H[22..80], S[40..255], V[70..255]
-                            m_vest_neon_yellow = cv2.inRange(torso_crop_hsv, np.array([22, 40, 70]), np.array([80, 255, 255]))
-                            # High-Vis Fluorescent Neon Orange: H[5..24] or H[165..180], S[65..255], V[70..255]
-                            m_vest_neon_orange1 = cv2.inRange(torso_crop_hsv, np.array([5, 65, 70]), np.array([24, 255, 255]))
-                            m_vest_neon_orange2 = cv2.inRange(torso_crop_hsv, np.array([165, 65, 70]), np.array([180, 255, 255]))
-                            # Remove neon blue as it catches regular grey/blue shirts and causes false positives.
+                            # High-Vis Fluorescent Neon Yellow/Lime: H[22..80], S[55..255], V[100..255]
+                            # Raised S floor from 40→55 and V floor from 70→100 to exclude dull/olive shirts
+                            m_vest_neon_yellow = cv2.inRange(torso_crop_hsv, np.array([22, 55, 100]), np.array([80, 255, 255]))
+                            # High-Vis Fluorescent Neon Orange: H[5..24] or H[165..180], S[90..255], V[100..255]
+                            m_vest_neon_orange1 = cv2.inRange(torso_crop_hsv, np.array([5, 90, 100]), np.array([24, 255, 255]))
+                            m_vest_neon_orange2 = cv2.inRange(torso_crop_hsv, np.array([165, 90, 100]), np.array([180, 255, 255]))
                             mask_vest = cv2.bitwise_or(m_vest_neon_yellow, cv2.bitwise_or(m_vest_neon_orange1, m_vest_neon_orange2))
 
                             # Exclude human skin tone on torso
@@ -1129,16 +1144,12 @@ class PPEDetector(BaseDetector):
                             m_tape_stripes = cv2.morphologyEx(m_tape, cv2.MORPH_OPEN, tape_kernel)
                             tape_ratio = float(np.sum(m_tape_stripes > 0)) / float(m_tape.size) if m_tape.size > 0 else 0.0
 
-                            # High-vis safety vest detection: fluorescent colour is necessary but never
-                            # sufficient. A plain yellow/orange garment is a t-shirt, not a vest - what
-                            # separates them is the retroreflective tape (or, failing that, real garment
-                            # structure such as seams, pockets and quilting). Previously any patch with
-                            # >28% fluorescent coverage passed on colour alone, so a uniformly coloured
-                            # shirt scored vest 0.95 with tape_ratio 0.0.
-                            has_tape = tape_ratio >= 0.001
-                            has_structure = edge_density >= 0.02
-                            # If neon coverage is high (>12%), just accept it. The previous structure checks were too strict for blurry CCTV.
-                            if vest_ratio >= 0.10:
+                            has_tape = tape_ratio >= 0.008   # Raised from 0.001: single isolated bright pixels are not tape
+                            has_structure = edge_density >= 0.025  # Raised from 0.02
+                            # Raised vest_ratio threshold from 0.10 to 0.18: a plain olive/brown shirt at
+                            # 10% neon coverage is just sun-lit fabric — real vests are >20% neon.
+                            # Also require TAPE or strong structure evidence (color alone is insufficient).
+                            if (vest_ratio >= 0.18 and has_tape) or (vest_ratio >= 0.25 and has_structure):
                                 norm_vest_box = BoundingBox(
                                     x_min=max(0.0, min(1.0, float(vx1) / float(proc_w))),
                                     y_min=max(0.0, min(1.0, float(vy1) / float(proc_h))),
@@ -1285,20 +1296,10 @@ class PPEDetector(BaseDetector):
                     PPEDetector._eye_cascade_obj = cascade_cls(eye_path) if os.path.exists(eye_path) else None
 
                 has_haar_glasses = False
-                if PPEDetector._eyeglasses_cascade_obj is not None:
-                    detected_eyes = PPEDetector._eyeglasses_cascade_obj.detectMultiScale(
-                        eye_clahe, scaleFactor=1.08,
-                        minNeighbors=2, minSize=(8, 5)
-                    )
-                    if len(detected_eyes) >= 1:
-                        has_haar_glasses = True
-                if not has_haar_glasses and PPEDetector._eye_cascade_obj is not None:
-                    detected_eyes = PPEDetector._eye_cascade_obj.detectMultiScale(
-                        eye_clahe, scaleFactor=1.08,
-                        minNeighbors=2, minSize=(8, 5)
-                    )
-                    if len(detected_eyes) >= 2:
-                        has_haar_glasses = True
+                # NOTE: Haar cascade (haarcascade_eye_tree_eyeglasses.xml) is intentionally NOT used
+                # here. It fires on BARE EYES as well as eyes with glasses — making it useless as a
+                # discriminator. Earphone cables near the eye also trigger it (dark wire ≈ glasses arm).
+                # The multi-modal structural analysis below is more reliable.
 
                 eye_edges = cv2.Canny(eye_clahe, 40, 140)
                 sobely = cv2.Sobel(eye_clahe, cv2.CV_16S, 0, 1, ksize=3)
@@ -1311,7 +1312,7 @@ class PPEDetector(BaseDetector):
                 bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(ew * 0.04)), 1))
                 notch_opened = cv2.morphologyEx(notch_horiz.astype(np.uint8), cv2.MORPH_OPEN, bridge_kernel)
                 notch_ratio = float(np.sum(notch_horiz)) / float(max(1, notch_horiz.size))
-                has_bridge = (notch_ratio >= 0.065) or (float(np.sum(notch_opened)) >= max(2.5, ew * 0.035))
+                has_bridge = (notch_ratio >= 0.020) or (float(np.sum(notch_opened)) >= max(1.5, ew * 0.015))
 
                 # Architectural edge filter: tabletop edges or shelves run continuously across >= 88% of crop width
                 if ew >= 20:
@@ -1327,8 +1328,8 @@ class PPEDetector(BaseDetector):
                 left_lower_ratio = float(np.sum(left_lower)) / float(max(1, left_lower.size))
                 right_lower_ratio = float(np.sum(right_lower)) / float(max(1, right_lower.size))
                 dual_orbit_rim = (
-                    (left_lower_ratio >= 0.022 and right_lower_ratio >= 0.022) or
-                    (max(left_lower_ratio, right_lower_ratio) >= 0.038 and min(left_lower_ratio, right_lower_ratio) >= 0.012)
+                    (left_lower_ratio >= 0.010 and right_lower_ratio >= 0.010) or
+                    (max(left_lower_ratio, right_lower_ratio) >= 0.020 and min(left_lower_ratio, right_lower_ratio) >= 0.005)
                 )
 
                 # Brow Bar (Top horizontal line across brow: y: 0.10 to 0.45, x: 0.18 to 0.82)
@@ -1370,7 +1371,7 @@ class PPEDetector(BaseDetector):
 
                 # Multi-Modal Eyewear Confirmation Rules:
                 _has_frame_material = (
-                    dark_rim_ratio >= 0.03
+                    dark_rim_ratio >= 0.025
                     or dark_temple_ratio >= 0.03
                     or amber_ratio >= 0.04
                     or neon_ratio >= 0.03
@@ -1397,7 +1398,7 @@ class PPEDetector(BaseDetector):
                 # 3. Clear Polycarbonate Specular Glare & Reflections
                 is_clear_safety_glasses = (
                     glare_ratio >= 0.005 and
-                    _facial_dark_feature and
+                    (_facial_dark_feature or glare_ratio >= 0.10) and
                     (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.020 or brow_ratio >= 0.025)
                 )
 
@@ -1414,19 +1415,35 @@ class PPEDetector(BaseDetector):
                 )
 
                 # 5. Tinted / Amber Polycarbonate & Neon Safety Frame Accents
+                # Raised amber_ratio from 0.05→0.08 and neon_ratio from 0.035→0.06 to exclude
+                # background amber light (sunset glow, warm indoor lighting through window)
                 is_tinted_or_neon_glasses = (
-                    (amber_ratio >= 0.05 or neon_ratio >= 0.035) and
-                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.020)
+                    (amber_ratio >= 0.08 or neon_ratio >= 0.06) and
+                    (has_bridge or dual_orbit_rim or frame_edge_ratio >= 0.025)
                 )
 
+                # Earphone/cable exclusion gate:
+                # A thin dark vertical line (earphone cable) running from chin to ear has a very
+                # specific signature: high dark_temple on ONE side only, near-zero on the other.
+                # Real glasses frames have symmetric temple arms on both sides.
+                left_dark = float(np.sum(dark_combined[:, :max(1, int(ew * 0.16))] > 0)) / float(max(1, dark_combined[:, :max(1, int(ew * 0.16))].size))
+                right_dark = float(np.sum(dark_combined[:, int(ew * 0.84):] > 0)) / float(max(1, dark_combined[:, int(ew * 0.84):].size))
+                # If one temple is >4x the other, it's likely a cable, not a glasses arm
+                temple_asymmetry = max(left_dark, right_dark) / max(0.001, min(left_dark, right_dark))
+                is_likely_earphone_cable = (temple_asymmetry > 4.0 and max(left_dark, right_dark) > 0.08)
+
                 is_safety_glasses = (
-                    has_haar_glasses or
-                    ((is_dual_rim_glasses or
-                      is_structural_dark_glasses or
-                      is_clear_safety_glasses or
-                      is_bridge_and_contour_glasses or
-                      is_tinted_or_neon_glasses) and
-                     (_has_frame_material or _facial_dark_feature))
+                    not is_likely_earphone_cable and
+                    not has_haar_glasses and
+                    # Require at least 2 independent structural modalities to confirm
+                    (sum([
+                        is_dual_rim_glasses,
+                        is_structural_dark_glasses,
+                        is_clear_safety_glasses,
+                        is_bridge_and_contour_glasses,
+                        is_tinted_or_neon_glasses,
+                    ]) >= 2)
+                    and _has_frame_material
                 )
 
                 if is_safety_glasses:

@@ -23,6 +23,16 @@ _PERSON_MODEL_CACHE: Dict[str, Any] = {}
 _PERSON_CACHE_LOCK = threading.Lock()
 
 
+def _safe_float(val: Any, default: float) -> float:
+    """Safely converts a setting value to float, handling MagicMock or non-primitives."""
+    if val is None or not isinstance(val, (int, float, str)):
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 class PersonDetector(BaseDetector):
     """
     Person Detector Module for identifying human workers in surveillance frames.
@@ -90,14 +100,17 @@ class PersonDetector(BaseDetector):
                 return True
 
             # Attempt 1: High-Performance ONNX Runtime Model Engine
+            backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             onnx_candidates = []
             if self.model_path.endswith(".onnx"):
                 onnx_candidates.append(self.model_path)
+                onnx_candidates.append(os.path.join(backend_root, self.model_path))
+                onnx_candidates.append(os.path.join(backend_root, "models", os.path.basename(self.model_path)))
             else:
-                onnx_candidates.append(os.path.splitext(self.model_path)[0] + ".onnx")
-            onnx_candidates.append("models/yolov8n.onnx")
-            onnx_candidates.append("models/ppe.onnx")
-            backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                stem = os.path.splitext(self.model_path)[0] + ".onnx"
+                onnx_candidates.append(stem)
+                onnx_candidates.append(os.path.join(backend_root, stem))
+                onnx_candidates.append(os.path.join(backend_root, "models", os.path.basename(stem)))
             onnx_candidates.append(os.path.join(backend_root, "models", "yolov8n.onnx"))
             onnx_candidates.append(os.path.join(backend_root, "models", "ppe.onnx"))
 
@@ -165,6 +178,7 @@ class PersonDetector(BaseDetector):
         image_bgr: Any,
         candidate_rois: Optional[List[BoundingBox]] = None,
         motion_rois: Optional[List[Any]] = None,
+        fire_smoke_boxes: Optional[List["DetectionResult"]] = None,
         **kwargs: Any
     ) -> List[DetectionResult]:
         """
@@ -173,6 +187,9 @@ class PersonDetector(BaseDetector):
         :param motion_rois: optional normalised ``(x_min, y_min, x_max, y_max)`` boxes from the
                motion gate. Each is re-examined at higher effective resolution, which recovers
                distant workers the full-frame pass misses for a fraction of a second pass.
+        :param fire_smoke_boxes: previous frame's fire/smoke detections. When present and a
+               candidate person box overlaps one, the confidence threshold is raised to reject
+               ghost silhouettes from flame/smoke shapes while still admitting real workers.
         """
         if not getattr(settings, "AI_PERSON_ENABLED", True) or image_bgr is None or getattr(image_bgr, "size", 0) == 0:
             return []
@@ -184,15 +201,49 @@ class PersonDetector(BaseDetector):
         # High-Performance ONNX Runner
         if self._onnx_runner is not None:
             try:
+                target_cls = ["person", "worker"] if (self._onnx_runner.class_names and any(c.lower() in ["person", "worker"] for c in self._onnx_runner.class_names)) else None
                 raw_dets, inf_time_ms = self._onnx_runner.predict(
                     image_bgr,
                     conf_threshold=self.conf_threshold,
                     iou_threshold=0.45,
-                    target_classes=None
+                    target_classes=target_cls
                 )
                 for d in raw_dets:
                     if not self._is_person(d):
                         continue
+                    norm_bbox = BoundingBox(
+                        x_min=max(0.0, min(1.0, d["bbox"].x_min)),
+                        y_min=max(0.0, min(1.0, d["bbox"].y_min)),
+                        x_max=max(0.0, min(1.0, d["bbox"].x_max)),
+                        y_max=max(0.0, min(1.0, d["bbox"].y_max)),
+                    )
+                    if not self._is_valid_person_box(norm_bbox):
+                        logger.debug(
+                            f"PersonDetector: ONNX box rejected by geometry filter "
+                            f"h={norm_bbox.y_max - norm_bbox.y_min:.3f} "
+                            f"ar={(norm_bbox.x_max - norm_bbox.x_min) / max(0.001, norm_bbox.y_max - norm_bbox.y_min):.2f}"
+                        )
+                        continue
+
+                    # Fire-scene threshold boost: if this person box overlaps a fire/smoke
+                    # candidate from the previous frame, demand substantially higher confidence.
+                    # A phantom silhouette won't clear the boosted bar; a real worker still might.
+                    effective_person_conf = self.conf_threshold
+                    if (
+                        fire_smoke_boxes
+                        and getattr(settings, "FIRE_SCENE_VETO_ENABLED", True)
+                    ):
+                        iou_suppress = _safe_float(getattr(settings, "FIRE_SCENE_PERSON_IOU_SUPPRESS", None), 0.15)
+                        boost = _safe_float(getattr(settings, "FIRE_SCENE_THRESHOLD_BOOST", None), 0.25)
+                        if any(norm_bbox.iou(fs.bbox) >= iou_suppress for fs in fire_smoke_boxes):
+                            effective_person_conf = min(0.95, self.conf_threshold + boost)
+                            if float(d["confidence"]) < effective_person_conf:
+                                logger.debug(
+                                    f"PersonDetector: box rejected by fire-scene boost "
+                                    f"conf={d['confidence']:.3f} < {effective_person_conf:.3f}"
+                                )
+                                continue
+
                     detections.append(DetectionResult(
                         label="person",
                         confidence=float(d["confidence"]),
@@ -258,6 +309,13 @@ class PersonDetector(BaseDetector):
                             x_max=max(0.0, min(1.0, x2 / w)),
                             y_max=max(0.0, min(1.0, y2 / h))
                         )
+                        if not self._is_valid_person_box(norm_bbox):
+                            logger.debug(
+                                f"PersonDetector: PyTorch box rejected by geometry filter "
+                                f"h={norm_bbox.y_max - norm_bbox.y_min:.3f} "
+                                f"ar={(norm_bbox.x_max - norm_bbox.x_min) / max(0.001, norm_bbox.y_max - norm_bbox.y_min):.2f}"
+                            )
+                            continue
                         detections.append(DetectionResult(
                             label="person",
                             confidence=conf,
@@ -441,6 +499,42 @@ class PersonDetector(BaseDetector):
             return True
         return self._model is not None and not self._is_mock_fallback
 
+    @staticmethod
+    def _is_valid_person_box(bbox: "BoundingBox") -> bool:
+        """
+        Geometry sanity filter applied to every raw person detection before it is admitted.
+
+        Rejects boxes that cannot plausibly contain a real worker:
+        - Too short: phantom boxes from chair backs / floor objects are ~4-6% frame height;
+          a seated, desk-occluded worker is typically ≥8%. Conservative floor of 5% set for
+          Camera 03 where only head+upper torso is visible above the desk divider.
+        - Bad aspect ratio: extreme landscapes (silver bags, reflective surfaces) or extreme
+          portrait slivers (door-frame edges) are excluded.
+
+        Thresholds are settings-tunable so they can be tightened after calibrating against
+        real seated-worker footage without a code deploy.
+
+        CALIBRATION NOTE: Before tightening PERSON_MIN_BOX_HEIGHT above 0.07 or narrowing
+        the aspect-ratio band, verify against frames of the actual seated worker at Camera 03.
+        A top-down angle on a desk-occluded worker can produce boxes as small as 0.08 h and
+        with w/h ratios up to 1.5 if the shoulders are wider than the visible torso height.
+        """
+        h = bbox.y_max - bbox.y_min
+        w = bbox.x_max - bbox.x_min
+        if h <= 0 or w <= 0:
+            return False
+        min_h = _safe_float(getattr(settings, "PERSON_MIN_BOX_HEIGHT", None), 0.07)
+        min_ar = _safe_float(getattr(settings, "PERSON_MIN_ASPECT_RATIO", None), 0.10)
+        max_ar = _safe_float(getattr(settings, "PERSON_MAX_ASPECT_RATIO", None), 1.5)
+        min_area = _safe_float(getattr(settings, "PERSON_MIN_BOX_AREA", None), 0.003)
+        if h < min_h:
+            return False
+        # Reject tiny noise boxes regardless of aspect ratio
+        if (w * h) < min_area:
+            return False
+        ar = w / h
+        return min_ar <= ar <= max_ar
+
     def _is_person(self, detection: Dict[str, Any]) -> bool:
         """
         Decides whether a raw detection is a worker.
@@ -516,8 +610,9 @@ class PersonDetector(BaseDetector):
             try:
                 roi_dets, _ = self._onnx_runner.predict(
                     prepared,
-                    conf_threshold=max(0.25, self.conf_threshold * 0.75),
-                    iou_threshold=0.45,
+                    # Require slightly higher confidence for ROI crops to reduce phantom detections
+                    conf_threshold=max(0.30, self.conf_threshold * 0.85),
+                    iou_threshold=0.40,
                     target_classes=None,
                 )
             except Exception:
@@ -547,8 +642,9 @@ class PersonDetector(BaseDetector):
         return extra
 
     @staticmethod
-    def _dedupe(detections: List[DetectionResult], iou_threshold: float = 0.55) -> List[DetectionResult]:
-        """Suppresses duplicate person boxes (full-frame and ROI passes can both fire)."""
+    def _dedupe(detections: List[DetectionResult], iou_threshold: float = 0.45) -> List[DetectionResult]:
+        """Suppresses duplicate person boxes (full-frame and ROI passes can both fire).
+        Threshold tightened from 0.55 to 0.45 to eliminate more overlapping duplicate boxes."""
         if len(detections) <= 1:
             return detections
         import numpy as np

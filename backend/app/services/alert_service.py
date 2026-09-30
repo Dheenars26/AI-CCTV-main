@@ -13,7 +13,7 @@ from app.models.detection import Detection
 from app.models.evidence import Evidence
 from app.models.notification import Notification
 from app.models.system_log import SystemLog
-from app.services.mongo_service import schedule_mongo_detection_log, schedule_mongo_detections_batch
+from app.services.mongo_service import schedule_mongo_alert_log
 from app.utils.logger import logger
 
 
@@ -56,6 +56,25 @@ class AlertService:
         self.db.commit()
         self.db.refresh(alert)
         logger.info(f"AlertService: Persisted Alert '{alert.id}' for Camera {camera_id} [{class_name}] state={state}")
+
+        # Non-blocking forward to MongoDB (simplified alert event store)
+        try:
+            from app.models.camera import Camera
+            cam = self.db.query(Camera).filter(Camera.id == camera_id).first()
+            cam_name = cam.name if cam and cam.name else f"Camera #{camera_id}"
+            cam_location = getattr(cam, "location", None) if cam else None
+            schedule_mongo_alert_log(
+                camera_id=camera_id,
+                camera_name=cam_name,
+                location=cam_location,
+                alert_type=class_name,
+                confidence=max_confidence,
+                timestamp=start_time,
+                metadata={"alert_id": alert_id, "state": state}
+            )
+        except Exception:
+            pass
+
         return alert
 
     def update_alert_state(
@@ -146,21 +165,6 @@ class AlertService:
         self.db.add(det)
         self.db.commit()
 
-        # Non-blocking async forward to MongoDB (Hybrid telemetry store)
-        try:
-            schedule_mongo_detection_log(
-                camera_id=camera_id,
-                camera_name=f"Camera #{camera_id}",
-                class_name=class_name,
-                confidence=confidence,
-                bounding_box=bounding_box,
-                frame_number=frame_number,
-                fps=fps,
-                timestamp=ts
-            )
-        except Exception:
-            pass
-
         return det
 
     def create_detections_batch(
@@ -204,19 +208,6 @@ class AlertService:
 
         self.db.add_all(records)
         self.db.commit()
-
-        # Non-blocking async forward to MongoDB
-        try:
-            schedule_mongo_detections_batch(
-                camera_id=camera_id,
-                camera_name=f"Camera #{camera_id}",
-                detections=mongo_docs,
-                frame_number=frame_number,
-                fps=fps,
-                timestamp=ts
-            )
-        except Exception:
-            pass
 
         return records
 

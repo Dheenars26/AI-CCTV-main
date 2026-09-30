@@ -46,12 +46,15 @@ axiosClient.interceptors.response.use(
     const originalRequest = error.config;
 
     // Auto-retry on 502 Bad Gateway / 503 Service Unavailable / ECONNABORTED (backend temporarily unavailable during restart)
-    const MAX_RETRIES = 2;
-    const RETRY_DELAY_MS = 1500;
+    // MAX_RETRIES=4 and RETRY_DELAY_MS=2000 handle the ~4-5 second backend cold-start window
+    // (all ONNX models load sequentially before uvicorn accepts requests)
+    const MAX_RETRIES = 4;
+    const RETRY_DELAY_MS = 2000;
     const isTimeoutOrUnavailable = error.code === 'ECONNABORTED' || error.response?.status === 502 || error.response?.status === 503;
     if (isTimeoutOrUnavailable && (originalRequest.__retryCount || 0) < MAX_RETRIES) {
       originalRequest.__retryCount = (originalRequest.__retryCount || 0) + 1;
-      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      const delay = RETRY_DELAY_MS * originalRequest.__retryCount; // exponential-ish: 2s, 4s, 6s, 8s
+      await new Promise((resolve) => setTimeout(resolve, delay));
       return axiosClient(originalRequest);
     }
 

@@ -53,17 +53,32 @@ def inspect_ai_environment():
         logger.warning("[WARNING] 'ultralytics' library is not installed. (System falls back to OpenCV HSV Fire/Smoke Engine).")
 
     # 5. Check Model Weight Files
-    model_path = settings.YOLO_MODEL_PATH
-    models_dir = os.path.dirname(os.path.abspath(model_path))
-    os.makedirs(models_dir, exist_ok=True)
+    backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    models_to_check = [
+        ("Fire & Smoke Model", settings.YOLO_MODEL_PATH),
+        ("PPE Detection Model", settings.PPE_MODEL_PATH),
+        ("Person Detection Model", settings.PERSON_MODEL_PATH),
+    ]
 
-    if os.path.exists(model_path):
-        size_mb = round(os.path.getsize(model_path) / (1024 * 1024), 2)
-        logger.info(f"[SUCCESS] Target YOLO Model File exists: '{model_path}' ({size_mb} MB)")
-    else:
-        logger.info(f"[NOTICE] Target Model File '{model_path}' not found.")
-        logger.info(f"OpenCV Fallback Computer Vision Engine is ACTIVE for Fire & Smoke detection.")
-        logger.info(f"To use PyTorch/ONNX YOLO inference, place your trained fire/smoke model weights (.pt or .onnx) at '{os.path.abspath(model_path)}'.")
+    for label, rel_path in models_to_check:
+        candidates = [
+            rel_path,
+            os.path.join(backend_root, rel_path),
+            os.path.join(backend_root, "models", os.path.basename(rel_path)),
+            os.path.join("backend", rel_path)
+        ]
+        found_path = None
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                found_path = os.path.abspath(cand)
+                break
+
+        if found_path:
+            size_mb = round(os.path.getsize(found_path) / (1024 * 1024), 2)
+            logger.info(f"[SUCCESS] {label} exists: '{found_path}' ({size_mb} MB)")
+        else:
+            expected_abs = os.path.join(backend_root, rel_path)
+            logger.warning(f"[NOTICE] {label} '{rel_path}' not found at '{expected_abs}'.")
 
     logger.info("=" * 60)
     logger.info("AI Model Setup Diagnostic Completed.")

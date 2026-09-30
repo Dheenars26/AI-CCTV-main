@@ -1,35 +1,34 @@
 """
-MongoDB Service for Detection Event Ingestion & Telemetry Queries.
-Provides non-blocking async writes and indexed time-range queries.
+MongoDB Service for Alert Event Logging & Queries.
+Stores only verified safety alerts with camera context, detection snapshots, and timestamps.
 """
 
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from app.database.mongodb import mongodb_manager
-from app.schemas.mongo_docs import DetectionEventDoc, BoundingBoxDoc, CameraTelemetryDoc, MongoQueryFilter
+from app.schemas.mongo_docs import AlertEventQueryFilter
 from app.utils.logger import logger
 
 
-class MongoDetectionService:
+class MongoAlertService:
     """
-    High-throughput ingestion and query service for MongoDB detection and telemetry records.
+    Simplified alert-focused MongoDB service.
+    Stores one document per verified safety alert (fire, smoke, PPE violation, zone breach).
     """
 
     @staticmethod
-    async def log_detection(
+    async def log_alert_event(
         camera_id: int,
         camera_name: str,
-        class_name: str,
-        confidence: float,
-        bounding_box: Dict[str, Any],
-        frame_number: int = 0,
-        fps: float = 0.0,
-        module: str = "GENERAL",
+        location: Optional[str],
+        alert_type: str,
+        confidence: float = 0.0,
+        snapshot_path: Optional[str] = None,
         timestamp: Optional[datetime] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> Optional[str]:
         """
-        Persists a single frame detection event into MongoDB 'detection_logs'.
+        Persists a single verified alert event into MongoDB 'alert_events'.
         Fails silently if MongoDB is offline to ensure video pipeline is never blocked.
         """
         if not mongodb_manager.is_connected or mongodb_manager.db is None:
@@ -39,109 +38,32 @@ class MongoDetectionService:
         doc = {
             "camera_id": camera_id,
             "camera_name": camera_name,
-            "class_name": class_name.lower(),
+            "location": location,
+            "alert_type": alert_type.lower(),
             "confidence": round(float(confidence), 4),
-            "bounding_box": bounding_box,
-            "frame_number": frame_number,
-            "fps": round(float(fps), 2),
-            "module": module.upper(),
+            "snapshot_path": snapshot_path,
             "timestamp": ts,
             "metadata": metadata or {}
         }
 
         try:
-            result = await mongodb_manager.db["detection_logs"].insert_one(doc)
+            result = await mongodb_manager.db["alert_events"].insert_one(doc)
             return str(result.inserted_id)
         except Exception as e:
-            logger.debug(f"MongoDB log_detection notice (non-fatal): {e}")
+            logger.debug(f"MongoDB log_alert_event notice (non-fatal): {e}")
             return None
 
     @staticmethod
-    async def log_detections_batch(
-        camera_id: int,
-        camera_name: str,
-        detections: List[Dict[str, Any]],
-        frame_number: int = 0,
-        fps: float = 0.0,
-        module: str = "GENERAL",
-        timestamp: Optional[datetime] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> int:
+    async def query_alert_events(filter_params: AlertEventQueryFilter) -> Dict[str, Any]:
         """
-        Persists a batch of detections from an inference frame in a single bulk insert.
-        """
-        if not mongodb_manager.is_connected or mongodb_manager.db is None or not detections:
-            return 0
-
-        ts = timestamp or datetime.now(timezone.utc)
-        docs = []
-        for det in detections:
-            docs.append({
-                "camera_id": camera_id,
-                "camera_name": camera_name,
-                "class_name": det.get("class_name", "unknown").lower(),
-                "confidence": round(float(det.get("confidence", 0.0)), 4),
-                "bounding_box": det.get("bounding_box", {}),
-                "track_id": det.get("track_id"),
-                "frame_number": frame_number,
-                "fps": round(float(fps), 2),
-                "module": module.upper(),
-                "timestamp": ts,
-                "metadata": metadata or {}
-            })
-
-        try:
-            result = await mongodb_manager.db["detection_logs"].insert_many(docs, ordered=False)
-            return len(result.inserted_ids)
-        except Exception as e:
-            logger.debug(f"MongoDB log_detections_batch notice (non-fatal): {e}")
-            return 0
-
-    @staticmethod
-    async def log_telemetry(
-        camera_id: int,
-        camera_name: str,
-        ai_fps: float,
-        stream_fps: float,
-        active_worker_tracks: int = 0,
-        active_violations: int = 0,
-        inference_latency_ms: float = 0.0
-    ) -> Optional[str]:
-        """
-        Persists stream processing and hardware performance telemetry.
-        """
-        if not mongodb_manager.is_connected or mongodb_manager.db is None:
-            return None
-
-        doc = {
-            "camera_id": camera_id,
-            "camera_name": camera_name,
-            "timestamp": datetime.now(timezone.utc),
-            "ai_fps": round(float(ai_fps), 2),
-            "stream_fps": round(float(stream_fps), 2),
-            "inference_latency_ms": round(float(inference_latency_ms), 2),
-            "active_worker_tracks": active_worker_tracks,
-            "active_violations": active_violations
-        }
-
-        try:
-            res = await mongodb_manager.db["telemetry_logs"].insert_one(doc)
-            return str(res.inserted_id)
-        except Exception as e:
-            logger.debug(f"MongoDB log_telemetry notice: {e}")
-            return None
-
-    @staticmethod
-    async def query_detection_history(filter_params: MongoQueryFilter) -> Dict[str, Any]:
-        """
-        Queries indexed detection logs from MongoDB with filtering and pagination.
+        Queries alert events from MongoDB with filtering and pagination.
         """
         if not mongodb_manager.is_connected or mongodb_manager.db is None:
             return {
                 "items": [],
                 "total": 0,
                 "mongodb_connected": False,
-                "message": "MongoDB is offline or unreachable. Detection logs are running in graceful fallback."
+                "message": "MongoDB is offline or unreachable."
             }
 
         query: Dict[str, Any] = {}
@@ -149,11 +71,8 @@ class MongoDetectionService:
         if filter_params.camera_id is not None:
             query["camera_id"] = filter_params.camera_id
 
-        if filter_params.class_name:
-            query["class_name"] = filter_params.class_name.lower()
-
-        if filter_params.module:
-            query["module"] = filter_params.module.upper()
+        if filter_params.alert_type:
+            query["alert_type"] = filter_params.alert_type.lower()
 
         time_query = {}
         if filter_params.start_time:
@@ -164,7 +83,7 @@ class MongoDetectionService:
             query["timestamp"] = time_query
 
         try:
-            collection = mongodb_manager.db["detection_logs"]
+            collection = mongodb_manager.db["alert_events"]
             total = await collection.count_documents(query)
 
             cursor = collection.find(query).sort("timestamp", -1).skip(filter_params.skip).limit(filter_params.limit)
@@ -189,42 +108,61 @@ class MongoDetectionService:
                 "error": str(e)
             }
 
+    @staticmethod
+    async def get_alerts_by_camera(camera_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        """Returns recent alert events for a specific camera."""
+        if not mongodb_manager.is_connected or mongodb_manager.db is None:
+            return []
 
-mongo_detection_service = MongoDetectionService()
+        try:
+            cursor = mongodb_manager.db["alert_events"].find(
+                {"camera_id": camera_id}
+            ).sort("timestamp", -1).limit(limit)
+            items = []
+            async for doc in cursor:
+                doc["id"] = str(doc.pop("_id"))
+                items.append(doc)
+            return items
+        except Exception as e:
+            logger.debug(f"MongoDB get_alerts_by_camera notice: {e}")
+            return []
 
 
-def schedule_mongo_detection_log(
+mongo_alert_service = MongoAlertService()
+
+
+import concurrent.futures
+
+_mongo_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="MongoDispatch")
+
+def schedule_mongo_alert_log(
     camera_id: int,
     camera_name: str,
-    class_name: str,
-    confidence: float,
-    bounding_box: Dict[str, Any],
-    frame_number: int = 0,
-    fps: float = 0.0,
-    module: str = "GENERAL",
+    location: Optional[str],
+    alert_type: str,
+    confidence: float = 0.0,
+    snapshot_path: Optional[str] = None,
     timestamp: Optional[datetime] = None,
     metadata: Optional[Dict[str, Any]] = None
 ) -> None:
     """
-    Safely dispatches non-blocking MongoDB detection logging from synchronous worker code.
+    Safely dispatches non-blocking MongoDB alert logging from synchronous worker code.
     Never blocks OpenCV/camera threads and silently catches errors if MongoDB is offline.
+    Uses a bounded ThreadPoolExecutor to prevent thread exhaustion during alert storms.
     """
     if not mongodb_manager.is_connected or mongodb_manager.db is None:
         return
 
     import asyncio
-    import threading
 
     async def _async_call():
-        await mongo_detection_service.log_detection(
+        await mongo_alert_service.log_alert_event(
             camera_id=camera_id,
             camera_name=camera_name,
-            class_name=class_name,
+            location=location,
+            alert_type=alert_type,
             confidence=confidence,
-            bounding_box=bounding_box,
-            frame_number=frame_number,
-            fps=fps,
-            module=module,
+            snapshot_path=snapshot_path,
             timestamp=timestamp,
             metadata=metadata
         )
@@ -233,46 +171,7 @@ def schedule_mongo_detection_log(
         loop = asyncio.get_running_loop()
         loop.create_task(_async_call())
     except RuntimeError:
-        threading.Thread(target=lambda: asyncio.run(_async_call()), daemon=True).start()
+        # Submit to the executor instead of spawning an unbounded raw thread
+        _mongo_executor.submit(lambda: asyncio.run(_async_call()))
     except Exception as e:
-        logger.debug(f"MongoDB dispatch notice: {e}")
-
-
-def schedule_mongo_detections_batch(
-    camera_id: int,
-    camera_name: str,
-    detections: List[Dict[str, Any]],
-    frame_number: int = 0,
-    fps: float = 0.0,
-    module: str = "GENERAL",
-    timestamp: Optional[datetime] = None,
-    metadata: Optional[Dict[str, Any]] = None
-) -> None:
-    """
-    Safely dispatches batch of detection documents to MongoDB from synchronous code.
-    """
-    if not mongodb_manager.is_connected or mongodb_manager.db is None or not detections:
-        return
-
-    import asyncio
-    import threading
-
-    async def _async_call():
-        await mongo_detection_service.log_detections_batch(
-            camera_id=camera_id,
-            camera_name=camera_name,
-            detections=detections,
-            frame_number=frame_number,
-            fps=fps,
-            module=module,
-            timestamp=timestamp,
-            metadata=metadata
-        )
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_async_call())
-    except RuntimeError:
-        threading.Thread(target=lambda: asyncio.run(_async_call()), daemon=True).start()
-    except Exception as e:
-        logger.debug(f"MongoDB batch dispatch notice: {e}")
+        logger.error(f"MongoDB alert dispatch failed: {e}")

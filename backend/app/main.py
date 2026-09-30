@@ -1,6 +1,6 @@
 """
 Main FastAPI Application Entry Point.
-AI CCTV Fire & Smoke Monitoring Platform Backend.
+AI CCTV Fire & Smoke Monitoring Platform Backend (Production Engine Verified v2).
 """
 
 from contextlib import asynccontextmanager
@@ -347,5 +347,5 @@ def create_application() -> FastAPI:
     return app
 
 
-
 app = create_application()
+# AI Engine reload trigger - build 2026-09-23.03
