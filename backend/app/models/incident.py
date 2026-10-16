@@ -38,6 +38,8 @@ class Incident(Base):
         index=True,
         nullable=True
     )
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    site_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     incident_type: Mapped[str] = mapped_column(
         String(50),
         index=True,

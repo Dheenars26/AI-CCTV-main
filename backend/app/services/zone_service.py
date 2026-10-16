@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.models.zone import SafetyZone
+from app.models.camera import Camera
 from app.services.audit_service import AuditService
 from app.zones.engine import ZoneEngine
 from app.utils.exceptions import ValidationException
@@ -18,14 +19,22 @@ class ZoneService:
     def __init__(self, db: Session):
         self.db = db
 
-    def get_zones(self, camera_id: Optional[int] = None) -> List[SafetyZone]:
+    def get_zones(self, camera_id: Optional[int] = None, organization_id: Optional[str] = None) -> List[SafetyZone]:
         stmt = select(SafetyZone)
+        if organization_id is not None:
+            stmt = stmt.where(SafetyZone.organization_id == organization_id)
         if camera_id is not None:
             stmt = stmt.where(SafetyZone.camera_id == camera_id)
         return list(self.db.scalars(stmt.order_by(SafetyZone.id)).all())
 
-    def get_zone(self, zone_id: int) -> Optional[SafetyZone]:
-        return self.db.get(SafetyZone, zone_id)
+    def get_zone(self, zone_id: int, organization_id: Optional[str] = None) -> Optional[SafetyZone]:
+        zone = self.db.get(SafetyZone, zone_id)
+        if not zone:
+            return None
+        if organization_id is not None and zone.organization_id is not None:
+            if zone.organization_id != organization_id:
+                return None
+        return zone
 
     def create_zone(
         self,
@@ -35,12 +44,22 @@ class ZoneService:
         zone_type: str = "HAZARD",
         ppe_profile_id: Optional[int] = None,
         enabled: bool = True,
-        user_id: Optional[Union[int, str]] = None
+        user_id: Optional[Union[int, str]] = None,
+        organization_id: Optional[str] = None,
+        site_id: Optional[str] = None
     ) -> SafetyZone:
         # Validate polygon coordinates
         valid, msg = ZoneEngine.validate_polygon(polygon_coordinates)
         if not valid:
             raise ValidationException(f"Invalid safety zone polygon: {msg}")
+
+        # Inherit org and site from camera if not specified
+        if not organization_id and camera_id:
+            cam = self.db.get(Camera, camera_id)
+            if cam:
+                organization_id = cam.organization_id
+                if not site_id:
+                    site_id = cam.site_id
 
         zone = SafetyZone(
             camera_id=camera_id,
@@ -48,7 +67,9 @@ class ZoneService:
             zone_type=zone_type.upper(),
             polygon_coordinates=polygon_coordinates,
             ppe_profile_id=ppe_profile_id,
-            enabled=enabled
+            enabled=enabled,
+            organization_id=organization_id,
+            site_id=site_id
         )
         self.db.add(zone)
         self.db.flush()
@@ -71,9 +92,10 @@ class ZoneService:
         polygon_coordinates: Optional[List[List[float]]] = None,
         ppe_profile_id: Optional[int] = None,
         enabled: Optional[bool] = None,
-        user_id: Optional[Union[int, str]] = None
+        user_id: Optional[Union[int, str]] = None,
+        organization_id: Optional[str] = None
     ) -> Optional[SafetyZone]:
-        zone = self.get_zone(zone_id)
+        zone = self.get_zone(zone_id, organization_id=organization_id)
         if not zone:
             return None
 
@@ -105,8 +127,13 @@ class ZoneService:
 
         return zone
 
-    def delete_zone(self, zone_id: int, user_id: Optional[Union[int, str]] = None) -> bool:
-        zone = self.get_zone(zone_id)
+    def delete_zone(
+        self,
+        zone_id: int,
+        user_id: Optional[Union[int, str]] = None,
+        organization_id: Optional[str] = None
+    ) -> bool:
+        zone = self.get_zone(zone_id, organization_id=organization_id)
         if not zone:
             return False
 

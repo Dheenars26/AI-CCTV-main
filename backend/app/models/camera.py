@@ -26,6 +26,10 @@ class Camera(Base):
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     camera_number: Mapped[str] = mapped_column(String(50), nullable=False, default="CAM-01")
     
+    # Optional Multi-Tenant Hierarchy Association
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
+    site_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("sites.id", ondelete="SET NULL"), nullable=True, index=True)
+
     # Optional Physical DVR/NVR Association
     dvr_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("dvrs.id", ondelete="RESTRICT"), nullable=True)
     dvr_channel: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

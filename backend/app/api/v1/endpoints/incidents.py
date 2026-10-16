@@ -44,6 +44,7 @@ def list_incidents(
         status=status,
         date_from=date_from,
         date_to=date_to,
+        organization_id=current_user.organization_id,
         page=page,
         page_size=page_size
     )
@@ -64,7 +65,7 @@ def get_incident(
     current_user: User = Depends(get_current_user)
 ):
     service = IncidentService(db)
-    inc = service.get_incident(id)
+    inc = service.get_incident(id, organization_id=current_user.organization_id)
     if not inc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
     return inc
@@ -81,7 +82,8 @@ def update_incident_status(
     updated = service.update_incident_status(
         incident_id=id,
         status=payload.status,
-        user_id=current_user.id
+        user_id=current_user.id,
+        organization_id=current_user.organization_id
     )
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")

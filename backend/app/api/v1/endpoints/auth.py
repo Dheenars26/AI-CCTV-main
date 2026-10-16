@@ -142,7 +142,13 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
 
     # 4. Generate Tokens (Access Token + Refresh Token with Family ID)
     family_id = str(uuid.uuid4())
-    token_claims = {"sub": user.id, "username": user.username, "role": user.role, "family_id": family_id}
+    token_claims = {
+        "sub": user.id,
+        "username": user.username,
+        "role": user.role,
+        "organization_id": user.organization_id,
+        "family_id": family_id
+    }
 
     access_token = create_access_token(data=token_claims)
     refresh_token_str, token_jti = create_refresh_token(data=token_claims)
@@ -281,7 +287,13 @@ def refresh_tokens(
     db_token.is_revoked = True
 
     # Issue NEW Access Token and NEW Refresh Token within same family
-    token_claims = {"sub": user.id, "username": user.username, "role": user.role, "family_id": db_token.family_id}
+    token_claims = {
+        "sub": user.id,
+        "username": user.username,
+        "role": user.role,
+        "organization_id": user.organization_id,
+        "family_id": db_token.family_id
+    }
     new_access_token = create_access_token(data=token_claims)
     new_refresh_str, new_token_jti = create_refresh_token(data=token_claims)
 
@@ -359,7 +371,10 @@ def logout(
 )
 def issue_ws_ticket(current_user: User = Depends(get_current_user)):
     ticket = ws_ticket_service.issue_ticket(
-        user_id=current_user.id, username=current_user.username, role=current_user.role
+        user_id=current_user.id,
+        username=current_user.username,
+        role=current_user.role,
+        organization_id=current_user.organization_id
     )
     return ResponseModel(data=WSTicketResponse(ticket=ticket, expires_in=10))
 

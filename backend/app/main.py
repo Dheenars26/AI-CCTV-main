@@ -89,7 +89,9 @@ async def lifespan(app: FastAPI):
                             ("gpu_device_id", "INTEGER DEFAULT 0"),
                             ("fps_limit", "INTEGER DEFAULT 25"),
                             ("connection_timeout", "INTEGER DEFAULT 10"),
-                            ("reconnect_interval", "INTEGER DEFAULT 5")
+                            ("reconnect_interval", "INTEGER DEFAULT 5"),
+                            ("organization_id", "VARCHAR(36)"),
+                            ("site_id", "VARCHAR(36)")
                         ]
                         for c_name, c_type in c_definitions:
                             if c_name not in cam_cols:
@@ -99,6 +101,12 @@ async def lifespan(app: FastAPI):
                                     logger.info(f"App Lifespan: Auto-added missing column '{c_name}' to cameras table.")
                                 except Exception as e:
                                     logger.warning(f"App Lifespan: Could not add column '{c_name}' to cameras: {e}")
+
+                    # Check user columns for organization_id
+                    user_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(users)")).fetchall()]
+                    if user_cols and "organization_id" not in user_cols:
+                        conn.execute(text("ALTER TABLE users ADD COLUMN organization_id VARCHAR(36)"))
+                        conn.commit()
 
                     det_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(detections)")).fetchall()]
                     if det_cols and "module" not in det_cols:
@@ -110,6 +118,12 @@ async def lifespan(app: FastAPI):
                         if "module" not in alt_cols:
                             conn.execute(text("ALTER TABLE alerts ADD COLUMN module VARCHAR(50) DEFAULT 'FIRE_SMOKE'"))
                             conn.commit()
+                        if "organization_id" not in alt_cols:
+                            conn.execute(text("ALTER TABLE alerts ADD COLUMN organization_id VARCHAR(36)"))
+                            conn.commit()
+                        if "site_id" not in alt_cols:
+                            conn.execute(text("ALTER TABLE alerts ADD COLUMN site_id VARCHAR(36)"))
+                            conn.commit()
                         if "remedial_action" not in alt_cols:
                             conn.execute(text("ALTER TABLE alerts ADD COLUMN remedial_action VARCHAR(100)"))
                             conn.commit()
@@ -118,6 +132,33 @@ async def lifespan(app: FastAPI):
                             conn.commit()
                         if "resolved_by" not in alt_cols:
                             conn.execute(text("ALTER TABLE alerts ADD COLUMN resolved_by VARCHAR(100)"))
+                            conn.commit()
+
+                    inc_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(incidents)")).fetchall()]
+                    if inc_cols:
+                        if "organization_id" not in inc_cols:
+                            conn.execute(text("ALTER TABLE incidents ADD COLUMN organization_id VARCHAR(36)"))
+                            conn.commit()
+                        if "site_id" not in inc_cols:
+                            conn.execute(text("ALTER TABLE incidents ADD COLUMN site_id VARCHAR(36)"))
+                            conn.commit()
+
+                    ev_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(evidence)")).fetchall()]
+                    if ev_cols:
+                        if "organization_id" not in ev_cols:
+                            conn.execute(text("ALTER TABLE evidence ADD COLUMN organization_id VARCHAR(36)"))
+                            conn.commit()
+                        if "site_id" not in ev_cols:
+                            conn.execute(text("ALTER TABLE evidence ADD COLUMN site_id VARCHAR(36)"))
+                            conn.commit()
+
+                    zone_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(safety_zones)")).fetchall()]
+                    if zone_cols:
+                        if "organization_id" not in zone_cols:
+                            conn.execute(text("ALTER TABLE safety_zones ADD COLUMN organization_id VARCHAR(36)"))
+                            conn.commit()
+                        if "site_id" not in zone_cols:
+                            conn.execute(text("ALTER TABLE safety_zones ADD COLUMN site_id VARCHAR(36)"))
                             conn.commit()
                 else:
                     # PostgreSQL IF NOT EXISTS column migrations
@@ -138,11 +179,22 @@ async def lifespan(app: FastAPI):
                         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS target_ai_fps INTEGER DEFAULT 15",
                         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS frame_skip INTEGER DEFAULT 1",
                         "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS gpu_device_id INTEGER DEFAULT 0",
+                        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS organization_id VARCHAR(36)",
+                        "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS site_id VARCHAR(36)",
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS organization_id VARCHAR(36)",
                         "ALTER TABLE detections ADD COLUMN IF NOT EXISTS module VARCHAR(50) DEFAULT 'FIRE_SMOKE'",
                         "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS module VARCHAR(50) DEFAULT 'FIRE_SMOKE'",
                         "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS remedial_action VARCHAR(100)",
                         "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS remedy_notes VARCHAR(500)",
-                        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolved_by VARCHAR(100)"
+                        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS resolved_by VARCHAR(100)",
+                        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS organization_id VARCHAR(36)",
+                        "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS site_id VARCHAR(36)",
+                        "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS organization_id VARCHAR(36)",
+                        "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS site_id VARCHAR(36)",
+                        "ALTER TABLE evidence ADD COLUMN IF NOT EXISTS organization_id VARCHAR(36)",
+                        "ALTER TABLE evidence ADD COLUMN IF NOT EXISTS site_id VARCHAR(36)",
+                        "ALTER TABLE safety_zones ADD COLUMN IF NOT EXISTS organization_id VARCHAR(36)",
+                        "ALTER TABLE safety_zones ADD COLUMN IF NOT EXISTS site_id VARCHAR(36)"
                     ]
                     for stmt in postgres_stmts:
                         try:
@@ -281,11 +333,10 @@ def create_application() -> FastAPI:
     # 3. Global Exception Handlers
     register_exception_handlers(app)
 
-    # 4. Mount Static Files Directory for Direct Evidence Access (/evidence)
+    # 4. Prepare Evidence Storage Directory
     import os
-    from fastapi.staticfiles import StaticFiles
     os.makedirs(settings.EVIDENCE_STORAGE_DIR, exist_ok=True)
-    app.mount("/evidence", StaticFiles(directory=settings.EVIDENCE_STORAGE_DIR), name="evidence")
+    # Direct static mount removed to enforce RBAC and tenant authorization via /api/v1/evidence
 
     # 5. Include Routers
     # Versioned REST APIs (/api/v1/...)
@@ -300,10 +351,22 @@ def create_application() -> FastAPI:
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/docs")
 
-    # Top-level Health Check Endpoint (/health & /healthz for Render/Docker)
+    # Top-level Health Check Endpoints (/health, /healthz, /readyz, /metrics for Cloud/Load Balancer)
     @app.get("/healthz", summary="Lightweight Liveness Probe", tags=["Health"])
     def healthz():
         return {"status": "ok", "service": "ai-cctv-monitor"}
+
+    @app.get("/readyz", summary="Subsystem Readiness Probe", tags=["Health"])
+    async def top_level_readyz(request: Request, db: Session = Depends(get_db)):
+        from app.api.v1.endpoints.system import readiness_probe
+        return await readiness_probe(request, db)
+
+    @app.get("/metrics", summary="Top-Level Prometheus Metrics", tags=["Metrics"])
+    def top_level_metrics():
+        from fastapi import Response
+        from app.utils.metrics import metrics_collector
+        output = metrics_collector.generate_prometheus_output()
+        return Response(content=output, media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @app.get("/health", summary="Top-Level Subsystem Health Status", tags=["Health"])
     def root_health_check(request: Request, db: Session = Depends(get_db)):

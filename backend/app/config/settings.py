@@ -6,7 +6,7 @@ Loads configuration from environment variables or .env file.
 import sys
 import os
 from typing import List, Union, Optional
-from pydantic import field_validator
+from pydantic import field_validator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 
@@ -262,10 +262,10 @@ class Settings(BaseSettings):
     SPATIAL_IOU_THRESHOLD: float = 0.15
 
     # Incident Evidence Management & Video Archiving Settings
-    EVIDENCE_STORAGE_DIR: str = "evidence"
+    EVIDENCE_STORAGE_DIR: str = Field(default="evidence", validation_alias="EVIDENCE_STORAGE_PATH")
     PRE_EVENT_BUFFER_SECONDS: float = 5.0
     POST_EVENT_BUFFER_SECONDS: float = 10.0
-    EVIDENCE_RETENTION_DAYS: int = 1
+    EVIDENCE_RETENTION_DAYS: int = 30
     EVIDENCE_JPEG_QUALITY: int = 90
 
     # Email Alert System & SMTP Configuration
@@ -314,13 +314,11 @@ class Settings(BaseSettings):
             return f"sqlite:///{db_path}"
         
         v_str = v.strip()
-        if "localhost:5432" in v_str or "127.0.0.1:5432" in v_str:
-            backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            db_path = os.path.join(backend_dir, "cctv.db")
-            return f"sqlite:///{db_path}"
-
         if v_str.startswith("postgres://"):
             return v_str.replace("postgres://", "postgresql://", 1)
+
+        if v_str.startswith("postgresql://") or v_str.startswith("postgresql+"):
+            return v_str
 
         if "sqlite:///./" in v_str or v_str == "sqlite:///cctv.db":
             backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -5,7 +5,7 @@ SQLAlchemy ORM Model for User Accounts & Authentication.
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import String, Boolean, DateTime
+from sqlalchemy import String, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database.base import Base
 
@@ -28,6 +28,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(50), default="OPERATOR", nullable=False)  # ADMIN, MANAGER, OPERATOR, VIEWER
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True)
 
     failed_login_attempts: Mapped[int] = mapped_column(default=0, nullable=False)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

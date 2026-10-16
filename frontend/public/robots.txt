@@ -1,4 +1,0 @@
-# robots.txt for AI CCTV Security Operations Center
-User-agent: *
-Allow: /
-Disallow: /api/

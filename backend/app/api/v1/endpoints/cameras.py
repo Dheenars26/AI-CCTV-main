@@ -54,6 +54,8 @@ def _build_camera_response(c: Camera) -> CameraResponse:
         id=c.id,
         name=c.name,
         camera_number=c.camera_number,
+        organization_id=getattr(c, "organization_id", None),
+        site_id=getattr(c, "site_id", None),
         dvr_id=getattr(c, "dvr_id", None),
         dvr_channel=getattr(c, "dvr_channel", None),
         dvr_address=c.dvr_address,
@@ -90,7 +92,7 @@ async def list_cameras(
     current_user: User = Depends(RequirePermission("cameras:read")),
     service: CameraService = Depends(get_camera_service)
 ):
-    cameras = service.list_cameras()
+    cameras = service.list_cameras(organization_id=current_user.organization_id)
     response_data = [_build_camera_response(c) for c in cameras]
     return ResponseModel(data=response_data)
 
@@ -107,7 +109,7 @@ async def create_camera(
     current_user: User = Depends(RequirePermission("cameras:write")),
     service: CameraService = Depends(get_camera_service)
 ):
-    c = service.create_camera(payload)
+    c = service.create_camera(payload, organization_id=current_user.organization_id)
     return ResponseModel(data=_build_camera_response(c))
 
 
@@ -122,7 +124,7 @@ async def get_camera(
     current_user: User = Depends(RequirePermission("cameras:read")),
     service: CameraService = Depends(get_camera_service)
 ):
-    c = service.get_camera(camera_id)
+    c = service.get_camera(camera_id, organization_id=current_user.organization_id)
     return ResponseModel(data=_build_camera_response(c))
 
 
@@ -139,7 +141,7 @@ async def update_camera_full(
     service: CameraService = Depends(get_camera_service)
 ):
     update_payload = CameraUpdate(**payload.model_dump())
-    c = service.update_camera(camera_id, update_payload)
+    c = service.update_camera(camera_id, update_payload, organization_id=current_user.organization_id)
     return ResponseModel(data=_build_camera_response(c))
 
 
@@ -155,7 +157,7 @@ async def update_camera_partial(
     current_user: User = Depends(RequirePermission("cameras:write")),
     service: CameraService = Depends(get_camera_service)
 ):
-    c = service.update_camera(camera_id, payload)
+    c = service.update_camera(camera_id, payload, organization_id=current_user.organization_id)
     return ResponseModel(data=_build_camera_response(c))
 
 
@@ -170,7 +172,7 @@ async def delete_camera(
     current_user: User = Depends(RequirePermission("cameras:write")),
     service: CameraService = Depends(get_camera_service)
 ):
-    success = service.delete_camera(camera_id)
+    success = service.delete_camera(camera_id, organization_id=current_user.organization_id)
     return ResponseModel(data=success)
 
 

@@ -20,7 +20,7 @@ class WSTicketService:
         self._tickets: Dict[str, Dict[str, Any]] = {}
         self._lock = Lock()
 
-    def issue_ticket(self, user_id: str, username: str, role: str) -> str:
+    def issue_ticket(self, user_id: str, username: str, role: str, organization_id: Optional[str] = None) -> str:
         """
         Generates and stores a unique single-use WebSocket ticket for a user.
         Returns ticket string 'wst_<uuid>'.
@@ -36,10 +36,11 @@ class WSTicketService:
                 "user_id": user_id,
                 "username": username,
                 "role": role,
+                "organization_id": organization_id,
                 "expires_at": now + self.ttl_seconds
             }
 
-        logger.debug(f"WSTicketService: Issued ticket '{ticket_id}' for user '{username}' (TTL {self.ttl_seconds}s)")
+        logger.debug(f"WSTicketService: Issued ticket '{ticket_id}' for user '{username}' (org={organization_id}, TTL {self.ttl_seconds}s)")
         return ticket_id
 
     def consume_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:

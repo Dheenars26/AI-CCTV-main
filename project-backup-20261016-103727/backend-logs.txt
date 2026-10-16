@@ -1,0 +1,314 @@
+﻿cctv_backend_api  | [2026-10-15 11:28:56] [INFO] [req_id:-] [ai_cctv_monitor:resource_manager.py:54] - ResourceManager: No CUDA GPUs detected or PyTorch CPU-only mode. CPU fallback active.
+cctv_backend_api  | INFO:     Started server process [8]
+cctv_backend_api  | INFO:     Waiting for application startup.
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:main.py:32] - ============================================================
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:main.py:33] - Starting AI CCTV Fire, Smoke & Workplace Safety Monitoring Platform v1.0.0
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:main.py:34] - Environment: production | Debug: False
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:main.py:35] - Configured CORS Origins: ['*']
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:main.py:36] - ============================================================
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:mongodb.py:62] - Connecting to MongoDB at 'mongodb://mongo:27017' (database: 'cctv_ai_surveillance')...
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:mongodb.py:78] - MongoDB connected successfully to database 'cctv_ai_surveillance'.
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:resource_manager.py:54] - ResourceManager: No CUDA GPUs detected or PyTorch CPU-only mode. CPU fallback active.
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:main.py:233] - App Lifespan: Loaded 1 camera(s) into CameraManager.
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:factory.py:72] - CameraFactory: Instantiating RTSPCamera for Camera ID 1
+cctv_backend_api  | WARNING ΓÜá∩╕Å user config directory '/home/appuser/.config/Ultralytics' is not writable, using '/tmp/Ultralytics'. Set YOLO_CONFIG_DIR to override.
+cctv_backend_api  | Creating new Ultralytics Settings v0.0.8 file Γ£à 
+cctv_backend_api  | View Ultralytics Settings with 'yolo settings' or at '/tmp/Ultralytics/settings.json'
+cctv_backend_api  | Update Settings with 'yolo settings key=value', i.e. 'yolo settings runs_dir=path/to/dir'. For help see https://docs.ultralytics.com/usage/settings.
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:87] - ============================================================
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:88] - YOLODetector: Initializing AI Detection Model Engine
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:89] - Model Path: '/app/models/fire_smoke.pt' | Device Target: 'cpu' | FP16 Half: False
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:90] - Conf Threshold: 0.45 | IoU NMS Threshold: 0.45
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:91] - ============================================================
+cctv_backend_api  | [2026-10-15 11:28:57] [INFO] [req_id:-] [ai_cctv_monitor:onnx_engine.py:173] - ONNXYOLORunner: Loaded '/app/models/fire_smoke.onnx' via onnxruntime (CPUExecutionProvider). Input: 640x640, Classes: 2, intra-op threads: 4
+cctv_backend_api  | [2026-10-15 11:28:58] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:123] - YOLODetector: Successfully loaded ONNX YOLO model from '/app/models/fire_smoke.onnx'.
+cctv_backend_api  | [2026-10-15 11:28:58] [INFO] [req_id:-] [ai_cctv_monitor:onnx_engine.py:173] - ONNXYOLORunner: Loaded '/app/models/ppe.onnx' via onnxruntime (CPUExecutionProvider). Input: 640x640, Classes: 6, intra-op threads: 4
+cctv_backend_api  | [2026-10-15 11:28:59] [INFO] [req_id:-] [ai_cctv_monitor:ppe_detector.py:169] - PPEDetector: Successfully loaded ONNX PPE model from 'models/ppe.onnx'.
+cctv_backend_api  | [2026-10-15 11:29:00] [INFO] [req_id:-] [ai_cctv_monitor:onnx_engine.py:173] - ONNXYOLORunner: Loaded '/app/models/yolov8s.onnx' via onnxruntime (CPUExecutionProvider). Input: 640x640, Classes: 80, intra-op threads: 4
+cctv_backend_api  | [2026-10-15 11:29:00] [INFO] [req_id:-] [ai_cctv_monitor:person_detector.py:128] - PersonDetector: Successfully initialized ONNX model from 'models/yolov8s.onnx'.
+cctv_backend_api  | [2026-10-15 11:29:00] [INFO] [req_id:-] [ai_cctv_monitor:manager.py:158] - CameraManager: Configured pipeline & detectors for Camera ID 1 on device 'cpu'
+cctv_backend_api  | [2026-10-15 11:29:00] [INFO] [req_id:-] [ai_cctv_monitor:manager.py:172] - CameraManager: Added Camera ID 1 ('hall') with device 'cpu' & priority 'HIGH'.
+cctv_backend_api  | [2026-10-15 11:29:00] [INFO] [req_id:-] [ai_cctv_monitor:main.py:269] - App Lifespan: Cameras started. Evidence sync running in background.
+cctv_backend_api  | INFO:     Application startup complete.
+cctv_backend_api  | INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+cctv_backend_api  | INFO:     127.0.0.1:52200 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46452 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55076 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43852 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:58866 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33564 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51482 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33462 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:44076 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51698 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57788 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39328 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53092 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59338 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42316 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | [2026-10-15 11:36:36] [ERROR] [req_id:ef851db3-ee2a-405f-87fb-341bfa9d84e2] [ai_cctv_monitor:exceptions.py:156] - Application Exception [UNAUTHORIZED]: Authentication credentials required. Missing Bearer Authorization header or cookie. - Details: None
+cctv_backend_api  | INFO:     127.0.0.1:37260 - "GET /api/v1/cameras HTTP/1.1" 401 Unauthorized
+cctv_backend_api  | INFO:     127.0.0.1:45880 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59618 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51538 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37982 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53526 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57802 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41908 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39232 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:47992 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57710 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33768 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | [2026-10-15 11:42:24] [ERROR] [req_id:2839acd7-1149-40be-ae5e-093977ddc95b] [ai_cctv_monitor:exceptions.py:156] - Application Exception [UNAUTHORIZED]: Authentication credentials required. Missing Bearer Authorization header or cookie. - Details: None
+cctv_backend_api  | INFO:     127.0.0.1:52634 - "GET /api/v1/evidence/ev_6eb167cd3f55/snapshot HTTP/1.1" 401 Unauthorized
+cctv_backend_api  | [2026-10-15 11:42:24] [ERROR] [req_id:e6780b09-dc6f-4d67-b0f2-12eebe301f39] [ai_cctv_monitor:exceptions.py:156] - Application Exception [UNAUTHORIZED]: Authentication credentials required. Missing Bearer Authorization header or cookie. - Details: None
+cctv_backend_api  | INFO:     127.0.0.1:52650 - "GET /api/v1/evidence/ev_6eb167cd3f55/video HTTP/1.1" 401 Unauthorized
+cctv_backend_api  | INFO:     127.0.0.1:52654 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39280 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | [2026-10-15 11:43:07] [WARNING] [req_id:55968814-6424-49a2-9b59-f4d109472757] [ai_cctv_monitor:exceptions.py:185] - Request Validation Error: [{'type': 'model_attributes_type', 'loc': ('body',), 'msg': 'Input should be a valid dictionary or object to extract fields from', 'input': b'username=admin&password=adminpassword'}]
+cctv_backend_api  | /home/appuser/.local/lib/python3.11/site-packages/starlette/_exception_handler.py:59: StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead.
+cctv_backend_api  |   response = await handler(conn, exc)  # type: ignore[arg-type]
+cctv_backend_api  | INFO:     127.0.0.1:48626 - "POST /api/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+cctv_backend_api  | INFO:     127.0.0.1:45172 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | [2026-10-15 11:43:43] [INFO] [req_id:5f1fd76d-2b95-4a18-af45-10f330809065] [ai_cctv_monitor:audit_service.py:57] - SECURITY AUDIT [FAILED]: Event 'LOGIN_FAILED' by User 'admin' from IP '127.0.0.1'
+cctv_backend_api  | [2026-10-15 11:43:43] [ERROR] [req_id:5f1fd76d-2b95-4a18-af45-10f330809065] [ai_cctv_monitor:exceptions.py:156] - Application Exception [INVALID_CREDENTIALS]: Invalid username or password. - Details: None
+cctv_backend_api  | INFO:     127.0.0.1:38266 - "POST /api/v1/auth/login HTTP/1.1" 401 Unauthorized
+cctv_backend_api  | [2026-10-15 11:43:43] [WARNING] [req_id:42c248ae-cf5e-440a-bde3-46f678c88396] [ai_cctv_monitor:exceptions.py:185] - Request Validation Error: [{'type': 'missing', 'loc': ('body', 'username'), 'msg': 'Field required', 'input': {'email': 'admin@example.com', 'password': 'adminpassword'}}]
+cctv_backend_api  | INFO:     127.0.0.1:38272 - "POST /api/v1/auth/login HTTP/1.1" 422 Unprocessable Entity
+cctv_backend_api  | INFO:     127.0.0.1:49772 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:56064 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54116 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37952 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:50748 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33998 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35978 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57512 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55464 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48870 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59584 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39506 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:45586 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55818 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46734 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46074 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:36018 - "GET /api/v1/healthz HTTP/1.0" 404 Not Found
+cctv_backend_api  | INFO:     127.0.0.1:59060 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:49426 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53642 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59376 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40014 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:49340 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33340 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:40038 - "GET /api/v1/healthz HTTP/1.0" 404 Not Found
+cctv_backend_api  | INFO:     127.0.0.1:47600 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35496 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:53304 - "GET /api/v1/healthz HTTP/1.0" 404 Not Found
+cctv_backend_api  | INFO:     127.0.0.1:46902 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53868 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37554 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36872 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57132 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:34204 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55462 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51952 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48684 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:60770 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:56446 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:45904 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33834 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:40540 - "GET /api/v1/healthz HTTP/1.0" 404 Not Found
+cctv_backend_api  | INFO:     127.0.0.1:40124 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41682 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41696 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41698 - "GET /api/v1/health HTTP/1.1" 404 Not Found
+cctv_backend_api  | INFO:     127.0.0.1:41714 - "GET /docs HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53446 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42788 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:47140 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41478 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53714 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:38314 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:38328 - "GET /docs HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37810 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:32880 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36404 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52166 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52952 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35730 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43418 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41248 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:49688 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:33678 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52096 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53402 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37954 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:49424 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:44160 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:60252 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53268 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42692 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:33394 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39810 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41556 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42218 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48236 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55968 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59432 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33912 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:46940 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:60840 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46252 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39474 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54448 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:38458 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:54476 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35248 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:50024 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:32782 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41318 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41748 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39584 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:45404 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:51176 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:58924 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52394 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33454 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53048 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:49724 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48618 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41894 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37878 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:47852 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:33616 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57426 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54398 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39178 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:60228 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35698 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42068 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52892 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48500 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54262 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52142 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:44510 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:56068 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:34390 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:47530 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42596 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:48880 - "GET /openapi.json HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:42142 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | [2026-10-16 04:26:01] [INFO] [req_id:-] [ai_cctv_monitor:resource_manager.py:54] - ResourceManager: No CUDA GPUs detected or PyTorch CPU-only mode. CPU fallback active.
+cctv_backend_api  | INFO:     Started server process [7]
+cctv_backend_api  | INFO:     Waiting for application startup.
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:main.py:32] - ============================================================
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:main.py:33] - Starting AI CCTV Fire, Smoke & Workplace Safety Monitoring Platform v1.0.0
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:main.py:34] - Environment: production | Debug: False
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:main.py:35] - Configured CORS Origins: ['*']
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:main.py:36] - ============================================================
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:mongodb.py:62] - Connecting to MongoDB at 'mongodb://mongo:27017' (database: 'cctv_ai_surveillance')...
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:mongodb.py:78] - MongoDB connected successfully to database 'cctv_ai_surveillance'.
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:resource_manager.py:54] - ResourceManager: No CUDA GPUs detected or PyTorch CPU-only mode. CPU fallback active.
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:main.py:233] - App Lifespan: Loaded 1 camera(s) into CameraManager.
+cctv_backend_api  | [2026-10-16 04:26:02] [INFO] [req_id:-] [ai_cctv_monitor:factory.py:72] - CameraFactory: Instantiating RTSPCamera for Camera ID 1
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:87] - ============================================================
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:88] - YOLODetector: Initializing AI Detection Model Engine
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:89] - Model Path: '/app/models/fire_smoke.pt' | Device Target: 'cpu' | FP16 Half: False
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:90] - Conf Threshold: 0.45 | IoU NMS Threshold: 0.45
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:91] - ============================================================
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:onnx_engine.py:173] - ONNXYOLORunner: Loaded '/app/models/fire_smoke.onnx' via onnxruntime (CPUExecutionProvider). Input: 640x640, Classes: 2, intra-op threads: 4
+cctv_backend_api  | [2026-10-16 04:26:03] [INFO] [req_id:-] [ai_cctv_monitor:yolo.py:123] - YOLODetector: Successfully loaded ONNX YOLO model from '/app/models/fire_smoke.onnx'.
+cctv_backend_api  | [2026-10-16 04:26:04] [INFO] [req_id:-] [ai_cctv_monitor:onnx_engine.py:173] - ONNXYOLORunner: Loaded '/app/models/ppe.onnx' via onnxruntime (CPUExecutionProvider). Input: 640x640, Classes: 6, intra-op threads: 4
+cctv_backend_api  | [2026-10-16 04:26:06] [INFO] [req_id:-] [ai_cctv_monitor:ppe_detector.py:169] - PPEDetector: Successfully loaded ONNX PPE model from 'models/ppe.onnx'.
+cctv_backend_api  | [2026-10-16 04:26:07] [INFO] [req_id:-] [ai_cctv_monitor:onnx_engine.py:173] - ONNXYOLORunner: Loaded '/app/models/yolov8s.onnx' via onnxruntime (CPUExecutionProvider). Input: 640x640, Classes: 80, intra-op threads: 4
+cctv_backend_api  | [2026-10-16 04:26:08] [INFO] [req_id:-] [ai_cctv_monitor:person_detector.py:128] - PersonDetector: Successfully initialized ONNX model from 'models/yolov8s.onnx'.
+cctv_backend_api  | [2026-10-16 04:26:08] [INFO] [req_id:-] [ai_cctv_monitor:manager.py:158] - CameraManager: Configured pipeline & detectors for Camera ID 1 on device 'cpu'
+cctv_backend_api  | [2026-10-16 04:26:08] [INFO] [req_id:-] [ai_cctv_monitor:manager.py:172] - CameraManager: Added Camera ID 1 ('hall') with device 'cpu' & priority 'HIGH'.
+cctv_backend_api  | [2026-10-16 04:26:08] [INFO] [req_id:-] [ai_cctv_monitor:main.py:269] - App Lifespan: Cameras started. Evidence sync running in background.
+cctv_backend_api  | INFO:     Application startup complete.
+cctv_backend_api  | INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+cctv_backend_api  | [2026-10-16 04:26:08] [INFO] [req_id:-] [ai_cctv_monitor:evidence_service.py:1016] - EvidenceService: Auto-synced 1 disk evidence envelope(s) into database.
+cctv_backend_api  | INFO:     127.0.0.1:44006 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48064 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48084 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51360 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35354 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46706 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:34242 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57662 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52532 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33956 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54262 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:49486 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46370 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:56498 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36494 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36928 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52696 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57184 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.4:47816 - "GET /openapi.json HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:46122 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43942 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:50992 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43588 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41330 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37158 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53494 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:44848 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59990 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     172.19.0.2:56312 - "GET /healthz HTTP/1.0" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54880 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36020 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:52260 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:35646 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:44830 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40662 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:58312 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37408 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55166 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:54136 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:38524 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43926 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40326 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36680 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39828 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40686 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57230 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51514 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:34934 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:39746 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40500 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:50842 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43778 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55506 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:50612 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36136 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40130 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:60796 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57332 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:33182 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:56196 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:59048 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48044 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:44552 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57056 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:45950 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:47908 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37170 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:37894 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55988 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:43874 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:46088 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:45608 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:55876 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:38818 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:40364 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51694 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:34146 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:34222 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:57082 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36262 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:48152 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:41224 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:51356 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:53396 - "GET /healthz HTTP/1.1" 200 OK
+cctv_backend_api  | INFO:     127.0.0.1:36214 - "GET /healthz HTTP/1.1" 200 OK

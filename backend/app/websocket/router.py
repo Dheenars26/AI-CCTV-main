@@ -58,7 +58,8 @@ async def handle_websocket_connection(
                 user_payload = {
                     "user_id": claims.get("sub"),
                     "username": claims.get("username", "user"),
-                    "role": claims.get("role", "OPERATOR")
+                    "role": claims.get("role", "OPERATOR"),
+                    "organization_id": claims.get("organization_id")
                 }
         except Exception as e:
             logger.debug(f"WebSocket auth fallback decoding error: {e}")
@@ -72,10 +73,11 @@ async def handle_websocket_connection(
     user_id = user_payload.get("user_id")
     username = user_payload.get("username")
     role = user_payload.get("role")
+    organization_id = user_payload.get("organization_id")
 
     # Accept connection with subprotocol header if requested
     subprotocol = f"cctv-auth-{auth_identifier}" if auth_identifier else None
-    await manager.connect(websocket, user_id=user_id, subprotocol=subprotocol)
+    await manager.connect(websocket, user_id=user_id, organization_id=organization_id, role=role, subprotocol=subprotocol)
 
     welcome_msg = {
         "event": "connected",

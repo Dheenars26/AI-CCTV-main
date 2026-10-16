@@ -58,6 +58,8 @@ async def list_evidence(
     db: Session = Depends(get_db)
 ):
     query = db.query(Evidence)
+    if current_user.organization_id:
+        query = query.filter(Evidence.organization_id == current_user.organization_id)
     if camera_id is not None:
         query = query.filter(Evidence.camera_id == camera_id)
     if alert_id:
@@ -87,7 +89,7 @@ async def get_evidence_details(
     db: Session = Depends(get_db)
 ):
     ev = db.query(Evidence).filter(Evidence.evidence_id == evidence_id).first()
-    if not ev:
+    if not ev or (current_user.organization_id and ev.organization_id and ev.organization_id != current_user.organization_id):
         raise AppException(
             message=f"Evidence record with token '{evidence_id}' not found",
             code="EVIDENCE_NOT_FOUND",
@@ -109,14 +111,22 @@ async def get_evidence_details(
 )
 async def get_evidence_snapshot(
     evidence_id: str,
+    current_user: User = Depends(RequirePermission("evidence:read")),
     db: Session = Depends(get_db)
 ):
+    ev = db.query(Evidence).filter(Evidence.evidence_id == evidence_id).first()
+    if ev and current_user.organization_id and ev.organization_id and ev.organization_id != current_user.organization_id:
+        raise AppException(
+            message=f"Evidence snapshot file for token '{evidence_id}' not found on storage",
+            code="SNAPSHOT_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
     # 1. Try registry lookup
     physical_path = evidence_service.get_physical_snapshot_path(evidence_id)
     
     # 2. Try DB fallback
     if not physical_path or not os.path.exists(physical_path):
-        ev = db.query(Evidence).filter(Evidence.evidence_id == evidence_id).first()
         if ev:
             full_path = os.path.join(evidence_service.base_storage_dir, ev.snapshot_relative_path)
             if os.path.exists(full_path):
@@ -150,12 +160,20 @@ async def get_evidence_snapshot(
 async def get_evidence_video(
     evidence_id: str,
     request: Request,
+    current_user: User = Depends(RequirePermission("evidence:read")),
     db: Session = Depends(get_db)
 ):
+    ev = db.query(Evidence).filter(Evidence.evidence_id == evidence_id).first()
+    if ev and current_user.organization_id and ev.organization_id and ev.organization_id != current_user.organization_id:
+        raise AppException(
+            message=f"Evidence video clip file for token '{evidence_id}' not found on storage",
+            code="VIDEO_NOT_FOUND",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+
     physical_path = evidence_service.get_physical_video_path(evidence_id)
 
     if not physical_path or not os.path.exists(physical_path):
-        ev = db.query(Evidence).filter(Evidence.evidence_id == evidence_id).first()
         if ev and ev.video_relative_path:
             full_path = os.path.join(evidence_service.base_storage_dir, ev.video_relative_path)
             if os.path.exists(full_path):

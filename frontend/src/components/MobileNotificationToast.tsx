@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Flame, Wind, ShieldAlert, X, ChevronRight, Bell } from 'lucide-react';
 import { useWebSocket } from '../context/WebSocketContext';
-import synterionLogo from '../assets/synterionx_icon.png';
+import synterionLogo from '../assets/synterionx_icon_sm.webp';
 
 export interface MobileNotificationItem {
   id: string;

@@ -34,5 +34,7 @@ class SafetyZoneResponse(BaseModel):
     polygon_coordinates: List[List[float]]
     ppe_profile_id: Optional[int] = None
     enabled: bool
+    organization_id: Optional[str] = None
+    site_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime

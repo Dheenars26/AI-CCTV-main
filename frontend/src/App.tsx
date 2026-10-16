@@ -9,6 +9,7 @@ import { Sidebar } from './components/Sidebar';
 import { AlertBanner } from './components/AlertBanner';
 
 import { MobileNotificationToast } from './components/MobileNotificationToast';
+
 import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
 
@@ -24,9 +25,15 @@ const SystemStatusPage = lazy(() => import('./pages/SystemStatusPage').then(m =>
 const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
 const ZoneManagementPage = lazy(() => import('./pages/ZoneManagementPage').then(m => ({ default: m.ZoneManagementPage })));
 
-const PageFallback: React.FC = () => (
-  <div className="flex items-center justify-center min-h-[60vh] text-slate-500 font-sans text-xs font-medium animate-pulse">
-    Loading module...
+const DashboardFallback: React.FC = () => (
+  <div className="space-y-4 animate-pulse">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="h-28 bg-white rounded-2xl border border-slate-200/80 shadow-xs" />
+      <div className="h-28 bg-white rounded-2xl border border-slate-200/80 shadow-xs" />
+      <div className="h-28 bg-white rounded-2xl border border-slate-200/80 shadow-xs" />
+      <div className="h-28 bg-white rounded-2xl border border-slate-200/80 shadow-xs" />
+    </div>
+    <div className="h-80 bg-white rounded-2xl border border-slate-200/80 shadow-xs" />
   </div>
 );
 
@@ -75,7 +82,7 @@ const ProtectedLayout: React.FC = () => {
         <div className="flex flex-1 min-h-0">
           <Sidebar isOpen={isMobileNavOpen} onClose={() => setIsMobileNavOpen(false)} />
           <main className="flex-1 p-3 sm:p-4 md:p-6 overflow-y-auto flex flex-col min-h-0 bg-slate-50 min-w-0">
-            <Suspense fallback={<PageFallback />}>
+            <Suspense fallback={<DashboardFallback />}>
               <Outlet />
             </Suspense>
           </main>
@@ -91,7 +98,7 @@ export const App: React.FC = () => {
       <QueryClientProvider client={queryClient}>
         <AuthProvider>
           <BrowserRouter>
-            <Suspense fallback={<PageFallback />}>
+            <Suspense fallback={<DashboardFallback />}>
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
 

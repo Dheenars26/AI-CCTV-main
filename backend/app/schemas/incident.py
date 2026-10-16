@@ -23,6 +23,8 @@ class IncidentResponse(BaseModel):
     status: str
     person_id: Optional[int] = None
     evidence_id: Optional[str] = None
+    organization_id: Optional[str] = None
+    site_id: Optional[str] = None
     start_time: datetime
     cleared_time: Optional[datetime] = None
     metadata_json: Dict[str, Any]

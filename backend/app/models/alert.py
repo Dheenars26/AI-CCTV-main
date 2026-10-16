@@ -33,6 +33,8 @@ class Alert(Base):
         index=True,
         nullable=False
     )
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    site_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     module: Mapped[str] = mapped_column(String(50), default="FIRE_SMOKE", index=True, nullable=False) # "FIRE_SMOKE", "SAFETY_ANALYSIS"
     class_name: Mapped[str] = mapped_column(String(50), index=True, nullable=False)  # "fire", "smoke", "cap_found", "mask_not_found", etc.
 

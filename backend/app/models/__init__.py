@@ -16,6 +16,8 @@ from app.models.audit_log import AuditLog
 from app.models.ppe import PPEProfile, PPERequirement, PersonDetection, PPEViolation
 from app.models.zone import SafetyZone
 from app.models.incident import Incident
+from app.models.organization import Organization, Site, OrganizationUser
+from app.models.license import License, LicenseTier, LicenseStatus
 
 __all__ = [
     "User",
@@ -35,5 +37,11 @@ __all__ = [
     "PersonDetection",
     "PPEViolation",
     "SafetyZone",
-    "Incident"
+    "Incident",
+    "Organization",
+    "Site",
+    "OrganizationUser",
+    "License",
+    "LicenseTier",
+    "LicenseStatus"
 ]

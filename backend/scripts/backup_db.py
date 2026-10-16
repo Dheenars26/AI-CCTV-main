@@ -19,14 +19,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from app.config.settings import settings
 
 
-def execute_database_backup(output_dir: str = "./backups", retention_count: int = 14) -> str:
+def execute_database_backup(output_dir: str = "./backups", retention_count: int = 14, db_url: str | None = None) -> str:
     """
     Executes native database backup with timestamping, gzip compression, and SHA-256 hash generation.
     """
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-    db_url = settings.DATABASE_URL.lower()
+    db_url = (db_url or settings.DATABASE_URL).lower()
     
     if "postgresql" in db_url:
         backup_filename = f"cctv_pg_backup_{timestamp}.sql.gz"

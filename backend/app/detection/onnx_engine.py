@@ -169,15 +169,6 @@ class ONNXYOLORunner:
                     except Exception:
                         pass
                         
-            # HOTFIX: ppe.onnx has swapped class indices for goggles (2) and vest (1) in this environment
-            if self.names and getattr(self, "names", None) and len(self.names) >= 3:
-                n1 = self.names.get(1, "").lower()
-                n2 = self.names.get(2, "").lower()
-                if "vest" in n1 and "goggles" in n2:
-                    logger.warning(f"ONNXYOLORunner: Detected swapped classes in {self.model_path}, auto-correcting vest <-> goggles.")
-                    self.names[1] = "goggles"
-                    self.names[2] = "Vest"
-
             self.backend_type = "onnxruntime"
             logger.info(
                 f"ONNXYOLORunner: Loaded '{self.model_path}' via onnxruntime ({providers[0]}). "

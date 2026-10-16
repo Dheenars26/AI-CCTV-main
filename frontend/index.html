@@ -2,44 +2,154 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/logo.png" />
+    <script>
+      try {
+        var isAuth = window.location.pathname === '/login' || !localStorage.getItem('access_token');
+        document.documentElement.className = isAuth ? 'auth-route' : 'app-route';
+      } catch(e) {
+        document.documentElement.className = 'auth-route';
+      }
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="SynterionX - Enterprise Real-Time AI CCTV Surveillance, Fire & Smoke Detection, and Safety Operations Platform." />
     <title>SynterionX | Smart AI Surveillance & Safety Platform</title>
+
+    <!-- Asynchronous Non-Render-Blocking Font Delivery -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" media="print" onload="this.media='all'">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
     <noscript>
-      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
     </noscript>
+
     <style>
-      /* Critical Inline CSS for instant 0ms Paint */
-      body { background-color: #f8fafc; color: #0f172a; margin: 0; font-family: system-ui, -apple-system, sans-serif; }
-      #root-skeleton { min-height: 100vh; display: flex; flex-direction: column; background: #f8fafc; }
-      #skeleton-nav { height: 64px; border-bottom: 1px solid #e2e8f0; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; background: #ffffff; }
-      #skeleton-brand { font-size: 16px; font-weight: 800; color: #2563eb; letter-spacing: 0.05em; display: flex; align-items: center; gap: 8px; }
-      #skeleton-main { flex: 1; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; box-sizing: border-box; }
-      #skeleton-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-      .skeleton-card { height: 96px; background: rgba(15,23,42,0.5); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; }
+      @font-face {
+        font-family: 'Inter-fallback';
+        size-adjust: 100%;
+        src: local('Segoe UI'), local('Arial'), sans-serif;
+      }
+      body {
+        background-color: #f8fafc;
+        color: #0f172a;
+        margin: 0;
+        font-family: 'Inter', 'Inter-fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      #skeleton-auth, #skeleton-app { display: none; }
+      .auth-route #skeleton-auth { display: flex; }
+      .app-route #skeleton-app { display: flex; }
+
+      /* Skeleton A: Pixel-perfect match to LoginPage.tsx */
+      #skeleton-auth {
+        min-height: 100vh;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        box-sizing: border-box;
+        background: linear-gradient(135deg, rgba(239,246,255,0.7) 0%, #f8fafc 50%, rgba(238,242,255,0.5) 100%);
+      }
+      .sk-auth-card {
+        width: 100%;
+        max-width: 448px;
+        background: #ffffff;
+        border-radius: 16px;
+        border: 1px solid rgba(226, 232, 240, 0.8);
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05);
+        padding: 32px;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+      .sk-logo-box {
+        width: 96px;
+        height: 96px;
+        border-radius: 16px;
+        background: linear-gradient(135deg, #eff6ff 0%, #e0e7ff 100%);
+        border: 1px solid rgba(226, 232, 240, 0.8);
+        margin: 0 auto;
+      }
+      .sk-title { height: 28px; width: 180px; background: #0f172a; opacity: 0.08; border-radius: 6px; margin: 0 auto; }
+      .sk-sub { height: 14px; width: 240px; background: #64748b; opacity: 0.12; border-radius: 4px; margin: 0 auto; }
+      .sk-input { width: 100%; height: 42px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; box-sizing: border-box; }
+      .sk-btn { width: 100%; height: 44px; border-radius: 12px; background: #2563eb; opacity: 0.9; }
+
+      /* Skeleton B: Pixel-perfect match to ProtectedLayout + DashboardPage */
+      #skeleton-app { min-height: 100vh; flex-direction: column; background: #f8fafc; }
+      #sk-nav {
+        height: 64px;
+        background: rgba(255, 255, 255, 0.95);
+        border-bottom: 1px solid rgba(226, 232, 240, 0.8);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 24px;
+        box-sizing: border-box;
+      }
+      #sk-body { display: flex; flex: 1; min-height: calc(100vh - 64px); }
+      #sk-sidebar {
+        width: 256px;
+        background: #ffffff;
+        border-right: 1px solid rgba(226, 232, 240, 0.8);
+        padding: 14px;
+        box-sizing: border-box;
+        display: none;
+        flex-direction: column;
+        gap: 8px;
+        shrink: 0;
+      }
+      @media (min-width: 1024px) { #sk-sidebar { display: flex; } }
+      .sk-side-item { height: 38px; border-radius: 12px; background: #f1f5f9; width: 100%; }
+      #sk-main { flex: 1; padding: 24px; box-sizing: border-box; }
+      .sk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+      .sk-card { height: 104px; background: #ffffff; border: 1px solid rgba(226, 232, 240, 0.8); border-radius: 16px; }
     </style>
   </head>
-  <body class="bg-[#080B11] text-slate-100 font-sans antialiased selection:bg-cyan-500 selection:text-white min-h-screen overflow-x-hidden">
+  <body class="bg-slate-50 text-slate-900 font-sans antialiased selection:bg-blue-500 selection:text-white min-h-screen overflow-x-hidden">
     <div id="root">
-      <div id="root-skeleton">
-        <div id="skeleton-nav">
-          <div id="skeleton-brand">
-            <span style="width: 10px; height: 10px; border-radius: 50%; background: #00f2fe; display: inline-block;"></span>
-            AI CCTV MONITOR
+      <!-- Skeleton A: Login Route -->
+      <div id="skeleton-auth">
+        <div class="sk-auth-card">
+          <div style="display: flex; flex-direction: column; gap: 8px; text-align: center;">
+            <div class="sk-logo-box"></div>
+            <div class="sk-title"></div>
+            <div class="sk-sub"></div>
           </div>
-          <div style="font-size: 12px; color: #64748b; font-family: monospace;">INITIALIZING SOC GATEWAY...</div>
+          <div style="display: flex; flex-direction: column; gap: 14px; width: 100%;">
+            <div class="sk-input"></div>
+            <div class="sk-input"></div>
+            <div class="sk-btn"></div>
+          </div>
         </div>
-        <div id="skeleton-main">
-          <div id="skeleton-cards">
-            <div class="skeleton-card"></div>
-            <div class="skeleton-card"></div>
-            <div class="skeleton-card"></div>
-            <div class="skeleton-card"></div>
-            <div class="skeleton-card"></div>
+      </div>
+
+      <!-- Skeleton B: App Route -->
+      <div id="skeleton-app">
+        <div id="sk-nav">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div style="width: 44px; height: 44px; border-radius: 12px; background: #eff6ff; border: 1px solid #e2e8f0;"></div>
+            <div style="height: 18px; width: 140px; background: #e2e8f0; border-radius: 4px;"></div>
+          </div>
+          <div style="height: 24px; width: 100px; background: #f1f5f9; border-radius: 6px;"></div>
+        </div>
+        <div id="sk-body">
+          <div id="sk-sidebar">
+            <div class="sk-side-item" style="background: #eff6ff;"></div>
+            <div class="sk-side-item"></div>
+            <div class="sk-side-item"></div>
+            <div class="sk-side-item"></div>
+            <div class="sk-side-item"></div>
+          </div>
+          <div id="sk-main">
+            <div class="sk-grid">
+              <div class="sk-card"></div>
+              <div class="sk-card"></div>
+              <div class="sk-card"></div>
+              <div class="sk-card"></div>
+            </div>
+            <div style="height: 360px; background: #ffffff; border: 1px solid rgba(226, 232, 240, 0.8); border-radius: 16px;"></div>
           </div>
         </div>
       </div>

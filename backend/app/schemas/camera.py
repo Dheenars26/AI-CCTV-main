@@ -21,30 +21,34 @@ class SourceType(str, Enum):
 
 
 class CameraBase(BaseModel):
-    name: str = Field(..., json_schema_extra={"example": "Warehouse Door 01"}, description="Human-readable camera name")
-    camera_number: str = Field(default="CAM-01", json_schema_extra={"example": "CAM-01"}, description="Camera designation number")
+    name: str = Field(..., min_length=1, max_length=100, json_schema_extra={"example": "Warehouse Door 01"}, description="Human-readable camera name")
+    camera_number: str = Field(default="CAM-01", min_length=1, max_length=50, json_schema_extra={"example": "CAM-01"}, description="Camera designation number")
     dvr_id: Optional[int] = Field(default=None, description="Optional physical DVR/NVR association")
-    dvr_channel: Optional[int] = Field(default=None, description="Physical DVR channel number (1 to 64)")
-    channel_name: Optional[str] = Field(default=None)
-    dvr_address: Optional[str] = Field(default=None, json_schema_extra={"example": "192.168.1.100"}, description="DVR/NVR IP or hostname")
+    dvr_channel: Optional[int] = Field(default=None, ge=1, le=128, description="Physical DVR channel number (1 to 128)")
+    channel_name: Optional[str] = Field(default=None, max_length=100)
+    dvr_address: Optional[str] = Field(default=None, max_length=100, json_schema_extra={"example": "192.168.1.100"}, description="DVR/NVR IP or hostname")
     rtsp_url: str = Field(
         ...,
+        min_length=1,
+        max_length=500,
         json_schema_extra={"example": "rtsp://admin:password123@192.168.1.100:554/live/ch0"},
         description="RTSP stream URL or local file path"
     )
     source_type: SourceType = Field(default=SourceType.RTSP, description="Video source type (rtsp, file, webcam)")
-    location: Optional[str] = Field(default=None, json_schema_extra={"example": "Zone A Entrance"})
-    latitude: Optional[float] = Field(default=13.0827, description="GPS Latitude coordinate")
-    longitude: Optional[float] = Field(default=80.2707, description="GPS Longitude coordinate")
+    location: Optional[str] = Field(default=None, max_length=200, json_schema_extra={"example": "Zone A Entrance"})
+    latitude: Optional[float] = Field(default=13.0827, ge=-90.0, le=90.0, description="GPS Latitude coordinate")
+    longitude: Optional[float] = Field(default=80.2707, ge=-180.0, le=180.0, description="GPS Longitude coordinate")
     enabled: bool = Field(default=False, description="Whether camera ingestion worker should be active (defaults to OFF until turned ON)")
     # AI Module Toggles & Per-Camera Settings
+    organization_id: Optional[str] = Field(default=None, description="Tenant Organization ID")
+    site_id: Optional[str] = Field(default=None, description="Facility Site ID")
     fire_smoke_enabled: bool = Field(default=True, description="Enable Fire & Smoke AI Detection")
     ppe_enabled: bool = Field(default=True, description="Enable PPE Safety Equipment Detection")
     person_enabled: bool = Field(default=True, description="Enable Person Tracking Engine")
     zone_enabled: bool = Field(default=True, description="Enable Safety Zone Polygon Evaluation")
     ppe_inference_interval_sec: float = Field(default=0.05, ge=0.01, le=10.0, description="PPE inference interval in seconds")
 
-    priority: str = Field(default="HIGH", description="Priority level (HIGH, MEDIUM, LOW)")
+    priority: str = Field(default="HIGH", pattern="^(?i)(HIGH|MEDIUM|LOW)$", description="Priority level (HIGH, MEDIUM, LOW)")
     capture_fps: int = Field(default=25, ge=1, le=120)
     target_ai_fps: int = Field(default=15, ge=1, le=60)
     frame_skip: int = Field(default=1, ge=1, le=20)
@@ -52,6 +56,14 @@ class CameraBase(BaseModel):
     fps_limit: int = Field(default=25, ge=1, le=120, description="Target frame rate limit")
     connection_timeout: int = Field(default=10, ge=1, le=60, description="Stream connection timeout in seconds")
     reconnect_interval: int = Field(default=5, ge=1, le=60, description="Reconnection backoff interval in seconds")
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Camera name cannot be empty or only whitespace")
+        return cleaned
 
 
 class CameraCreate(CameraBase):
@@ -70,6 +82,8 @@ class CameraUpdate(BaseModel):
     latitude: Optional[float] = Field(default=None)
     longitude: Optional[float] = Field(default=None)
     enabled: Optional[bool] = Field(default=None)
+    organization_id: Optional[str] = Field(default=None)
+    site_id: Optional[str] = Field(default=None)
     fire_smoke_enabled: Optional[bool] = Field(default=None)
     ppe_enabled: Optional[bool] = Field(default=None)
     person_enabled: Optional[bool] = Field(default=None)
@@ -97,6 +111,8 @@ class CameraResponse(BaseModel):
     latitude: Optional[float] = Field(default=13.0827)
     longitude: Optional[float] = Field(default=80.2707)
     enabled: bool = Field(...)
+    organization_id: Optional[str] = Field(default=None)
+    site_id: Optional[str] = Field(default=None)
     fire_smoke_enabled: bool = Field(default=True)
     ppe_enabled: bool = Field(default=True)
     person_enabled: bool = Field(default=True)

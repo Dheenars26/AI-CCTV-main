@@ -6,7 +6,7 @@ import { useAuth } from '../context/AuthContext';
 import { useWebSocket } from '../context/WebSocketContext';
 import { alertsApi } from '../api/alerts';
 import { getSafeTimestamp, formatSafeTime } from '../utils/dateUtils';
-import synterionLogo from '../assets/synterionx_icon.png';
+import synterionLogo from '../assets/synterionx_icon_sm.webp';
 
 interface NavbarProps {
   onToggleMobileNav?: () => void;
@@ -128,7 +128,15 @@ export const Navbar: React.FC<NavbarProps> = ({ onToggleMobileNav }) => {
           <Menu className="w-4 h-4" />
         </button>
         <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-br from-blue-50 via-white to-indigo-50/50 flex items-center justify-center shadow-sm border border-slate-200/80 overflow-hidden p-1 shrink-0">
-          <img src={synterionLogo} alt="SynterionX Logo" className="w-full h-full object-contain" />
+          <img
+            src={synterionLogo}
+            alt="SynterionX Logo"
+            width={48}
+            height={30}
+            fetchPriority="high"
+            decoding="async"
+            className="w-full h-full object-contain"
+          />
         </div>
         <div className="min-w-0">
           <h1 className="font-extrabold text-sm sm:text-base tracking-tight text-slate-900 truncate">

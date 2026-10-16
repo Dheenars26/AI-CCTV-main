@@ -286,10 +286,11 @@ def sanitize_rtsp_url(url: str) -> str:
     """
     Sanitizes raw RTSP stream credentials in log files and API payloads.
     Replaces credentials with '***:***' (e.g. 'rtsp://***:***@192.168.1.50:554/live').
+    Supports both rtsp:// and rtsps:// protocols and any username/password combination.
     """
-    if not url or "rtsp://" not in url.lower():
+    if not url or ("rtsp://" not in url.lower() and "rtsps://" not in url.lower()):
         return url
-    return re.sub(r"rtsp://[^:@]+:[^@]+@", "rtsp://***:***@", url, flags=re.IGNORECASE)
+    return re.sub(r"(rtsps?://)([^:@\s]+)(:[^@\s]+)?@", r"\1***:***@", url, flags=re.IGNORECASE)
 
 
 def sanitize_dict_for_logging(data: Dict[str, Any]) -> Dict[str, Any]:

@@ -44,6 +44,8 @@ class Evidence(Base):
         index=True,
         nullable=False
     )
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    site_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     snapshot_relative_path: Mapped[str] = mapped_column(String(500), nullable=False)
     video_relative_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     metadata_relative_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)

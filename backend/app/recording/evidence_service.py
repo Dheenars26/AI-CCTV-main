@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 import cv2
 import numpy as np
+import subprocess
 
 from app.config.settings import settings
 from app.detection.base import BoundingBox
@@ -108,7 +109,7 @@ class IncidentRecordingSession:
             return True
 
     def finalize(self, service: "EvidenceService") -> bool:
-        """Compiles and writes the final complete video clip."""
+        """Writes the completed clip and reports its actual path."""
         if self.watchdog:
             try:
                 self.watchdog.cancel()
@@ -119,22 +120,49 @@ class IncidentRecordingSession:
             self._is_completed = True
             post_snapshot = list(self._post_frames)
 
+        actual_video_path = None
+        success = False
+
         try:
-            success = service._write_video_clip(
+            actual_video_path = service._write_video_clip(
                 video_path=self.video_path,
                 pre_event_frames=self.pre_event_frames,
                 current_frame=self.annotated_frame,
                 fps=self.fps,
                 post_event_frames=post_snapshot
             )
+
+            success = bool(
+                actual_video_path
+                and os.path.isfile(actual_video_path)
+                and os.path.getsize(actual_video_path) > 0
+            )
+
+            if success:
+                self.video_path = actual_video_path
+
+        except Exception as err:
+            logger.warning(
+                f"EvidenceService: Post-event finalization failed "
+                f"for {self.evidence_id}: {err}"
+            )
+            success = False
+
         finally:
             self.finished_event.set()
 
         if self.on_complete:
             try:
-                self.on_complete(self.evidence_id, self.video_path, success)
+                self.on_complete(
+                    self.evidence_id,
+                    self.video_path,
+                    success
+                )
             except Exception as cb_err:
-                logger.warning(f"IncidentRecordingSession callback error: {cb_err}")
+                logger.warning(
+                    f"IncidentRecordingSession callback error: {cb_err}"
+                )
+
         return success
 
 
@@ -285,7 +313,16 @@ class EvidenceService:
             clip_fps = min(30.0, max(10.0, clip_fps))
 
             # 2. Write initial MP4/WebM Video Clip (Pre-Event + Current Frame) at accurate stream FPS
-            has_video = self._write_video_clip(video_path, pre_event_frames or [], annotated_frame, fps=clip_fps)
+            actual_video_path = self._write_video_clip(
+                video_path=video_path,
+                pre_event_frames=pre_event_frames or [],
+                current_frame=annotated_frame,
+                fps=clip_fps
+            )
+            has_video = actual_video_path is not None
+
+            if has_video:
+                video_path = actual_video_path
 
             # 3. Create Secure Token Identifiers
             evidence_id = f"ev_{uuid.uuid4().hex[:12]}"
@@ -397,94 +434,181 @@ class EvidenceService:
         current_frame: np.ndarray,
         fps: float = 25.0,
         post_event_frames: Optional[List[Any]] = None
-    ) -> bool:
+    ) -> Optional[str]:
         """
-        Compiles pre-event rolling buffer frames, detection frame, and post-event frames into an HTML5 WebM/MP4 video clip.
+        Creates a valid video clip and returns its actual file path.
+        Prefers H.264 MP4; falls back to WebM if conversion fails.
         """
+        writer = None
+        webm_path = None
+        mp4_path = video_path
+
         try:
+            if current_frame is None or current_frame.size == 0:
+                return None
+
             h, w = current_frame.shape[:2]
             base_dir = os.path.dirname(video_path)
             base_name = os.path.splitext(os.path.basename(video_path))[0]
 
+            os.makedirs(base_dir, exist_ok=True)
+            webm_path = os.path.join(base_dir, f"{base_name}.webm")
+            mp4_path = os.path.join(base_dir, f"{base_name}.mp4")
+
             clip_fps = float(fps) if fps and fps > 0 else 25.0
             clip_fps = min(30.0, max(10.0, clip_fps))
 
-            webm_path = os.path.join(base_dir, f"{base_name}.webm")
-            writer = None
-            target_path = webm_path
-
-            # Primary codec: VP80 WebM for 100% native HTML5 browser playback
-            try:
-                fourcc_vp8 = cv2.VideoWriter.fourcc(*"VP80")
-                w_test = cv2.VideoWriter(webm_path, fourcc_vp8, clip_fps, (w, h))
-                if w_test.isOpened():
-                    writer = w_test
-                    target_path = webm_path
-            except Exception:
-                pass
-
-            if not writer or not writer.isOpened():
+            # Write an intermediate WebM file.
+            for codec in ("VP80", "VP90"):
+                candidate = None
                 try:
-                    fourcc_vp9 = cv2.VideoWriter.fourcc(*"VP90")
-                    w_vp9 = cv2.VideoWriter(webm_path, fourcc_vp9, clip_fps, (w, h))
-                    if w_vp9.isOpened():
-                        writer = w_vp9
-                        target_path = webm_path
-                except Exception:
-                    pass
+                    candidate = cv2.VideoWriter(
+                        webm_path,
+                        cv2.VideoWriter.fourcc(*codec),
+                        clip_fps,
+                        (w, h)
+                    )
+                    if candidate.isOpened():
+                        writer = candidate
+                        break
+                    candidate.release()
+                except Exception as err:
+                    if candidate is not None:
+                        candidate.release()
+                    logger.debug(
+                        f"EvidenceService: {codec} encoder unavailable: {err}"
+                    )
 
-            if not writer or not writer.isOpened():
+            # If WebM encoding is unavailable, try a native MP4 writer.
+            if writer is None:
+                candidate = None
                 try:
-                    fourcc_mp4 = cv2.VideoWriter.fourcc(*"mp4v")
-                    w_mp4 = cv2.VideoWriter(video_path, fourcc_mp4, clip_fps, (w, h))
-                    if w_mp4.isOpened():
-                        writer = w_mp4
-                        target_path = video_path
-                except Exception:
-                    pass
+                    candidate = cv2.VideoWriter(
+                        mp4_path,
+                        cv2.VideoWriter.fourcc(*"mp4v"),
+                        clip_fps,
+                        (w, h)
+                    )
+                    if candidate.isOpened():
+                        writer = candidate
+                    elif candidate is not None:
+                        candidate.release()
+                except Exception as err:
+                    if candidate is not None:
+                        candidate.release()
+                    logger.warning(
+                        f"EvidenceService: Native MP4 writer unavailable: {err}"
+                    )
 
-            if not writer or not writer.isOpened():
-                return False
+                if writer is None:
+                    return None
 
-            # 1. Write pre-event frames if available
-            if pre_event_frames:
-                for item in pre_event_frames:
+                # Write frames directly to MP4.
+                def write_frame(img):
+                    if img is None or img.size == 0:
+                        return
+                    if img.shape[:2] != (h, w):
+                        img = cv2.resize(img, (w, h))
+                    writer.write(img)
+
+                for item in pre_event_frames or []:
                     img = item[0] if isinstance(item, (tuple, list)) else item
-                    if img is not None and img.size > 0:
-                        if img.shape[:2] == (h, w):
-                            writer.write(img)
-                        else:
-                            writer.write(cv2.resize(img, (w, h)))
+                    write_frame(img)
 
-            # 2. Write detection frame (2 frames if post-event video follows, otherwise 1 second)
-            annotated_repeats = 2 if post_event_frames else max(1, int(clip_fps * 1.0))
-            for _ in range(annotated_repeats):
-                writer.write(current_frame)
+                repeats = (
+                    2 if post_event_frames
+                    else max(1, int(clip_fps))
+                )
+                for _ in range(repeats):
+                    write_frame(current_frame)
 
-            # 3. Write live post-event frames if available
-            if post_event_frames:
-                for item in post_event_frames:
+                for item in post_event_frames or []:
                     img = item[0] if isinstance(item, (tuple, list)) else item
-                    if img is not None and img.size > 0:
-                        if img.shape[:2] == (h, w):
-                            writer.write(img)
-                        else:
-                            writer.write(cv2.resize(img, (w, h)))
+                    write_frame(img)
 
+                writer.release()
+                writer = None
+
+                if (
+                    os.path.isfile(mp4_path)
+                    and os.path.getsize(mp4_path) > 0
+                ):
+                    return mp4_path
+                return None
+
+            # Write frames to the WebM intermediate.
+            def write_frame(img):
+                if img is None or img.size == 0:
+                    return
+                if img.shape[:2] != (h, w):
+                    img = cv2.resize(img, (w, h))
+                writer.write(img)
+
+            for item in pre_event_frames or []:
+                img = item[0] if isinstance(item, (tuple, list)) else item
+                write_frame(img)
+
+            repeats = (
+                2 if post_event_frames
+                else max(1, int(clip_fps))
+            )
+            for _ in range(repeats):
+                write_frame(current_frame)
+
+            for item in post_event_frames or []:
+                img = item[0] if isinstance(item, (tuple, list)) else item
+                write_frame(img)
+
+            # Flush and release WebM intermediate writer
             writer.release()
+            writer = None
 
-            # Ensure file exists at requested video_path as well for backwards compatibility
-            if target_path != video_path and os.path.exists(target_path):
+            if not os.path.isfile(webm_path) or os.path.getsize(webm_path) == 0:
+                return None
+
+            # Attempt FFmpeg conversion to true H.264 MP4
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-i", webm_path,
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                mp4_path
+            ]
+
+            try:
+                res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+                if res.returncode == 0 and os.path.isfile(mp4_path) and os.path.getsize(mp4_path) > 0:
+                    try:
+                        os.remove(webm_path)
+                    except Exception:
+                        pass
+                    return mp4_path
+            except Exception as err:
+                logger.warning(f"EvidenceService: FFmpeg conversion to MP4 failed: {err}")
+
+            # Fallback: preserve valid WebM file and clean up any empty MP4 artifact
+            if os.path.isfile(mp4_path) and os.path.getsize(mp4_path) == 0:
                 try:
-                    shutil.copy2(target_path, video_path)
+                    os.remove(mp4_path)
                 except Exception:
                     pass
 
-            return os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            return webm_path if (os.path.isfile(webm_path) and os.path.getsize(webm_path) > 0) else None
 
-        except Exception as e:
-            logger.warning(f"EvidenceService: Failed writing video clip '{video_path}': {str(e)}")
-            return False
+        except Exception as err:
+            logger.warning(
+                f"EvidenceService: Failed writing video clip "
+                f"'{video_path}': {err}"
+            )
+            return None
+
+        finally:
+            if writer is not None:
+                try:
+                    writer.release()
+                except Exception:
+                    pass
 
     def _ensure_webm_clip(self, raw_path: str) -> str:
         """
@@ -559,15 +683,54 @@ class EvidenceService:
 
     def get_physical_video_path(self, evidence_id: str) -> Optional[str]:
         """
-        Resolves secure evidence token ID to physical HTML5 video clip path.
+        Resolves an evidence token to an existing video file with
+        an extension matching its actual container format.
         """
         with self._lock:
-            paths = self._physical_paths.get(evidence_id)
-            if paths:
-                raw_path = paths.get("video", "")
-                if raw_path and os.path.exists(raw_path):
-                    return self._ensure_webm_clip(raw_path)
+            paths = self._physical_paths.get(evidence_id, {})
+            raw_path = paths.get("video", "")
+
+        if not raw_path or not os.path.isfile(raw_path):
             return None
+
+        ext = os.path.splitext(raw_path)[1].lower()
+        base_path = os.path.splitext(raw_path)[0]
+
+        try:
+            with open(raw_path, "rb") as video_file:
+                header = video_file.read(16)
+        except OSError:
+            return None
+
+        # WebM uses the EBML container signature.
+        if header.startswith(b"\x1a\x45\xdf\xa3"):
+            if ext == ".webm":
+                return raw_path
+
+            # Recover older WebM files that were incorrectly named .mp4.
+            webm_path = base_path + ".webm"
+            if os.path.isfile(webm_path) and os.path.getsize(webm_path) > 0:
+                return webm_path
+
+            logger.warning(
+                f"EvidenceService: WebM content has unexpected extension: {raw_path}"
+            )
+            return None
+
+        # MP4-family files normally contain the 'ftyp' brand at byte offset 4.
+        if len(header) >= 8 and header[4:8] == b"ftyp":
+            if ext == ".mp4":
+                return raw_path
+
+            logger.warning(
+                f"EvidenceService: MP4 content has unexpected extension: {raw_path}"
+            )
+            return None
+
+        logger.warning(
+            f"EvidenceService: Unrecognized video container for {raw_path}"
+        )
+        return None
 
     def purge_expired_evidence(self, retention_days: Optional[int] = None, db: Optional[Any] = None) -> int:
         """

@@ -28,6 +28,8 @@ class SafetyZone(Base):
         index=True,
         nullable=False
     )
+    organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    site_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     zone_type: Mapped[str] = mapped_column(String(30), default="HAZARD", index=True, nullable=False)  # HAZARD, RESTRICTED, GENERAL
     

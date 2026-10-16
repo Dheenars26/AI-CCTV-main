@@ -16,8 +16,9 @@ from app.models.notification import Notification
 from app.models.evidence import Evidence
 from app.schemas.common import ResponseModel, PaginatedResponseModel, PaginationMeta
 from app.schemas.alert import AlertResponse, AlertUpdate
-from app.utils.exceptions import AppException
+from app.utils.exceptions import AppException, ValidationException, DatabaseException
 from app.utils.logger import logger
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.v1.dependencies.permissions import RequirePermission
 from app.models.user import User
@@ -84,7 +85,20 @@ async def list_alerts(
     current_user: User = Depends(RequirePermission("alerts:read")),
     db: Session = Depends(get_db)
 ):
+    if date_from and date_to and date_from > date_to:
+        raise ValidationException(
+            message="Invalid date range: 'date_from' must be earlier than or equal to 'date_to'",
+            details={"date_from": str(date_from), "date_to": str(date_to)}
+        )
+    if camera_id is not None and camera_id < 1:
+        raise ValidationException(
+            message="Camera ID must be a positive integer greater than or equal to 1",
+            details={"camera_id": camera_id}
+        )
+
     query = db.query(Alert)
+    if current_user.organization_id:
+        query = query.filter(Alert.organization_id == current_user.organization_id)
 
     if camera_id is not None:
         query = query.filter(Alert.camera_id == camera_id)
@@ -109,7 +123,7 @@ async def list_alerts(
         query = query.filter(Alert.start_time <= date_to)
 
     total = query.count()
-    alerts = query.order_by(desc(func.datetime(Alert.start_time))).offset(offset).limit(limit).all()
+    alerts = query.order_by(Alert.start_time.desc()).offset(offset).limit(limit).all()
 
     page = (offset // limit) + 1 if limit > 0 else 1
     pages = math.ceil(total / limit) if limit > 0 else 1
@@ -138,32 +152,38 @@ async def resolve_all_alerts(
 ):
     now = datetime.now(timezone.utc)
     from app.database.session import db_write_lock
-    with db_write_lock:
-        count = db.query(Alert).filter(
-            ~Alert.state.in_(["RESOLVED", "CLEARED"])
-        ).update(
-            {
-                Alert.state: "RESOLVED",
-                Alert.cleared_time: now,
-                Alert.updated_at: now,
-                Alert.remedial_action: "All Incident Notifications Cleared",
-                Alert.resolved_by: current_user.username
-            },
-            synchronize_session=False
-        )
-        db.commit()
+    try:
+        with db_write_lock:
+            query = db.query(Alert).filter(~Alert.state.in_(["RESOLVED", "CLEARED"]))
+            if current_user.organization_id:
+                query = query.filter(Alert.organization_id == current_user.organization_id)
+            count = query.update(
+                {
+                    Alert.state: "RESOLVED",
+                    Alert.cleared_time: now,
+                    Alert.updated_at: now,
+                    Alert.remedial_action: "All Incident Notifications Cleared",
+                    Alert.resolved_by: current_user.username
+                },
+                synchronize_session=False
+            )
+            db.commit()
+    except SQLAlchemyError as sqle:
+        db.rollback()
+        logger.error(f"Alerts API: Database transaction error in resolve_all_alerts: {sqle}")
+        raise DatabaseException(message="Failed to resolve active alerts due to database error", details=str(sqle))
 
     # Broadcast WebSocket notification so all frontend subscribers update instantly
     from app.websocket.connection_manager import manager as ws_manager
-    await ws_manager.broadcast_event("alert_resolved", {"resolved_count": count, "state": "RESOLVED"})
+    await ws_manager.broadcast_event("alert_resolved", {"resolved_count": count, "state": "RESOLVED"}, organization_id=current_user.organization_id)
 
     logger.info(f"Alerts API: User '{current_user.username}' resolved all {count} active alerts.")
     return ResponseModel(data={"resolved_count": count, "status": "RESOLVED"})
 
 
-def _find_alert_by_id_or_alias(db: Session, alert_id: str) -> Optional[Alert]:
+def _find_alert_by_id_or_alias(db: Session, alert_id: str, organization_id: Optional[str] = None) -> Optional[Alert]:
     """
-    Resolves an Alert incident using multiple key formats:
+    Resolves an Alert incident using multiple key formats, scoped to organization:
     1. Exact match on Alert.id (e.g. ppe_evt_..., evt_...)
     2. Notification delivery audit ID (e.g. notif_...)
     3. Evidence token or Evidence UUID (e.g. ev_...)
@@ -173,10 +193,15 @@ def _find_alert_by_id_or_alias(db: Session, alert_id: str) -> Optional[Alert]:
     if not clean_id:
         return None
 
+    def _matches_org(a: Optional[Alert]) -> Optional[Alert]:
+        if a and organization_id and a.organization_id and a.organization_id != organization_id:
+            return None
+        return a
+
     # 1. Direct match on Alert primary key
     alert = db.query(Alert).filter(Alert.id == clean_id).first()
     if alert:
-        return alert
+        return _matches_org(alert)
 
     # 2. Match by Notification delivery audit ID (e.g. notif_...)
     if clean_id.startswith("notif_"):
@@ -184,7 +209,7 @@ def _find_alert_by_id_or_alias(db: Session, alert_id: str) -> Optional[Alert]:
         if notif and notif.alert_id:
             alert = db.query(Alert).filter(Alert.id == notif.alert_id).first()
             if alert:
-                return alert
+                return _matches_org(alert)
 
     # 3. Match by Evidence ID / Evidence token (e.g. ev_... or UUID)
     ev = db.query(Evidence).filter(
@@ -193,16 +218,19 @@ def _find_alert_by_id_or_alias(db: Session, alert_id: str) -> Optional[Alert]:
     if ev and ev.alert_id:
         alert = db.query(Alert).filter(Alert.id == ev.alert_id).first()
         if alert:
-            return alert
+            return _matches_org(alert)
 
     # 4. Fallback for client-side synthetic timestamp IDs (e.g. notif_1789457050561) or "latest"
     if clean_id.startswith("notif_") or clean_id == "latest":
-        active_alert = db.query(Alert).filter(
+        q = db.query(Alert)
+        if organization_id:
+            q = q.filter(Alert.organization_id == organization_id)
+        active_alert = q.filter(
             ~Alert.state.in_(["RESOLVED", "CLEARED"])
         ).order_by(desc(Alert.start_time)).first()
         if active_alert:
             return active_alert
-        latest_alert = db.query(Alert).order_by(desc(Alert.start_time)).first()
+        latest_alert = q.order_by(desc(Alert.start_time)).first()
         if latest_alert:
             return latest_alert
 
@@ -220,7 +248,7 @@ async def get_alert(
     current_user: User = Depends(RequirePermission("alerts:read")),
     db: Session = Depends(get_db)
 ):
-    alert = _find_alert_by_id_or_alias(db, alert_id)
+    alert = _find_alert_by_id_or_alias(db, alert_id, organization_id=current_user.organization_id)
     if not alert:
         raise AppException(
             message=f"Alert incident with ID '{alert_id}' not found",
@@ -260,7 +288,7 @@ async def acknowledge_alert(
     current_user: User = Depends(RequirePermission("alerts:write")),
     db: Session = Depends(get_db)
 ):
-    alert = _find_alert_by_id_or_alias(db, alert_id)
+    alert = _find_alert_by_id_or_alias(db, alert_id, organization_id=current_user.organization_id)
     if not alert:
         raise AppException(
             message=f"Alert incident with ID '{alert_id}' not found",
@@ -268,7 +296,14 @@ async def acknowledge_alert(
             status_code=status.HTTP_404_NOT_FOUND
         )
 
+    VALID_ALERT_STATES = {"POSSIBLE", "CONFIRMED", "ALERT_SENT", "ACTIVE", "CLEARED", "RESOLVED", "ACKNOWLEDGED", "NEW"}
     target_state = payload.state.upper() if (payload and payload.state) else "RESOLVED"
+    if target_state not in VALID_ALERT_STATES:
+        raise ValidationException(
+            message=f"Invalid alert state '{target_state}'. Allowed states are: {', '.join(sorted(VALID_ALERT_STATES))}",
+            details={"provided_state": target_state, "allowed_states": sorted(list(VALID_ALERT_STATES))}
+        )
+
     alert.state = target_state
     if target_state in ("CLEARED", "RESOLVED"):
         alert.cleared_time = datetime.now(timezone.utc)
@@ -279,11 +314,20 @@ async def acknowledge_alert(
         alert.resolved_by = (payload.resolved_by if (payload and payload.resolved_by) else current_user.username)
 
     alert.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(alert)
+    try:
+        db.commit()
+        db.refresh(alert)
+    except SQLAlchemyError as sqle:
+        db.rollback()
+        logger.error(f"Alerts API: Database transaction error in acknowledge_alert: {sqle}")
+        raise DatabaseException(message=f"Failed to update alert '{alert_id}' due to database error", details=str(sqle))
 
     # Broadcast WebSocket notification for single alert resolution
     from app.websocket.connection_manager import manager as ws_manager
-    await ws_manager.broadcast_event("alert_resolved", {"alert_id": alert.id, "state": target_state})
+    await ws_manager.broadcast_event(
+        "alert_resolved",
+        {"alert_id": alert.id, "state": target_state},
+        organization_id=alert.organization_id
+    )
 
     return ResponseModel(data=_format_alert_response(alert))

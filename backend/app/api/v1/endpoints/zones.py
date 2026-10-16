@@ -45,7 +45,7 @@ def list_safety_zones(
     current_user: User = Depends(get_current_user)
 ):
     service = ZoneService(db)
-    return service.get_zones(camera_id=camera_id)
+    return service.get_zones(camera_id=camera_id, organization_id=current_user.organization_id)
 
 
 @router.post("", response_model=SafetyZoneResponse, status_code=status.HTTP_201_CREATED)
@@ -63,7 +63,8 @@ def create_safety_zone(
         zone_type=payload.zone_type,
         ppe_profile_id=payload.ppe_profile_id,
         enabled=payload.enabled,
-        user_id=current_user.id
+        user_id=current_user.id,
+        organization_id=current_user.organization_id
     )
 
     # Hot-reload safety zone in real-time camera pipeline
@@ -79,7 +80,7 @@ def get_safety_zone(
     current_user: User = Depends(get_current_user)
 ):
     service = ZoneService(db)
-    zone = service.get_zone(id)
+    zone = service.get_zone(id, organization_id=current_user.organization_id)
     if not zone:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Safety Zone not found")
     return zone
@@ -102,7 +103,8 @@ def update_safety_zone(
         polygon_coordinates=payload.polygon_coordinates,
         ppe_profile_id=payload.ppe_profile_id,
         enabled=payload.enabled,
-        user_id=current_user.id
+        user_id=current_user.id,
+        organization_id=current_user.organization_id
     )
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Safety Zone not found")
@@ -121,10 +123,10 @@ def delete_safety_zone(
     current_user: User = Depends(require_role(["ADMIN", "MANAGER"]))
 ):
     service = ZoneService(db)
-    zone = service.get_zone(id)
+    zone = service.get_zone(id, organization_id=current_user.organization_id)
     cam_id = zone.camera_id if zone else None
 
-    success = service.delete_zone(id, user_id=current_user.id)
+    success = service.delete_zone(id, user_id=current_user.id, organization_id=current_user.organization_id)
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Safety Zone not found")
 

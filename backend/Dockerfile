@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-COPY --from=builder /root/.local /home/appuser/.local
+COPY --chown=appuser:appuser --from=builder /root/.local /home/appuser/.local
 ENV PATH=/home/appuser/.local/bin:$PATH
 
 COPY --chown=appuser:appuser . .

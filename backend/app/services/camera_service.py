@@ -25,14 +25,44 @@ class CameraService:
         self.db = db
         self.camera_manager = camera_manager
 
-    def create_camera(self, payload: CameraCreate) -> Camera:
+    def create_camera(self, payload: CameraCreate, organization_id: Optional[str] = None) -> Camera:
         """
         Creates a new camera configuration in DB and registers it with CameraManager.
+        Enforces organization tenant scoping and license limits.
         """
+        eff_org_id = organization_id or payload.organization_id
+        if eff_org_id:
+            from app.services.license_service import LicenseService
+            allowed, reason = LicenseService.check_camera_limit(self.db, eff_org_id)
+            if not allowed:
+                raise AppException(
+                    message=f"Camera registration rejected: {reason}",
+                    code="CAMERA_LIMIT_EXCEEDED",
+                    status_code=403
+                )
+            if payload.ppe_enabled:
+                m_ok, m_reason = LicenseService.check_module_allowed(self.db, eff_org_id, "ppe")
+                if not m_ok:
+                    raise AppException(
+                        message=f"PPE detection module is not enabled for your license tier: {m_reason}",
+                        code="MODULE_DISABLED",
+                        status_code=403
+                    )
+            if payload.zone_enabled:
+                m_ok, m_reason = LicenseService.check_module_allowed(self.db, eff_org_id, "zones")
+                if not m_ok:
+                    raise AppException(
+                        message=f"Safety zone module is not enabled for your license tier: {m_reason}",
+                        code="MODULE_DISABLED",
+                        status_code=403
+                    )
+
         source_type_str = payload.source_type.value if hasattr(payload.source_type, "value") else str(payload.source_type)
         camera = Camera(
             name=payload.name,
             camera_number=payload.camera_number,
+            organization_id=eff_org_id,
+            site_id=payload.site_id,
             dvr_id=payload.dvr_id,
             dvr_channel=payload.dvr_channel,
             channel_name=payload.channel_name,
@@ -70,14 +100,17 @@ class CameraService:
 
         self.db.commit()
         self.db.refresh(camera)
-        logger.info(f"CameraService: Registered Camera ID {camera.id} ('{camera.name}')")
+        logger.info(f"CameraService: Registered Camera ID {camera.id} ('{camera.name}') [org={eff_org_id}]")
         return camera
 
-    def get_camera(self, camera_id: int) -> Camera:
+    def get_camera(self, camera_id: int, organization_id: Optional[str] = None) -> Camera:
         """
-        Retrieves camera configuration by ID from DB.
+        Retrieves camera configuration by ID from DB, isolated by organization if specified.
         """
-        camera = self.db.query(Camera).filter(Camera.id == camera_id).first()
+        query = self.db.query(Camera).filter(Camera.id == camera_id)
+        if organization_id:
+            query = query.filter(Camera.organization_id == organization_id)
+        camera = query.first()
         if not camera:
             raise AppException(
                 message=f"Camera with ID {camera_id} not found",
@@ -86,17 +119,20 @@ class CameraService:
             )
         return camera
 
-    def list_cameras(self) -> List[Camera]:
+    def list_cameras(self, organization_id: Optional[str] = None) -> List[Camera]:
         """
-        Lists all registered camera configurations from DB.
+        Lists all registered camera configurations from DB, scoped to organization.
         """
-        return self.db.query(Camera).all()
+        query = self.db.query(Camera)
+        if organization_id:
+            query = query.filter(Camera.organization_id == organization_id)
+        return query.all()
 
-    def update_camera(self, camera_id: int, payload: CameraUpdate) -> Camera:
+    def update_camera(self, camera_id: int, payload: CameraUpdate, organization_id: Optional[str] = None) -> Camera:
         """
         Updates camera configuration in DB and reloads runtime state in CameraManager.
         """
-        camera = self.get_camera(camera_id)
+        camera = self.get_camera(camera_id, organization_id=organization_id)
 
         # Stop existing worker before updating configuration
         self.camera_manager.stop_camera(camera_id)
@@ -121,11 +157,11 @@ class CameraService:
         logger.info(f"CameraService: Updated Camera ID {camera_id}")
         return camera
 
-    def delete_camera(self, camera_id: int) -> bool:
+    def delete_camera(self, camera_id: int, organization_id: Optional[str] = None) -> bool:
         """
         Stops runtime worker and removes camera configuration from DB.
         """
-        camera = self.get_camera(camera_id)
+        camera = self.get_camera(camera_id, organization_id=organization_id)
         self.camera_manager.remove_camera(camera_id)
 
         self.db.delete(camera)

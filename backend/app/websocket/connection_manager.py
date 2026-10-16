@@ -32,8 +32,8 @@ class ConnectionManager:
     """
 
     def __init__(self):
-        # Maps active WebSocket -> optional user_id
-        self._connections: Dict[WebSocket, Optional[str]] = {}
+        # Maps active WebSocket -> {"user_id": Optional[str], "organization_id": Optional[str], "role": Optional[str]}
+        self._connections: Dict[WebSocket, Dict[str, Optional[str]]] = {}
         self._lock = asyncio.Lock()
         self._seq_counter: int = 0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -42,7 +42,14 @@ class ConnectionManager:
         """Sets main application asyncio event loop for cross-thread scheduling."""
         self._loop = loop
 
-    async def connect(self, websocket: WebSocket, user_id: Optional[str] = None, subprotocol: Optional[str] = None) -> None:
+    async def connect(
+        self,
+        websocket: WebSocket,
+        user_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
+        role: Optional[str] = None,
+        subprotocol: Optional[str] = None
+    ) -> None:
         """
         Accepts incoming WebSocket connection and registers client in active connection map.
         """
@@ -67,9 +74,13 @@ class ConnectionManager:
             await websocket.accept()
 
         async with self._lock:
-            self._connections[websocket] = user_id
+            self._connections[websocket] = {
+                "user_id": user_id,
+                "organization_id": organization_id,
+                "role": role
+            }
         
-        logger.info(f"WebSocket Manager: Client connected (user_id={user_id}). Active clients: {len(self._connections)}")
+        logger.info(f"WebSocket Manager: Client connected (user_id={user_id}, org={organization_id}). Active clients: {len(self._connections)}")
 
     async def disconnect(self, websocket: WebSocket) -> None:
         """
@@ -77,7 +88,8 @@ class ConnectionManager:
         """
         async with self._lock:
             if websocket in self._connections:
-                user_id = self._connections.pop(websocket)
+                info = self._connections.pop(websocket)
+                user_id = info.get("user_id") if isinstance(info, dict) else info
                 logger.info(f"WebSocket Manager: Client disconnected (user_id={user_id}). Active clients: {len(self._connections)}")
 
     @property
@@ -96,13 +108,42 @@ class ConnectionManager:
             await self.disconnect(websocket)
             return False
 
+    MAX_MESSAGE_BYTES = 65536  # 64 KB maximum incoming frame limit
+
     async def handle_incoming_message(self, websocket: WebSocket, raw_text: str) -> None:
         """
-        Parses client message, responding to ping keep-alive heartbeats.
+        Parses client message with payload size validation, returning error frames on malformed JSON.
         """
+        if not raw_text:
+            return
+
+        if len(raw_text) > self.MAX_MESSAGE_BYTES:
+            logger.warning(f"WebSocket Manager: Client sent oversized frame ({len(raw_text)} bytes). Dropping.")
+            await self.send_personal_message({
+                "type": "error",
+                "code": "PAYLOAD_TOO_LARGE",
+                "message": f"Message size exceeds maximum limit of {self.MAX_MESSAGE_BYTES} bytes",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }, websocket)
+            return
+
         try:
-            data = json.loads(raw_text) if raw_text.startswith("{") else {"type": raw_text.strip().lower()}
-            msg_type = data.get("type", "").lower() or data.get("event", "").lower()
+            if raw_text.startswith("{"):
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError as jde:
+                    logger.debug(f"WebSocket Manager: Malformed JSON from client: {jde}")
+                    await self.send_personal_message({
+                        "type": "error",
+                        "code": "INVALID_JSON_PAYLOAD",
+                        "message": "Malformed JSON frame received",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }, websocket)
+                    return
+            else:
+                data = {"type": raw_text.strip().lower()}
+
+            msg_type = (data.get("type") or data.get("event") or "").strip().lower()
 
             if msg_type in ("ping", "heartbeat"):
                 pong_msg = {
@@ -111,6 +152,14 @@ class ConnectionManager:
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
                 await self.send_personal_message(pong_msg, websocket)
+            elif msg_type == "subscribe":
+                channels = data.get("channels", ["alerts", "cameras"])
+                ack_msg = {
+                    "type": "subscribed",
+                    "channels": channels,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                await self.send_personal_message(ack_msg, websocket)
             else:
                 ack_msg = {
                     "type": "ack",
@@ -119,16 +168,34 @@ class ConnectionManager:
                 }
                 await self.send_personal_message(ack_msg, websocket)
         except Exception as e:
-            logger.debug(f"WebSocket Manager: Raw text received from client: '{raw_text}'")
+            logger.warning(f"WebSocket Manager: Error processing message: {e}")
 
-    async def broadcast_event(self, event: str, data: Dict[str, Any], version: str = "1.0") -> None:
+    async def broadcast_event(
+        self,
+        event: str,
+        data: Dict[str, Any],
+        version: str = "1.0",
+        organization_id: Optional[str] = None
+    ) -> None:
         """
-        Broadcasts standardized event payload to all active WebSocket clients concurrently.
+        Broadcasts standardized event payload to active WebSocket clients concurrently.
+        If organization_id is provided, only clients belonging to that organization (or superadmins) receive the event.
         Each client send is isolated in a try/except timeout block to prevent slow-client backpressure.
         """
         import uuid
         async with self._lock:
-            sockets = list(self._connections.keys())
+            # Filter sockets by organization_id if specified
+            if organization_id is not None:
+                sockets = [
+                    ws for ws, info in self._connections.items()
+                    if isinstance(info, dict) and (
+                        info.get("organization_id") == organization_id or
+                        info.get("role") in ("SUPERADMIN", "ADMIN")
+                    )
+                ]
+            else:
+                sockets = list(self._connections.keys())
+
             self._seq_counter += 1
             current_seq = self._seq_counter
 
@@ -145,13 +212,19 @@ class ConnectionManager:
         )
         payload_dict = envelope.model_dump()
 
-        logger.info(f"WebSocket Manager: Broadcasting event '{event}' (v{version}) to {len(sockets)} connected client(s).")
+        logger.info(f"WebSocket Manager: Broadcasting event '{event}' (v{version}, org={organization_id}) to {len(sockets)} connected client(s).")
         
-        # Dispatch concurrently to all clients with isolation
+        # Dispatch concurrently to all matching clients with isolation
         tasks = [self.send_personal_message(payload_dict, ws) for ws in sockets]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    def broadcast_event_sync(self, event: str, data: Dict[str, Any], version: str = "1.0") -> None:
+    def broadcast_event_sync(
+        self,
+        event: str,
+        data: Dict[str, Any],
+        version: str = "1.0",
+        organization_id: Optional[str] = None
+    ) -> None:
         """
         Thread-safe synchronous wrapper for scheduling broadcast from background worker threads.
         """
@@ -164,7 +237,7 @@ class ConnectionManager:
                     loop = None
 
             if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(self.broadcast_event(event, data, version), loop)
+                asyncio.run_coroutine_threadsafe(self.broadcast_event(event, data, version, organization_id=organization_id), loop)
             else:
                 logger.debug(f"WebSocket Manager: No running asyncio loop available for sync broadcast of '{event}'")
         except Exception as e:
