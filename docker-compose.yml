@@ -39,6 +39,7 @@ services:
     container_name: cctv_frontend
     networks:
       - edge
+      - backend
     restart: always
 
   # 3. Backend API Service Gateway
